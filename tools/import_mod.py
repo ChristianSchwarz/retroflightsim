@@ -56,6 +56,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 GLASS_CATEGORY = 'GLASS'
 DEFAULT_MATERIAL = '#909094'  # neutral grey fallback
+# PaletteCategory used for a generated flyable-aircraft shadow silhouette.
+SHADOW_MATERIAL = 'VEHICLE_PLANE_GREY'
 
 # UnityPy's mesh.export() negates X to convert Unity's left-handed coordinates
 # to a right-handed OBJ/glTF system. Transforms read from the bundle are still
@@ -367,9 +369,11 @@ def import_mod(cfg: dict) -> int:
         # 1. Explicit per-material override wins.
         if mat is not None and mat['name'] in material_colors:
             return np.full(len(face_t), material_colors[mat['name']])
-        # 2. Glass: sample palette if the glass has real per-poly tint, else flat.
+        # 2. Glass: a PaletteCategory glass colour (e.g. 'GLASS') always renders
+        # as one uniform material so the sim can tint/dither it; a literal
+        # '#rrggbb' still samples per-poly tint when the glass has a swatch.
         if is_glass(name, mat):
-            if uvs is not None and pal is not None:
+            if glass_color.startswith('#') and uvs is not None and pal is not None:
                 return sample_hex(pal, uvs[face_t].mean(axis=1))
             return np.full(len(face_t), glass_color)
         # 3. Palette-swatch sampled per face.
@@ -391,9 +395,25 @@ def import_mod(cfg: dict) -> int:
         return None
 
     world_cache: dict[int, np.ndarray] = {}
-    buckets: dict[str, list[np.ndarray]] = defaultdict(list)
+
+    # A flyable mod additionally routes movable parts into per-surface + gear
+    # sub-models and emits an aircraft manifest; absent, the classic single
+    # static glTF is produced.
+    flyable = cfg.get('flyable')
+    surface_defs = flyable.get('surfaces', []) if flyable else []
+    gear_names = set(flyable.get('gear', [])) if flyable else set()
+    surface_of_part: dict[str, int] = {}
+    for si, sd in enumerate(surface_defs):
+        for pn in sd.get('parts', []):
+            surface_of_part[pn] = si
+
+    def colourable(name: str, sub_mat: dict | None, pal) -> bool:
+        has_override = sub_mat is not None and sub_mat['name'] in material_colors
+        return bool(has_override or is_glass(name, sub_mat)
+                    or pal is not None or (sub_mat is not None and sub_mat['color']))
+
+    processed: list[dict] = []
     gear_min_y = None
-    part_count = 0
 
     for o in bundle.env.objects:
         if o.type.name != 'GameObject':
@@ -442,57 +462,204 @@ def import_mod(cfg: dict) -> int:
         if rotation_matrix is not None:
             world_v = world_v @ rotation_matrix.T
 
-        if name in ground_parts:
+        if name in ground_parts or name in gear_names:
             wmin = float(world_v[:, 1].min())
             gear_min_y = wmin if gear_min_y is None else min(gear_min_y, wmin)
 
-        exported = False
-        for si, face_v in enumerate(sub_faces):
-            sub_mat = bundle.materials.get(
-                mat_pids[si if si < len(mat_pids) else 0])
-            if sub_mat and any(s in sub_mat['name'] for s in skip_materials):
-                continue
-            pal = palette_array(sub_mat)
-            has_override = sub_mat is not None and sub_mat['name'] in material_colors
-            if (not has_override and not is_glass(name, sub_mat)
-                    and pal is None and (sub_mat is None or not sub_mat['color'])):
-                continue
+        sub_mats = [bundle.materials.get(mat_pids[si if si < len(mat_pids) else 0])
+                    for si in range(len(sub_faces))]
+        processed.append({
+            'name': name, 'world_v': world_v, 'uvs': uvs,
+            'sub_faces': sub_faces, 'sub_face_t': sub_face_t, 'sub_mats': sub_mats,
+        })
 
-            face_t = sub_face_t[si]
-            tri_corners = world_v[face_v]
-            keys = face_colors(name, sub_mat, face_t, uvs, pal)
-            for key in np.unique(keys):
-                buckets[str(key)].append(tri_corners[keys == key].reshape(-1, 3))
-            exported = True
-
-        if exported:
-            part_count += 1
-
-    if not buckets:
+    if not processed:
         raise SystemExit('No colourable meshes found. Try --list to inspect the bundle.')
 
     if gear_min_y is None:
-        gear_min_y = min(min(t[:, 1].min() for t in tris) for tris in buckets.values())
+        gear_min_y = min(float(p['world_v'][:, 1].min()) for p in processed)
     ground_min_y = gear_min_y
     ground_offset_y = -ground_distance - ground_min_y
 
-    scene = trimesh.Scene()
-    for idx, (key, tris) in enumerate(buckets.items()):
+    def build_buckets(parts, translate) -> dict[str, list[np.ndarray]]:
+        buckets: dict[str, list[np.ndarray]] = defaultdict(list)
+        for p in parts:
+            for si, face_v in enumerate(p['sub_faces']):
+                sub_mat = p['sub_mats'][si]
+                if sub_mat and any(s in sub_mat['name'] for s in skip_materials):
+                    continue
+                pal = palette_array(sub_mat)
+                if not colourable(p['name'], sub_mat, pal):
+                    continue
+                face_t = p['sub_face_t'][si]
+                tri_corners = p['world_v'][face_v] + translate
+                keys = face_colors(p['name'], sub_mat, face_t, p['uvs'], pal)
+                for key in np.unique(keys):
+                    buckets[str(key)].append(tri_corners[keys == key].reshape(-1, 3))
+        return buckets
+
+    def emit(parts, translate, out_path, buffer_prefix) -> list[str]:
+        buckets = build_buckets(parts, np.asarray(translate, dtype=np.float64))
+        if not buckets:
+            return []
+        scene = trimesh.Scene()
+        for idx, (key, tris) in enumerate(buckets.items()):
+            v = np.vstack(tris)
+            f = np.arange(len(v), dtype=np.int64).reshape(-1, 3)
+            m = trimesh.Trimesh(vertices=v, faces=f, process=False)
+            _ = m.vertex_normals
+            m.visual = trimesh.visual.TextureVisuals(
+                material=trimesh.visual.material.PBRMaterial(name=key))
+            scene.add_geometry(m, node_name=f'0_{idx}_{key}', geom_name=f'{idx}_{key}')
+        _write_gltf(scene, out_path, buffer_prefix)
+        return sorted(buckets)
+
+    def emit_shadow(parts, out_path, buffer_prefix) -> bool:
+        """Flattened planform silhouette (y=0) rendered as a single grey mesh."""
+        tris = []
+        for p in parts:
+            for si, face_v in enumerate(p['sub_faces']):
+                sub_mat = p['sub_mats'][si]
+                if sub_mat and any(s in sub_mat['name'] for s in skip_materials):
+                    continue
+                v = p['world_v'][face_v].reshape(-1, 3).copy()
+                v[:, 1] = 0.0
+                tris.append(v)
+        if not tris:
+            return False
         v = np.vstack(tris)
         f = np.arange(len(v), dtype=np.int64).reshape(-1, 3)
         m = trimesh.Trimesh(vertices=v, faces=f, process=False)
-        m.apply_translation([0, ground_offset_y, 0])
         _ = m.vertex_normals
         m.visual = trimesh.visual.TextureVisuals(
-            material=trimesh.visual.material.PBRMaterial(name=key))
-        scene.add_geometry(m, node_name=f'0_{idx}_{key}', geom_name=f'{idx}_{key}')
+            material=trimesh.visual.material.PBRMaterial(name=SHADOW_MATERIAL))
+        scene = trimesh.Scene()
+        scene.add_geometry(m, node_name=f'0_0_{SHADOW_MATERIAL}',
+                           geom_name=f'0_{SHADOW_MATERIAL}')
+        _write_gltf(scene, out_path, buffer_prefix)
+        return True
 
-    _write_gltf(scene, out, buffer_prefix)
+    def bp(path: str) -> str:
+        return os.path.splitext(os.path.basename(path))[0] + '_buffer_'
 
-    print(f'Wrote {out}')
-    print(f'Parts: {part_count}, colours/materials: {len(buckets)}')
-    print('  ' + ', '.join(sorted(buckets)))
-    print(f'ground_min_y: {ground_min_y:.3f}, ground_offset_y: {ground_offset_y:.3f}')
+    def rel(path: str) -> str:
+        return os.path.relpath(path, PROJECT_ROOT).replace('\\', '/')
+
+    ground_translate = [0.0, ground_offset_y, 0.0]
+
+    if not flyable:
+        keys = emit(processed, ground_translate, out, buffer_prefix)
+        print(f'Wrote {out}')
+        print(f'Parts: {len(processed)}, colours/materials: {len(keys)}')
+        print('  ' + ', '.join(keys))
+        print(f'ground_min_y: {ground_min_y:.3f}, ground_offset_y: {ground_offset_y:.3f}')
+        return 0
+
+    # ---- Flyable: split into body / per-surface / gear sub-models + manifest.
+    out_dir = os.path.dirname(out)
+    stem = os.path.splitext(os.path.basename(out))[0]
+    if stem.endswith('_static'):
+        stem = stem[:-len('_static')]
+    prefix = flyable.get('outPrefix') or os.path.join(out_dir, stem)
+    if not os.path.isabs(prefix):
+        prefix = os.path.join(PROJECT_ROOT, prefix)
+
+    surface_parts = set(surface_of_part.keys())
+    body_parts = [p for p in processed
+                  if p['name'] not in surface_parts and p['name'] not in gear_names]
+    gear_parts = [p for p in processed if p['name'] in gear_names]
+
+    body_path = f'{prefix}_body.gltf'
+    body_keys = emit(body_parts, ground_translate, body_path, bp(body_path))
+    print(f'Wrote {body_path} ({len(body_keys)} colours)')
+
+    gear_manifest = None
+    if gear_parts:
+        gear_path = f'{prefix}_gear.gltf'
+        gear_keys = emit(gear_parts, ground_translate, gear_path, bp(gear_path))
+        if gear_keys:
+            gear_manifest = rel(gear_path)
+            print(f'Wrote {gear_path} ({len(gear_keys)} colours)')
+
+    def unit(v) -> np.ndarray:
+        v = np.asarray(v, dtype=np.float64)
+        n = float(np.linalg.norm(v))
+        return v / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+
+    surfaces_manifest = []
+    for si, sd in enumerate(surface_defs):
+        members = [p for pn in sd.get('parts', []) for p in processed if p['name'] == pn]
+        if not members:
+            print(f'WARNING: surface "{sd.get("role", si)}" matched no parts; skipping.')
+            continue
+        control = sd.get('control', 'pitch')
+        role = sd.get('role', f'surf{si}')
+
+        # Hinge axis: explicit override, else spanwise (RIGHT) for pitch/roll/
+        # flap surfaces and vertical (UP) for the rudder.
+        if 'axis' in sd:
+            axis = unit(sd['axis'])
+        else:
+            axis = np.array([1.0, 0.0, 0.0]) if control != 'yaw' else np.array([0.0, 1.0, 0.0])
+
+        # Hinge pivot (aircraft-local frame). Baked-geometry mods carry no useful
+        # per-part transform, so derive it from the part geometry: the spanwise/
+        # vertical centre at the forward (nose-ward, max +Z) edge of the surface,
+        # which is where a trailing-edge control hinges. `pivot` may override it.
+        if 'pivot' in sd:
+            pivot_local = np.asarray(sd['pivot'], dtype=np.float64)
+            translate = np.array([0.0, ground_offset_y, 0.0]) - pivot_local
+        else:
+            member_v = np.vstack([p['world_v'] for p in members])
+            pivot_world = np.array([
+                float(member_v[:, 0].mean()),
+                float(member_v[:, 1].mean()),
+                float(member_v[:, 2].max()),
+            ])
+            pivot_local = pivot_world + np.array([0.0, ground_offset_y, 0.0])
+            translate = -pivot_world
+
+        surf_path = f'{prefix}_surf_{role}.gltf'
+        surf_keys = emit(members, translate, surf_path, bp(surf_path))
+        if not surf_keys:
+            print(f'WARNING: surface "{role}" produced no geometry; skipping.')
+            continue
+        surfaces_manifest.append({
+            'role': role,
+            'path': rel(surf_path),
+            'pivot': [round(float(x), 4) for x in pivot_local],
+            'axis': [round(float(x), 4) for x in axis],
+            'control': control,
+            'sign': sd.get('sign', 1),
+            'rangeRad': sd.get('rangeRad', float(np.pi / 6)),
+        })
+        print(f'Wrote {surf_path} (pivot={pivot_local.round(2).tolist()} axis={axis.round(2).tolist()})')
+
+    # Shadow: use a supplied silhouette, else generate a flattened one.
+    if flyable.get('shadow'):
+        shadow_manifest = flyable['shadow']
+    else:
+        shadow_path = f'{prefix}_shadow.gltf'
+        shadow_manifest = rel(shadow_path) if emit_shadow(processed, shadow_path, bp(shadow_path)) else None
+
+    manifest = {
+        'name': cfg.get('name', stem),
+        'body': rel(body_path),
+        'shadow': shadow_manifest,
+        'gear': gear_manifest,
+        'surfaces': surfaces_manifest,
+        'fx': flyable.get('fx', {'nozzles': None, 'wingtips': None}),
+        'cockpitOffset': flyable.get('cockpitOffset', [0.0, 1.0, 4.0]),
+        'spawn': flyable.get('spawn', {}),
+        'groundOffsetY': round(float(ground_offset_y), 4),
+        'flight': cfg.get('flight'),
+    }
+    manifest_path = f'{prefix}.aircraft.json'
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2)
+    print(f'Wrote {manifest_path}')
+    print(f'Parts: {len(processed)} (body {len(body_parts)}, '
+          f'gear {len(gear_parts)}, surfaces {len(surfaces_manifest)})')
     return 0
 
 
