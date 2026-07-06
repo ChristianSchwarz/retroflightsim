@@ -105,31 +105,8 @@ def world_matrix(path_id: int, transforms, cache) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Mesh / material parsing
 # --------------------------------------------------------------------------- #
-def read_submesh_faces(mesh) -> list[np.ndarray]:
-    """Return per-submesh triangle index arrays from a Unity mesh."""
-    ib = np.array(list(mesh.m_IndexBuffer), dtype=np.int64)
-    sub_faces: list[np.ndarray] = []
-    off = 0
-    for sm in mesh.m_SubMeshes:
-        idx = ib[off:off + sm.indexCount]
-        off += sm.indexCount
-        if len(idx) >= 3:
-            sub_faces.append(idx.reshape(-1, 3))
-    return sub_faces
-
-
 def mesh_geometry(mesh, mat_pids: list) -> tuple[np.ndarray, np.ndarray | None, list[np.ndarray], list[np.ndarray]]:
     """Return verts, uvs, per-submesh face indices, and per-submesh UV indices."""
-    multi_material = len(mat_pids) > 1 and len(mesh.m_SubMeshes) > 1
-    if multi_material:
-        verts, uvs, face_v, face_t = parse_obj(mesh.export())
-        if len(verts) == 0 or len(face_v) == 0:
-            return np.empty((0, 3)), None, [], []
-        sub_faces = read_submesh_faces(mesh)
-        if not sub_faces:
-            return verts, uvs, [face_v], [face_t]
-        # Unity vertex indices match the exported OBJ; UVs are per-vertex.
-        return verts, uvs, sub_faces, sub_faces
     verts, uvs, face_v, face_t = parse_obj(mesh.export())
     if len(verts) == 0 or len(face_v) == 0:
         return np.empty((0, 3)), None, [], []
