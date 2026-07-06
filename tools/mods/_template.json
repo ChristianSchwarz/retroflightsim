@@ -7,6 +7,8 @@
 
   "bufferPrefix": "mymod_static_buffer_",
   "groundDistance": 2.0,
+  "groundContactPercentile": 10,
+  "groundContactInsetM": 0.0,
   "scale": 1.0,
   "rotationEuler": [0, 0, 0],
 

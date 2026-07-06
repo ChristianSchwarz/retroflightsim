@@ -88,6 +88,8 @@ and `out` are required.
 | `out`            | **(required)** Output `.gltf` path (relative to project root).      |
 | `bufferPrefix`   | Prefix for the `.bin` buffers (defaults to the output file stem).   |
 | `groundDistance` | Distance from model origin down to the ground (2.0 for aircraft).   |
+| `groundContactPercentile` | Bottom percentile of `groundParts` vertex Y used as the wheel contact plane (default 10). Avoids mesh-min spikes that float the visible tire tread. |
+| `groundContactInsetM` | Extra metres to shift the model down after percentile alignment (default 0). |
 | `scale`          | Uniform scale applied to geometry (default 1.0).                    |
 | `rotationEuler`  | `[x, y, z]` degrees to reorient a model that faces the wrong way.   |
 | `swatchMax`      | Max texture size in px treated as a palette swatch (default 64).    |
@@ -96,7 +98,7 @@ and `out` are required.
 | `glassAutoAlpha` | Auto-treat transparent materials as glass (default `true`).         |
 | `glassAlphaMax`  | Alpha below which a material counts as glass (default `0.9`).        |
 | `materialColors` | Map of Unity material name -> `#rrggbb` **or** a `PaletteCategory` (e.g. `"GLASS"`). Overrides palette sampling for those materials. |
-| `groundParts`    | Part names used to compute the ground offset (lowest point). `gearWheelParts` is accepted as an alias. |
+| `groundParts`    | Part names whose mesh sets the ground contact height (wheel meshes). Uses the bottom `groundContactPercentile` of each part's vertices, then the highest contact among parts so tricycle mains do not float. `gearWheelParts` is accepted as an alias. |
 | `skipMaterials`  | Material-name substrings whose meshes are dropped (colliders etc.). |
 | `skipExact`      | Part names dropped exactly.                                         |
 | `includeExact`   | Part names always kept even if they match a skip substring.         |

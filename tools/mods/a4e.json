@@ -31,7 +31,6 @@
 
   "flyable": {
     "outPrefix": "assets/a4e",
-    "shadow": "assets/a4e_shadow.gltf",
     "cockpitOffset": [0.0, 0.9, 4.5],
     "fx": { "nozzles": null, "wingtips": null },
     "spawn": {},
@@ -41,8 +40,8 @@
       "GearNoseBase", "GearNoseBase2", "GearMainBaseL", "GearMainBaseR"
     ],
     "surfaces": [
-      { "role": "elevatorLeft", "parts": ["ElevatorLeft", "ElevatorLTip"], "control": "pitch", "sign": 1, "rangeRad": 0.42 },
-      { "role": "elevatorRight", "parts": ["ElevatorRight", "ElevatorRTip"], "control": "pitch", "sign": 1, "rangeRad": 0.42 },
+      { "role": "elevatorLeft", "parts": ["ElevatorLeft"], "control": "pitch", "sign": 1, "rangeRad": 0.42 },
+      { "role": "elevatorRight", "parts": ["ElevatorRight"], "control": "pitch", "sign": 1, "rangeRad": 0.42 },
       { "role": "aileronLeft", "parts": ["AileronL"], "control": "roll", "sign": 1, "rangeRad": 0.4 },
       { "role": "aileronRight", "parts": ["AileronR"], "control": "roll", "sign": -1, "rangeRad": 0.4 },
       { "role": "rudder", "parts": ["Rudder"], "control": "yaw", "sign": 1, "rangeRad": 0.45 },

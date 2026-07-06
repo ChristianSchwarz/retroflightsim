@@ -8,9 +8,9 @@
       "role": "elevatorLeft",
       "path": "assets/a4e_surf_elevatorLeft.gltf",
       "pivot": [
-        1.1164,
-        1.4424,
-        -4.2491
+        0.8686,
+        1.0629,
+        -5.9827
       ],
       "axis": [
         1.0,
@@ -25,9 +25,9 @@
       "role": "elevatorRight",
       "path": "assets/a4e_surf_elevatorRight.gltf",
       "pivot": [
-        -1.1177,
-        1.4424,
-        -4.2491
+        -0.872,
+        1.0629,
+        -5.9827
       ],
       "axis": [
         1.0,
@@ -43,7 +43,7 @@
       "path": "assets/a4e_surf_aileronLeft.gltf",
       "pivot": [
         3.2868,
-        -0.0233,
+        -0.4028,
         -2.176
       ],
       "axis": [
@@ -60,7 +60,7 @@
       "path": "assets/a4e_surf_aileronRight.gltf",
       "pivot": [
         -3.2868,
-        -0.0233,
+        -0.4027,
         -2.176
       ],
       "axis": [
@@ -77,7 +77,7 @@
       "path": "assets/a4e_surf_rudder.gltf",
       "pivot": [
         0.0036,
-        2.5441,
+        2.1646,
         -5.4679
       ],
       "axis": [
@@ -94,7 +94,7 @@
       "path": "assets/a4e_surf_flapLeft.gltf",
       "pivot": [
         1.2736,
-        -0.1516,
+        -0.5311,
         -2.1592
       ],
       "axis": [
@@ -111,7 +111,7 @@
       "path": "assets/a4e_surf_flapRight.gltf",
       "pivot": [
         -1.271,
-        -0.1456,
+        -0.5251,
         -2.1595
       ],
       "axis": [
@@ -134,7 +134,7 @@
     4.5
   ],
   "spawn": {},
-  "groundOffsetY": 0.5112,
+  "groundOffsetY": 0.1318,
   "flight": {
     "geometry": {
       "massKg": 8200,

@@ -336,6 +336,8 @@ def import_mod(cfg: dict) -> int:
     buffer_prefix = cfg.get('bufferPrefix') or (
         os.path.splitext(os.path.basename(out))[0] + '_buffer_')
     ground_distance = float(cfg.get('groundDistance', 2.0))
+    ground_contact_percentile = float(cfg.get('groundContactPercentile', 10.0))
+    ground_contact_inset_m = float(cfg.get('groundContactInsetM', 0.0))
     scale = float(cfg.get('scale', 1.0))
     rotation_euler = cfg.get('rotationEuler')  # [x, y, z] degrees, or None
     swatch_max = int(cfg.get('swatchMax', DEFAULT_SWATCH_MAX))
@@ -413,7 +415,7 @@ def import_mod(cfg: dict) -> int:
                     or pal is not None or (sub_mat is not None and sub_mat['color']))
 
     processed: list[dict] = []
-    gear_min_y = None
+    ground_contact_y = None
 
     for o in bundle.env.objects:
         if o.type.name != 'GameObject':
@@ -462,9 +464,12 @@ def import_mod(cfg: dict) -> int:
         if rotation_matrix is not None:
             world_v = world_v @ rotation_matrix.T
 
-        if name in ground_parts or name in gear_names:
-            wmin = float(world_v[:, 1].min())
-            gear_min_y = wmin if gear_min_y is None else min(gear_min_y, wmin)
+        if name in ground_parts:
+            ys = world_v[:, 1]
+            contact = float(np.percentile(ys, ground_contact_percentile))
+            contact -= ground_contact_inset_m
+            ground_contact_y = (contact if ground_contact_y is None
+                                else max(ground_contact_y, contact))
 
         sub_mats = [bundle.materials.get(mat_pids[si if si < len(mat_pids) else 0])
                     for si in range(len(sub_faces))]
@@ -476,9 +481,9 @@ def import_mod(cfg: dict) -> int:
     if not processed:
         raise SystemExit('No colourable meshes found. Try --list to inspect the bundle.')
 
-    if gear_min_y is None:
-        gear_min_y = min(float(p['world_v'][:, 1].min()) for p in processed)
-    ground_min_y = gear_min_y
+    if ground_contact_y is None:
+        ground_contact_y = min(float(p['world_v'][:, 1].min()) for p in processed)
+    ground_min_y = ground_contact_y
     ground_offset_y = -ground_distance - ground_min_y
 
     def build_buckets(parts, translate) -> dict[str, list[np.ndarray]]:
@@ -514,15 +519,16 @@ def import_mod(cfg: dict) -> int:
         _write_gltf(scene, out_path, buffer_prefix)
         return sorted(buckets)
 
-    def emit_shadow(parts, out_path, buffer_prefix) -> bool:
-        """Flattened planform silhouette (y=0) rendered as a single grey mesh."""
+    def emit_shadow(parts, translate, out_path, buffer_prefix) -> bool:
+        """Flattened planform silhouette (aircraft-local y=0) as a single grey mesh."""
         tris = []
+        translate = np.asarray(translate, dtype=np.float64)
         for p in parts:
             for si, face_v in enumerate(p['sub_faces']):
                 sub_mat = p['sub_mats'][si]
                 if sub_mat and any(s in sub_mat['name'] for s in skip_materials):
                     continue
-                v = p['world_v'][face_v].reshape(-1, 3).copy()
+                v = p['world_v'][face_v].reshape(-1, 3).copy() + translate
                 v[:, 1] = 0.0
                 tris.append(v)
         if not tris:
@@ -530,7 +536,7 @@ def import_mod(cfg: dict) -> int:
         v = np.vstack(tris)
         f = np.arange(len(v), dtype=np.int64).reshape(-1, 3)
         m = trimesh.Trimesh(vertices=v, faces=f, process=False)
-        _ = m.vertex_normals
+        m.vertex_normals = np.tile([0.0, 1.0, 0.0], (len(v), 1))
         m.visual = trimesh.visual.TextureVisuals(
             material=trimesh.visual.material.PBRMaterial(name=SHADOW_MATERIAL))
         scene = trimesh.Scene()
@@ -635,12 +641,13 @@ def import_mod(cfg: dict) -> int:
         })
         print(f'Wrote {surf_path} (pivot={pivot_local.round(2).tolist()} axis={axis.round(2).tolist()})')
 
-    # Shadow: use a supplied silhouette, else generate a flattened one.
-    if flyable.get('shadow'):
-        shadow_manifest = flyable['shadow']
-    else:
-        shadow_path = f'{prefix}_shadow.gltf'
-        shadow_manifest = rel(shadow_path) if emit_shadow(processed, shadow_path, bp(shadow_path)) else None
+    # Flattened planform shadow in the same aircraft-local frame as the body.
+    shadow_path = f'{prefix}_shadow.gltf'
+    shadow_manifest = (rel(shadow_path)
+                       if emit_shadow(processed, ground_translate, shadow_path, bp(shadow_path))
+                       else None)
+    if shadow_manifest:
+        print(f'Wrote {shadow_path}')
 
     manifest = {
         'name': cfg.get('name', stem),
@@ -658,8 +665,14 @@ def import_mod(cfg: dict) -> int:
     with open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, indent=2)
     print(f'Wrote {manifest_path}')
+
+    static_keys = emit(processed, ground_translate, out, buffer_prefix)
+    if static_keys:
+        print(f'Wrote {out} ({len(static_keys)} colours)')
+
     print(f'Parts: {len(processed)} (body {len(body_parts)}, '
           f'gear {len(gear_parts)}, surfaces {len(surfaces_manifest)})')
+    print(f'ground_min_y: {ground_min_y:.3f}, ground_offset_y: {ground_offset_y:.3f}')
     return 0
 
 
