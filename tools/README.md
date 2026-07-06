@@ -73,9 +73,30 @@ python tools/build_a4e_gltf.py
 
 ### 3. Wire it into the sim
 
-The importer only produces the glTF asset. To make it appear in the game, add
-it to `src/script/state/staticModelViews.ts` (the parked ramp models) or load
-it anywhere via `ModelManager.getModel('assets/foo_static.gltf')`.
+The importer produces loose glTF files under `assets/` for editing and tests.
+At build time, `tools/pack_aircraft_mods.py` bundles each `assets/*.aircraft.json`
+mod (manifest, flyable sub-models, buffers, and the static ramp model) into a
+single `dist/assets/{id}.aircraft.pack` file. Webpack skips copying those loose
+mod files into `dist/`.
+
+To register a flyable mod, load its pack in `src/script/state/game.ts`:
+
+```
+await this.aircraftRegistry.loadPack('a4e', 'assets/a4e.aircraft.pack');
+```
+
+For parked ramp models, reference pack URLs in
+`src/script/state/staticModelViews.ts` (e.g. `pack:a4e/a4e_static.gltf`).
+
+### 4. Build
+
+```
+npm run build
+```
+
+Runs webpack and then `npm run pack-mods`. The deployable mod output is
+`dist/assets/*.aircraft.pack`, not the hundreds of loose `a4e_*` files in
+`assets/`.
 
 ## Config schema (`tools/mods/*.json`)
 
@@ -98,7 +119,7 @@ and `out` are required.
 | `glassAutoAlpha` | Auto-treat transparent materials as glass (default `true`).         |
 | `glassAlphaMax`  | Alpha below which a material counts as glass (default `0.9`).        |
 | `materialColors` | Map of Unity material name -> `#rrggbb` **or** a `PaletteCategory` (e.g. `"GLASS"`). Overrides palette sampling for those materials. |
-| `groundParts`    | Part names whose mesh sets the ground contact height (wheel meshes). Uses the bottom `groundContactPercentile` of each part's vertices, then the highest contact among parts so tricycle mains do not float. `gearWheelParts` is accepted as an alias. |
+| `groundParts`    | Part names whose mesh sets the ground contact height (wheel meshes). Uses the bottom `groundContactPercentile` of each part's vertices, then the highest contact among parts so tricycle mains do not float. On flyable imports, also auto-generates `flight.gear.points` from each part's mesh minimum Y for FM2 physics. `gearWheelParts` is accepted as an alias. |
 | `skipMaterials`  | Material-name substrings whose meshes are dropped (colliders etc.). |
 | `skipExact`      | Part names dropped exactly.                                         |
 | `includeExact`   | Part names always kept even if they match a skip substring.         |

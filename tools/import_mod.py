@@ -328,6 +328,70 @@ def _should_include(name: str, include_exact, skip_parts, skip_exact) -> bool:
     return not any(part in name for part in skip_parts)
 
 
+def hinge_frame_from_part(
+    bundle: Bundle,
+    part_name: str,
+    world_cache: dict[int, np.ndarray],
+    scale: float,
+    ground_offset_y: float,
+    hinge_axis: str = 'x',
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Pivot + hinge axis from a Unity bone/empty (e.g. BSlatL) in the sim body frame."""
+    axis_col = {'x': 0, 'y': 1, 'z': 2}.get(hinge_axis.lower(), 0)
+    for o in bundle.env.objects:
+        if o.type.name != 'GameObject':
+            continue
+        go = o.read()
+        if go.m_Name != part_name:
+            continue
+        transform_pid = None
+        for comp in go.m_Component:
+            co = bundle.by_path.get(comp.component.path_id)
+            if co is not None and co.type.name == 'Transform':
+                transform_pid = comp.component.path_id
+                break
+        if transform_pid is None:
+            return None
+        wm = _FLIP_X @ world_matrix(transform_pid, bundle.transforms, world_cache) @ _FLIP_X
+        hinge_world = wm[:3, 3] * scale
+        pivot_local = hinge_world + np.array([0.0, ground_offset_y, 0.0])
+        axis = wm[:3, axis_col].copy()
+        n = float(np.linalg.norm(axis))
+        if n > 1e-9:
+            axis /= n
+        else:
+            axis = np.array([1.0, 0.0, 0.0])
+        return pivot_local, axis
+    return None
+
+
+def derive_gear_points(
+    processed: list[dict],
+    ground_part_names: list[str],
+    translate: np.ndarray,
+    bottom_percentile: float = 10.0,
+) -> list[list[float]]:
+    """FM2 spring contact points from each wheel mesh's lowest vertices."""
+    part_by_name = {p['name']: p for p in processed}
+    translate = np.asarray(translate, dtype=np.float64)
+    points: list[list[float]] = []
+    for name in ground_part_names:
+        part = part_by_name.get(name)
+        if part is None:
+            print(f'WARNING: ground part "{name}" not found; skipping gear point.')
+            continue
+        v = part['world_v'] + translate
+        y_contact = float(v[:, 1].min())
+        y_thresh = float(np.percentile(v[:, 1], bottom_percentile))
+        bottom = v[v[:, 1] <= y_thresh]
+        if len(bottom) == 0:
+            bottom = v
+        x = float(bottom[:, 0].mean())
+        z = float(bottom[:, 2].mean())
+        points.append([round(x, 4), round(y_contact, 4), round(z, 4)])
+    return points
+
+
 def import_mod(cfg: dict) -> int:
     bundle_path = cfg['bundle']
     out = cfg['out']
@@ -349,7 +413,8 @@ def import_mod(cfg: dict) -> int:
     # or a PaletteCategory name (e.g. 'GLASS'). Supersedes palette sampling.
     material_colors = dict(cfg.get('materialColors', {}))
     # groundParts is the general name; gearWheelParts kept as a back-compat alias.
-    ground_parts = set(cfg.get('groundParts', cfg.get('gearWheelParts', [])))
+    ground_part_names = list(cfg.get('groundParts', cfg.get('gearWheelParts', [])))
+    ground_parts = set(ground_part_names)
     include_exact = set(cfg.get('includeExact', []))
     skip_parts = tuple(cfg.get('skipNameParts', []))
     skip_exact = set(cfg.get('skipExact', []))
@@ -601,26 +666,44 @@ def import_mod(cfg: dict) -> int:
         control = sd.get('control', 'pitch')
         role = sd.get('role', f'surf{si}')
 
-        # Hinge axis: explicit override, else spanwise (RIGHT) for pitch/roll/
+        hinge_part = sd.get('hingePart')
+        hinge_frame = None
+        if hinge_part:
+            hinge_frame = hinge_frame_from_part(
+                bundle, hinge_part, world_cache, scale, ground_offset_y,
+                sd.get('hingeAxis', 'x'),
+            )
+            if hinge_frame is None:
+                print(f'WARNING: hingePart "{hinge_part}" for surface "{role}" not found; '
+                      'falling back to geometry pivot.')
+
+        # Hinge axis: explicit override, else bone local axis, else spanwise
         # flap surfaces and vertical (UP) for the rudder.
         if 'axis' in sd:
             axis = unit(sd['axis'])
+        elif hinge_frame is not None:
+            axis = unit(hinge_frame[1])
         else:
             axis = np.array([1.0, 0.0, 0.0]) if control != 'yaw' else np.array([0.0, 1.0, 0.0])
 
         # Hinge pivot (aircraft-local frame). Baked-geometry mods carry no useful
         # per-part transform, so derive it from the part geometry: the spanwise/
-        # vertical centre at the forward (nose-ward, max +Z) edge of the surface,
-        # which is where a trailing-edge control hinges. `pivot` may override it.
+        # vertical centre at the hinge edge  trailing-edge controls (flaps,
+        # ailerons, ) use max +Z; leading-edge slats use min +Z. `pivot` may
+        # override it.
         if 'pivot' in sd:
             pivot_local = np.asarray(sd['pivot'], dtype=np.float64)
             translate = np.array([0.0, ground_offset_y, 0.0]) - pivot_local
+        elif hinge_frame is not None:
+            pivot_local = hinge_frame[0]
+            translate = np.array([0.0, ground_offset_y, 0.0]) - pivot_local
         else:
             member_v = np.vstack([p['world_v'] for p in members])
+            hinge_z = float(member_v[:, 2].min()) if control == 'slats' else float(member_v[:, 2].max())
             pivot_world = np.array([
                 float(member_v[:, 0].mean()),
                 float(member_v[:, 1].mean()),
-                float(member_v[:, 2].max()),
+                hinge_z,
             ])
             pivot_local = pivot_world + np.array([0.0, ground_offset_y, 0.0])
             translate = -pivot_world
@@ -649,17 +732,33 @@ def import_mod(cfg: dict) -> int:
     if shadow_manifest:
         print(f'Wrote {shadow_path}')
 
+    flight = dict(cfg.get('flight') or {})
+    ground_rest_height_m = ground_distance
+    if ground_part_names and flight:
+        gear_cfg = dict(flight.get('gear') or {})
+        derived = derive_gear_points(
+            processed, ground_part_names, np.asarray(ground_translate),
+            bottom_percentile=ground_contact_percentile,
+        )
+        if derived:
+            gear_cfg['points'] = derived
+            flight['gear'] = gear_cfg
+            ground_rest_height_m = -min(p[1] for p in derived)
+            print(f'Gear contact points: {derived}')
+
     manifest = {
         'name': cfg.get('name', stem),
         'body': rel(body_path),
         'shadow': shadow_manifest,
         'gear': gear_manifest,
+        'static': rel(out),
         'surfaces': surfaces_manifest,
         'fx': flyable.get('fx', {'nozzles': None, 'wingtips': None}),
         'cockpitOffset': flyable.get('cockpitOffset', [0.0, 1.0, 4.0]),
         'spawn': flyable.get('spawn', {}),
         'groundOffsetY': round(float(ground_offset_y), 4),
-        'flight': cfg.get('flight'),
+        'groundRestHeightM': round(float(ground_rest_height_m), 4),
+        'flight': flight or None,
     }
     manifest_path = f'{prefix}.aircraft.json'
     with open(manifest_path, 'w', encoding='utf-8') as f:

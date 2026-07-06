@@ -44,9 +44,11 @@
       { "role": "elevatorRight", "parts": ["ElevatorRight"], "control": "pitch", "sign": 1, "rangeRad": 0.42 },
       { "role": "aileronLeft", "parts": ["AileronL"], "control": "roll", "sign": 1, "rangeRad": 0.4 },
       { "role": "aileronRight", "parts": ["AileronR"], "control": "roll", "sign": -1, "rangeRad": 0.4 },
-      { "role": "rudder", "parts": ["Rudder"], "control": "yaw", "sign": 1, "rangeRad": 0.45 },
-      { "role": "flapLeft", "parts": ["FlapL"], "control": "flaps", "sign": 1, "rangeRad": 0.5 },
-      { "role": "flapRight", "parts": ["FlapR"], "control": "flaps", "sign": 1, "rangeRad": 0.5 }
+      { "role": "rudder", "parts": ["Rudder"], "control": "yaw", "sign": 1, "rangeRad": 0.45, "axis": [0.0, 0.9195, -0.386], "pivot": [0.0, 2.2728, -5.782] },
+      { "role": "flapLeft", "parts": ["FlapL"], "control": "flaps", "sign": -1, "rangeRad": 0.5 },
+      { "role": "flapRight", "parts": ["FlapR"], "control": "flaps", "sign": -1, "rangeRad": 0.5 },
+      { "role": "slatLeft", "parts": ["SlatL"], "hingePart": "BSlatL", "control": "slats", "sign": 1, "rangeRad": 0.35 },
+      { "role": "slatRight", "parts": ["SlatR"], "hingePart": "BSlatR", "control": "slats", "sign": 1, "rangeRad": 0.35 }
     ]
   },
 
@@ -85,11 +87,6 @@
     "bodyCd0": 0.028,
     "waveDrag": { "machOnset": 0.90, "scale": 0.50 },
     "gear": {
-      "points": [
-        [0.0, -2.0, 2.4],
-        [-1.0, -2.0, -0.3],
-        [1.0, -2.0, -0.3]
-      ],
       "stiffness": 3000000,
       "damping": 130000,
       "rollFriction": 0.04,
