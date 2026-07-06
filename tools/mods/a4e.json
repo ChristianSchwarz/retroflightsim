@@ -1,6 +1,6 @@
 {
   "name": "A-4E Skyhawk",
-  "bundle": "c:\\Users\\Christian-CarbonFree\\Downloads\\3617819835_A-4E_Skyhawk.zip",
+  "bundle": "mods/A-4E_Skyhawk.zip",
   "out": "assets/a4e_static.gltf",
   "bufferPrefix": "a4e_static_buffer_",
   "groundDistance": 2.0,

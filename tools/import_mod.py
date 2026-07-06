@@ -688,8 +688,8 @@ def import_mod(cfg: dict) -> int:
 
         # Hinge pivot (aircraft-local frame). Baked-geometry mods carry no useful
         # per-part transform, so derive it from the part geometry: the spanwise/
-        # vertical centre at the hinge edge ù trailing-edge controls (flaps,
-        # ailerons, ù) use max +Z; leading-edge slats use min +Z. `pivot` may
+        # vertical centre at the hinge edge; trailing-edge controls (flaps,
+        # ailerons, etc.) use max +Z; leading-edge slats use min +Z. `pivot` may
         # override it.
         if 'pivot' in sd:
             pivot_local = np.asarray(sd['pivot'], dtype=np.float64)
