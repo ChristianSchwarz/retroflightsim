@@ -53,11 +53,17 @@ Straight from the CLI (auto-detects the palette texture and glass):
 python tools/import_mod.py --bundle "C:/Downloads/mod.zip" --out assets/foo_static.gltf
 ```
 
-Or, for repeatability, with a JSON config (recommended):
+Or, for repeatability, with a JSON config (recommended). Copy
+`tools/mods/_template.json`, fill in `bundle` + `out`, and tweak from there:
 
 ```
 python tools/import_mod.py --config tools/mods/a4e.json
 ```
+
+Only `bundle` and `out` are required; every other field has a sensible default
+(include everything, drop colliders/shadows, auto-detect glass and the palette
+swatch). Use `--list` to discover part and material names before narrowing the
+include/skip lists.
 
 The A-4E has its own convenience wrapper:
 
@@ -73,23 +79,44 @@ it anywhere via `ModelManager.getModel('assets/foo_static.gltf')`.
 
 ## Config schema (`tools/mods/*.json`)
 
+See `tools/mods/_template.json` for a copy-paste starting point. Only `bundle`
+and `out` are required.
+
 | Field            | Meaning                                                              |
 | ---------------- | ------------------------------------------------------------------- |
-| `bundle`         | Path to a mod `.zip`, a Unity asset-bundle file, or a folder.        |
-| `out`            | Output `.gltf` path (relative to project root).                     |
+| `bundle`         | **(required)** Path to a mod `.zip`, a Unity asset-bundle file, or a folder. |
+| `out`            | **(required)** Output `.gltf` path (relative to project root).      |
 | `bufferPrefix`   | Prefix for the `.bin` buffers (defaults to the output file stem).   |
 | `groundDistance` | Distance from model origin down to the ground (2.0 for aircraft).   |
 | `scale`          | Uniform scale applied to geometry (default 1.0).                    |
+| `rotationEuler`  | `[x, y, z]` degrees to reorient a model that faces the wrong way.   |
 | `swatchMax`      | Max texture size in px treated as a palette swatch (default 64).    |
-| `gearWheelParts` | Part names used to compute the ground offset (lowest wheel).        |
-| `glassParts`     | Part-name substrings exported as literal `glassColor` (not `GLASS` palette). |
-| `glassColor`     | Hex colour for `glassParts` (default `#d1f7ff`).                    |
-| `canopyFrameColor` | Opaque hex for canopy seal/frame submeshes (default `#262826`).   |
-| `canopyFrameMaterials` | Unity material names treated as frame, not glass (default `["Canopy"]`). |
+| `glassColor`     | Flat colour for glass parts with no palette tint (default `#d1f7ff`). |
+| `glassParts`     | Part-name substrings always exported as glass.                      |
+| `glassAutoAlpha` | Auto-treat transparent materials as glass (default `true`).         |
+| `glassAlphaMax`  | Alpha below which a material counts as glass (default `0.9`).        |
+| `materialColors` | Map of Unity material name -> `#rrggbb` **or** a `PaletteCategory` (e.g. `"GLASS"`). Overrides palette sampling for those materials. |
+| `groundParts`    | Part names used to compute the ground offset (lowest point). `gearWheelParts` is accepted as an alias. |
 | `skipMaterials`  | Material-name substrings whose meshes are dropped (colliders etc.). |
-| `skipExact`      | Part names dropped exactly (e.g. interior `Canopy` frame, not `CanopyGlass`). |
+| `skipExact`      | Part names dropped exactly.                                         |
 | `includeExact`   | Part names always kept even if they match a skip substring.         |
 | `skipNameParts`  | Part-name substrings to drop (gauges, weapons, colliders, ...).     |
+
+With no include/skip lists, every mesh object is exported (minus
+`skipMaterials`). Narrow it down with `skipNameParts`/`skipExact` for interior
+or clutter parts, and use `includeExact` to rescue a part that a skip substring
+would otherwise catch.
+
+### Per-material colour overrides
+
+`materialColors` is the general way to fix a specific material's colour when the
+palette/alpha heuristics get it wrong. The value can be either a literal
+`#rrggbb` (rendered as-is) or the name of a sim `PaletteCategory` such as
+`GLASS` or `VEHICLE_PLANE_GREY` (tinted by the active palette/time). Example:
+
+```json
+"materialColors": { "CanopyRubber": "#262826", "Windscreen": "GLASS" }
+```
 
 ## Notes / limitations
 

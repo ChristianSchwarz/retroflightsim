@@ -1,15 +1,22 @@
-"""Import a Unity asset-bundle aircraft/vehicle mod into a retroflightsim glTF.
+"""Import a Unity asset-bundle mod into a retroflightsim glTF.
 
-Many low-poly flight-sim mods (e.g. the Tiny Combat Arena A-4E) do not use
-detail textures. Their whole livery -- paint, insignia, side numbers, trim --
-is authored as flat polygon "vector decals" whose colours come from a tiny
+Many low-poly Unity mods (e.g. Tiny Combat Arena aircraft) do not use detail
+textures. Their whole livery -- paint, insignia, side numbers, trim -- is
+authored as flat polygon "vector decals" whose colours come from a tiny
 palette-swatch texture: every triangle's UVs point at one solid-colour cell.
+Others simply rely on per-material flat `_Color` values.
 
-This tool recovers those real per-polygon colours by sampling the palette
-texture at each face's UV centroid, groups faces by colour, and writes a glTF
-with one mesh/material per distinct colour. Each material is named '#rrggbb' so
-the sim renders that literal colour (see ModelManager.rawColorFor) instead of
-mapping it to a PaletteCategory. Transparent glass keeps the GLASS category.
+This tool recovers those real per-polygon colours by, for each mesh face:
+  1. an explicit per-material override colour (config `materialColors`), else
+  2. a palette-swatch sample at the face's UV centroid, else
+  3. the material's flat `_Color`, else a neutral fallback.
+Faces are grouped by colour and written to a glTF with one mesh/material per
+distinct colour. Each material is named '#rrggbb' so the sim renders that
+literal colour (see ModelManager.rawColorFor). A material name may also be a
+PaletteCategory (e.g. 'GLASS') to let the sim tint it per palette/time.
+
+Transparent materials (low alpha) are auto-detected as glass; you can also
+force parts to glass by name, and control the glass colour.
 
 The --bundle input may be a mod .zip (e.g. a Tiny Combat Arena workshop
 download), a raw Unity asset bundle file, or a folder; a .zip is unpacked and
@@ -17,12 +24,12 @@ the Unity bundle inside is located automatically.
 
 Usage:
     # Inspect a mod (list GameObjects, materials, textures) before importing:
-    python tools/import_mod.py --bundle "C:/Downloads/3617819835_A-4E_Skyhawk.zip" --list
+    python tools/import_mod.py --bundle "C:/Downloads/mod.zip" --list
 
-    # Import using a JSON config (see tools/mods/a4e.json):
+    # Import using a JSON config (see tools/mods/_template.json for all fields):
     python tools/import_mod.py --config tools/mods/a4e.json
 
-    # Import straight from the CLI with auto-detection:
+    # Import straight from the CLI (zero-config: include everything, auto glass):
     python tools/import_mod.py --bundle "C:/Downloads/mod.zip" --out assets/foo.gltf
 
 The importer only produces the glTF asset. To make it appear in the sim, add it
@@ -49,6 +56,14 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 GLASS_CATEGORY = 'GLASS'
 DEFAULT_MATERIAL = '#909094'  # neutral grey fallback
+
+# UnityPy's mesh.export() negates X to convert Unity's left-handed coordinates
+# to a right-handed OBJ/glTF system. Transforms read from the bundle are still
+# in Unity's left-handed space, so a part's world matrix must be conjugated by
+# this flip (S @ M @ S) before it is applied to the exported (flipped) verts.
+# Without this, only identity-rotation parts land correctly; rotated/offset
+# parts (gear wheels, speedbrakes, control surfaces) get the wrong axis.
+_FLIP_X = np.diag([-1.0, 1.0, 1.0, 1.0])
 
 # A texture no larger than this (px) is treated as a flat palette-swatch atlas.
 DEFAULT_SWATCH_MAX = 64
@@ -100,6 +115,18 @@ def world_matrix(path_id: int, transforms, cache) -> np.ndarray:
         mat = world_matrix(parent.path_id, transforms, cache) @ mat
     cache[path_id] = mat
     return mat
+
+
+def euler_matrix(degrees) -> np.ndarray:
+    """3x3 rotation matrix from XYZ Euler angles (degrees), applied X then Y then Z."""
+    rx, ry, rz = (np.radians(float(a)) for a in degrees)
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    mx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float64)
+    my = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)
+    mz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float64)
+    return mz @ my @ mx
 
 
 # --------------------------------------------------------------------------- #
@@ -259,7 +286,8 @@ def list_bundle(bundle: Bundle):
         tex = bundle.textures.get(m['main_tex'], {}) if m['main_tex'] else {}
         texname = tex.get('name', '-')
         col = rgba01_to_hex(m['color']) if m['color'] else '-'
-        print(f'  {m["name"]:24s} tex={texname:20s} color={col} alpha={m["alpha"]:.2f}')
+        glass = ' (transparent -> glass)' if m['alpha'] < 0.9 else ''
+        print(f'  {m["name"]:24s} tex={texname:20s} color={col} alpha={m["alpha"]:.2f}{glass}')
     print('== GameObjects with meshes ==')
     for o in bundle.env.objects:
         if o.type.name != 'GameObject':
@@ -307,37 +335,47 @@ def import_mod(cfg: dict) -> int:
         os.path.splitext(os.path.basename(out))[0] + '_buffer_')
     ground_distance = float(cfg.get('groundDistance', 2.0))
     scale = float(cfg.get('scale', 1.0))
+    rotation_euler = cfg.get('rotationEuler')  # [x, y, z] degrees, or None
     swatch_max = int(cfg.get('swatchMax', DEFAULT_SWATCH_MAX))
     glass_color = cfg.get('glassColor', '#d1f7ff')
-    canopy_frame_color = cfg.get('canopyFrameColor', '#262826')
-    canopy_frame_materials = set(cfg.get('canopyFrameMaterials', ['Canopy']))
-    gear_parts = set(cfg.get('gearWheelParts', []))
     glass_parts = tuple(cfg.get('glassParts', []))
+    glass_auto_alpha = bool(cfg.get('glassAutoAlpha', True))
+    glass_alpha_max = float(cfg.get('glassAlphaMax', 0.9))
+    # Explicit per-material colour overrides: Unity material name -> '#rrggbb'
+    # or a PaletteCategory name (e.g. 'GLASS'). Supersedes palette sampling.
+    material_colors = dict(cfg.get('materialColors', {}))
+    # groundParts is the general name; gearWheelParts kept as a back-compat alias.
+    ground_parts = set(cfg.get('groundParts', cfg.get('gearWheelParts', [])))
     include_exact = set(cfg.get('includeExact', []))
     skip_parts = tuple(cfg.get('skipNameParts', []))
     skip_exact = set(cfg.get('skipExact', []))
     skip_materials = tuple(cfg.get('skipMaterials', DEFAULT_SKIP_MATERIALS))
 
+    rotation_matrix = euler_matrix(rotation_euler) if rotation_euler else None
+
     bundle = Bundle(bundle_path)
 
-    def is_glass(name: str, mat: dict) -> bool:
+    def is_glass(name: str, mat: dict | None) -> bool:
         if any(p in name for p in glass_parts):
+            return True
+        if glass_auto_alpha and mat is not None and mat['alpha'] < glass_alpha_max:
             return True
         return False
 
-    def is_canopy_frame(mat: dict | None) -> bool:
-        return mat is not None and mat['name'] in canopy_frame_materials
-
     def face_colors(name: str, mat: dict | None, face_t: np.ndarray,
                     uvs: np.ndarray | None, pal: np.ndarray | None) -> np.ndarray:
+        # 1. Explicit per-material override wins.
+        if mat is not None and mat['name'] in material_colors:
+            return np.full(len(face_t), material_colors[mat['name']])
+        # 2. Glass: sample palette if the glass has real per-poly tint, else flat.
         if is_glass(name, mat):
             if uvs is not None and pal is not None:
                 return sample_hex(pal, uvs[face_t].mean(axis=1))
             return np.full(len(face_t), glass_color)
-        if is_canopy_frame(mat):
-            return np.full(len(face_t), canopy_frame_color)
+        # 3. Palette-swatch sampled per face.
         if pal is not None and uvs is not None:
             return sample_hex(pal, uvs[face_t].mean(axis=1))
+        # 4. Flat material colour, else neutral fallback.
         if mat is not None and mat['color']:
             return np.full(len(face_t), rgba01_to_hex(mat['color']))
         return np.full(len(face_t), DEFAULT_MATERIAL)
@@ -399,9 +437,12 @@ def import_mod(cfg: dict) -> int:
             continue
 
         wm = world_matrix(transform_pid, bundle.transforms, world_cache)
+        wm = _FLIP_X @ wm @ _FLIP_X  # match the X-flip in mesh.export()
         world_v = (wm @ np.c_[verts, np.ones(len(verts))].T).T[:, :3] * scale
+        if rotation_matrix is not None:
+            world_v = world_v @ rotation_matrix.T
 
-        if name in gear_parts:
+        if name in ground_parts:
             wmin = float(world_v[:, 1].min())
             gear_min_y = wmin if gear_min_y is None else min(gear_min_y, wmin)
 
@@ -412,7 +453,8 @@ def import_mod(cfg: dict) -> int:
             if sub_mat and any(s in sub_mat['name'] for s in skip_materials):
                 continue
             pal = palette_array(sub_mat)
-            if (not is_glass(name, sub_mat) and not is_canopy_frame(sub_mat)
+            has_override = sub_mat is not None and sub_mat['name'] in material_colors
+            if (not has_override and not is_glass(name, sub_mat)
                     and pal is None and (sub_mat is None or not sub_mat['color'])):
                 continue
 
@@ -431,7 +473,8 @@ def import_mod(cfg: dict) -> int:
 
     if gear_min_y is None:
         gear_min_y = min(min(t[:, 1].min() for t in tris) for tris in buckets.values())
-    ground_offset_y = -ground_distance - gear_min_y
+    ground_min_y = gear_min_y
+    ground_offset_y = -ground_distance - ground_min_y
 
     scene = trimesh.Scene()
     for idx, (key, tris) in enumerate(buckets.items()):
@@ -449,7 +492,7 @@ def import_mod(cfg: dict) -> int:
     print(f'Wrote {out}')
     print(f'Parts: {part_count}, colours/materials: {len(buckets)}')
     print('  ' + ', '.join(sorted(buckets)))
-    print(f'gear_min_y: {gear_min_y:.3f}, ground_offset_y: {ground_offset_y:.3f}')
+    print(f'ground_min_y: {ground_min_y:.3f}, ground_offset_y: {ground_offset_y:.3f}')
     return 0
 
 
@@ -524,6 +567,7 @@ def main(argv=None) -> int:
     ap.add_argument('--out', help='Output .gltf path (relative to project root).')
     ap.add_argument('--ground', type=float, help='Distance from origin to ground (default 2.0).')
     ap.add_argument('--scale', type=float, help='Uniform scale applied to geometry.')
+    ap.add_argument('--rotate', help='XYZ Euler rotation in degrees, e.g. "0,180,0", to reorient the model.')
     ap.add_argument('--swatch-max', type=int, help='Max texture size (px) treated as a palette swatch.')
     ap.add_argument('--list', action='store_true', help='List textures/materials/objects and exit.')
     args = ap.parse_args(argv)
@@ -537,6 +581,8 @@ def main(argv=None) -> int:
         cfg['groundDistance'] = args.ground
     if args.scale is not None:
         cfg['scale'] = args.scale
+    if args.rotate is not None:
+        cfg['rotationEuler'] = [float(x) for x in args.rotate.split(',')]
     if args.swatch_max is not None:
         cfg['swatchMax'] = args.swatch_max
 

@@ -6,11 +6,10 @@
   "groundDistance": 2.0,
   "scale": 1.0,
   "swatchMax": 64,
-  "gearWheelParts": ["GearMainWheelR", "GearNoseWheel", "GearMainWheelL"],
+  "groundParts": ["GearMainWheelR", "GearNoseWheel", "GearMainWheelL"],
   "glassParts": ["CanopyGlass", "CanopyGlass2"],
   "glassColor": "#d1f7ff",
-  "canopyFrameColor": "#262826",
-  "canopyFrameMaterials": ["Canopy"],
+  "materialColors": {},
   "skipMaterials": ["Collider", "ShadowDepthOffset", "Shadow"],
   "skipExact": ["CockpitMain", "CockpitPanel", "CockpitFloor"],
   "includeExact": [

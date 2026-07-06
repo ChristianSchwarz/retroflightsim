@@ -1,0 +1,28 @@
+{
+  "_comment": "Template config for tools/import_mod.py. Copy this file, fill in bundle+out, then run: python tools/import_mod.py --config tools/mods/<yourmod>.json. Only 'bundle' and 'out' are required; every other field has a sensible default. Run with --list first to discover part and material names.",
+
+  "name": "My Mod",
+  "bundle": "C:\\Downloads\\my_mod.zip",
+  "out": "assets/mymod_static.gltf",
+
+  "bufferPrefix": "mymod_static_buffer_",
+  "groundDistance": 2.0,
+  "scale": 1.0,
+  "rotationEuler": [0, 0, 0],
+
+  "swatchMax": 64,
+
+  "glassColor": "#d1f7ff",
+  "glassParts": [],
+  "glassAutoAlpha": true,
+  "glassAlphaMax": 0.9,
+
+  "materialColors": {},
+
+  "groundParts": [],
+
+  "includeExact": [],
+  "skipExact": [],
+  "skipNameParts": [],
+  "skipMaterials": ["Collider", "ShadowDepthOffset", "Shadow"]
+}
