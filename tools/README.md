@@ -82,8 +82,12 @@ it anywhere via `ModelManager.getModel('assets/foo_static.gltf')`.
 | `scale`          | Uniform scale applied to geometry (default 1.0).                    |
 | `swatchMax`      | Max texture size in px treated as a palette swatch (default 64).    |
 | `gearWheelParts` | Part names used to compute the ground offset (lowest wheel).        |
-| `glassParts`     | Part-name substrings forced to the transparent `GLASS` category.    |
+| `glassParts`     | Part-name substrings exported as literal `glassColor` (not `GLASS` palette). |
+| `glassColor`     | Hex colour for `glassParts` (default `#d1f7ff`).                    |
+| `canopyFrameColor` | Opaque hex for canopy seal/frame submeshes (default `#262826`).   |
+| `canopyFrameMaterials` | Unity material names treated as frame, not glass (default `["Canopy"]`). |
 | `skipMaterials`  | Material-name substrings whose meshes are dropped (colliders etc.). |
+| `skipExact`      | Part names dropped exactly (e.g. interior `Canopy` frame, not `CanopyGlass`). |
 | `includeExact`   | Part names always kept even if they match a skip substring.         |
 | `skipNameParts`  | Part-name substrings to drop (gauges, weapons, colliders, ...).     |
 

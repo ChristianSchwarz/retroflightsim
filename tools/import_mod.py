@@ -105,6 +105,37 @@ def world_matrix(path_id: int, transforms, cache) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Mesh / material parsing
 # --------------------------------------------------------------------------- #
+def read_submesh_faces(mesh) -> list[np.ndarray]:
+    """Return per-submesh triangle index arrays from a Unity mesh."""
+    ib = np.array(list(mesh.m_IndexBuffer), dtype=np.int64)
+    sub_faces: list[np.ndarray] = []
+    off = 0
+    for sm in mesh.m_SubMeshes:
+        idx = ib[off:off + sm.indexCount]
+        off += sm.indexCount
+        if len(idx) >= 3:
+            sub_faces.append(idx.reshape(-1, 3))
+    return sub_faces
+
+
+def mesh_geometry(mesh, mat_pids: list) -> tuple[np.ndarray, np.ndarray | None, list[np.ndarray], list[np.ndarray]]:
+    """Return verts, uvs, per-submesh face indices, and per-submesh UV indices."""
+    multi_material = len(mat_pids) > 1 and len(mesh.m_SubMeshes) > 1
+    if multi_material:
+        verts, uvs, face_v, face_t = parse_obj(mesh.export())
+        if len(verts) == 0 or len(face_v) == 0:
+            return np.empty((0, 3)), None, [], []
+        sub_faces = read_submesh_faces(mesh)
+        if not sub_faces:
+            return verts, uvs, [face_v], [face_t]
+        # Unity vertex indices match the exported OBJ; UVs are per-vertex.
+        return verts, uvs, sub_faces, sub_faces
+    verts, uvs, face_v, face_t = parse_obj(mesh.export())
+    if len(verts) == 0 or len(face_v) == 0:
+        return np.empty((0, 3)), None, [], []
+    return verts, uvs, [face_v], [face_t]
+
+
 def parse_obj(obj_text: str):
     """Return (vertices Nx3, uvs Mx2 or None, face_v Fx3, face_t Fx3)."""
     verts, uvs, face_v, face_t = [], [], [], []
@@ -282,7 +313,9 @@ def _renderer_material_names(bundle: Bundle, go):
 # --------------------------------------------------------------------------- #
 # Import
 # --------------------------------------------------------------------------- #
-def _should_include(name: str, include_exact, skip_parts) -> bool:
+def _should_include(name: str, include_exact, skip_parts, skip_exact) -> bool:
+    if name in skip_exact:
+        return False
     if name in include_exact:
         return True
     return not any(part in name for part in skip_parts)
@@ -298,10 +331,14 @@ def import_mod(cfg: dict) -> int:
     ground_distance = float(cfg.get('groundDistance', 2.0))
     scale = float(cfg.get('scale', 1.0))
     swatch_max = int(cfg.get('swatchMax', DEFAULT_SWATCH_MAX))
+    glass_color = cfg.get('glassColor', '#d1f7ff')
+    canopy_frame_color = cfg.get('canopyFrameColor', '#262826')
+    canopy_frame_materials = set(cfg.get('canopyFrameMaterials', ['Canopy']))
     gear_parts = set(cfg.get('gearWheelParts', []))
     glass_parts = tuple(cfg.get('glassParts', []))
     include_exact = set(cfg.get('includeExact', []))
     skip_parts = tuple(cfg.get('skipNameParts', []))
+    skip_exact = set(cfg.get('skipExact', []))
     skip_materials = tuple(cfg.get('skipMaterials', DEFAULT_SKIP_MATERIALS))
 
     bundle = Bundle(bundle_path)
@@ -309,7 +346,24 @@ def import_mod(cfg: dict) -> int:
     def is_glass(name: str, mat: dict) -> bool:
         if any(p in name for p in glass_parts):
             return True
-        return mat is not None and mat['alpha'] < 0.9
+        return False
+
+    def is_canopy_frame(mat: dict | None) -> bool:
+        return mat is not None and mat['name'] in canopy_frame_materials
+
+    def face_colors(name: str, mat: dict | None, face_t: np.ndarray,
+                    uvs: np.ndarray | None, pal: np.ndarray | None) -> np.ndarray:
+        if is_glass(name, mat):
+            if uvs is not None and pal is not None:
+                return sample_hex(pal, uvs[face_t].mean(axis=1))
+            return np.full(len(face_t), glass_color)
+        if is_canopy_frame(mat):
+            return np.full(len(face_t), canopy_frame_color)
+        if pal is not None and uvs is not None:
+            return sample_hex(pal, uvs[face_t].mean(axis=1))
+        if mat is not None and mat['color']:
+            return np.full(len(face_t), rgba01_to_hex(mat['color']))
+        return np.full(len(face_t), DEFAULT_MATERIAL)
 
     def palette_array(mat: dict):
         if mat is None or not mat['main_tex']:
@@ -331,7 +385,7 @@ def import_mod(cfg: dict) -> int:
             continue
         go = o.read()
         name = go.m_Name
-        if not _should_include(name, include_exact, skip_parts):
+        if not _should_include(name, include_exact, skip_parts, skip_exact):
             continue
 
         transform_pid = None
@@ -356,40 +410,44 @@ def import_mod(cfg: dict) -> int:
         if mesh is None:
             continue
 
-        primary_mat = bundle.materials.get(mat_pids[0]) if mat_pids else None
-        if primary_mat and any(s in primary_mat['name'] for s in skip_materials):
+        if not mat_pids:
+            continue
+        if any(any(s in bundle.materials.get(pid, {}).get('name', '')
+                   for s in skip_materials)
+               for pid in mat_pids):
             continue
 
-        glass = is_glass(name, primary_mat)
-        pal = None if glass else palette_array(primary_mat)
-        # Skip parts we cannot colour (no palette, no usable flat colour, not glass).
-        if not glass and pal is None and (primary_mat is None or not primary_mat['color']):
+        verts, uvs, sub_faces, sub_face_t = mesh_geometry(mesh, mat_pids)
+        if len(verts) == 0 or not sub_faces:
             continue
 
-        verts, uvs, face_v, face_t = parse_obj(mesh.export())
-        if len(verts) == 0 or len(face_v) == 0:
-            continue
-
-        mat = world_matrix(transform_pid, bundle.transforms, world_cache)
-        world_v = (mat @ np.c_[verts, np.ones(len(verts))].T).T[:, :3] * scale
+        wm = world_matrix(transform_pid, bundle.transforms, world_cache)
+        world_v = (wm @ np.c_[verts, np.ones(len(verts))].T).T[:, :3] * scale
 
         if name in gear_parts:
             wmin = float(world_v[:, 1].min())
             gear_min_y = wmin if gear_min_y is None else min(gear_min_y, wmin)
 
-        tri_corners = world_v[face_v]  # (F, 3, 3)
+        exported = False
+        for si, face_v in enumerate(sub_faces):
+            sub_mat = bundle.materials.get(
+                mat_pids[si if si < len(mat_pids) else 0])
+            if sub_mat and any(s in sub_mat['name'] for s in skip_materials):
+                continue
+            pal = palette_array(sub_mat)
+            if (not is_glass(name, sub_mat) and not is_canopy_frame(sub_mat)
+                    and pal is None and (sub_mat is None or not sub_mat['color'])):
+                continue
 
-        if glass:
-            keys = np.full(len(face_v), GLASS_CATEGORY)
-        elif pal is not None and uvs is not None:
-            keys = sample_hex(pal, uvs[face_t].mean(axis=1))
-        else:
-            keys = np.full(len(face_v), rgba01_to_hex(primary_mat['color']))
+            face_t = sub_face_t[si]
+            tri_corners = world_v[face_v]
+            keys = face_colors(name, sub_mat, face_t, uvs, pal)
+            for key in np.unique(keys):
+                buckets[str(key)].append(tri_corners[keys == key].reshape(-1, 3))
+            exported = True
 
-        for key in np.unique(keys):
-            buckets[str(key)].append(tri_corners[keys == key].reshape(-1, 3))
-
-        part_count += 1
+        if exported:
+            part_count += 1
 
     if not buckets:
         raise SystemExit('No colourable meshes found. Try --list to inspect the bundle.')

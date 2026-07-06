@@ -7,14 +7,18 @@
   "scale": 1.0,
   "swatchMax": 64,
   "gearWheelParts": ["GearMainWheelR", "GearNoseWheel", "GearMainWheelL"],
-  "glassParts": ["CanopyGlass"],
+  "glassParts": ["CanopyGlass", "CanopyGlass2"],
+  "glassColor": "#d1f7ff",
+  "canopyFrameColor": "#262826",
+  "canopyFrameMaterials": ["Canopy"],
   "skipMaterials": ["Collider", "ShadowDepthOffset", "Shadow"],
+  "skipExact": ["CockpitMain", "CockpitPanel", "CockpitFloor"],
   "includeExact": [
     "VerticalStabilizerTip", "NozzleInterior", "SlatL", "RudderRight", "Canopy",
-    "Seat", "AileronL", "WingLCenter", "FlapR", "CanopyGlass", "AileronR",
+    "AileronL", "WingLCenter", "FlapR", "CanopyGlass", "CanopyGlass2", "AileronR",
     "WingRCenter", "SlatR", "SpeedBrakeL", "ElevatorLeft", "ElevatorRTip",
     "Fuselage", "RudderLeft", "SpeedBrakeR", "FlapL", "ElevatorLTip", "Rudder",
-    "ElevatorRight"
+    "ElevatorRight", "CanopyExplode"
   ],
   "skipNameParts": [
     "Needle", "Gauge", "Clock", "RPM", "Heading", "Azimuth", "Climb", "Attach",
@@ -23,6 +27,6 @@
     "FlightDirector", "HorAxisLine", "CockpitCam", "LightNav", "EnginePoint",
     "370Gal", "FuelTank", "CMLauncher", "Barrel", "WRDoor", "WLDoor",
     "WingLight", "C_", "BAileron", "BFlap", "AV8B", "Shadow", "M117", "Bolt",
-    "CanopyExplode"
+    "Cockpit", "Seat", "Stick", "Throttle", "Lever", "Compass", "FlightStick"
   ]
 }
