@@ -1,0 +1,156 @@
+{
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        1
+      ],
+      "name": "0"
+    },
+    {
+      "name": "1",
+      "nodes": []
+    },
+    {
+      "name": "2",
+      "nodes": []
+    },
+    {
+      "name": "3",
+      "nodes": []
+    },
+    {
+      "name": "4",
+      "nodes": []
+    },
+    {
+      "name": "5",
+      "nodes": []
+    }
+  ],
+  "asset": {
+    "version": "2.0",
+    "generator": "https://github.com/mikedh/trimesh"
+  },
+  "accessors": [
+    {
+      "componentType": 5125,
+      "type": "SCALAR",
+      "bufferView": 0,
+      "count": 61194,
+      "max": [
+        61193
+      ],
+      "min": [
+        0
+      ]
+    },
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 1,
+      "count": 61194,
+      "max": [
+        4.497308254241943,
+        3.6229512691497803,
+        7.10891056060791
+      ],
+      "min": [
+        -4.497673511505127,
+        -2.0,
+        -6.5059709548950195
+      ]
+    },
+    {
+      "componentType": 5126,
+      "count": 61194,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 2,
+      "max": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "min": [
+        -1.0,
+        -1.0,
+        -1.0
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "VEHICLE_PLANE_GREY",
+      "extras": {},
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2
+          },
+          "indices": 0,
+          "mode": 4,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "name": "world",
+      "children": [
+        1
+      ]
+    },
+    {
+      "name": "0_Fuselage",
+      "mesh": 0
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "a4e_body_buffer_0.bin",
+      "byteLength": 244776
+    },
+    {
+      "uri": "a4e_body_buffer_1.bin",
+      "byteLength": 734328
+    },
+    {
+      "uri": "a4e_body_buffer_2.bin",
+      "byteLength": 734328
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 244776
+    },
+    {
+      "buffer": 1,
+      "byteOffset": 0,
+      "byteLength": 734328
+    },
+    {
+      "buffer": 2,
+      "byteOffset": 0,
+      "byteLength": 734328
+    }
+  ],
+  "materials": [
+    {
+      "name": "VEHICLE_PLANE_GREY",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          1,
+          1,
+          1,
+          1
+        ]
+      }
+    }
+  ]
+}
