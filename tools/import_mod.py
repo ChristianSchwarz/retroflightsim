@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -334,10 +335,19 @@ def hinge_frame_from_part(
     world_cache: dict[int, np.ndarray],
     scale: float,
     ground_offset_y: float,
-    hinge_axis: str = 'x',
+    control: str = 'pitch',
+    hinge_axis: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Pivot + hinge axis from a Unity bone/empty (e.g. BSlatL) in the sim body frame."""
-    axis_col = {'x': 0, 'y': 1, 'z': 2}.get(hinge_axis.lower(), 0)
+    """Pivot + hinge axis from a Unity bone/empty (e.g. BSlatL) in the sim body frame.
+
+    The hinge axis is one of the bone's three local axes, but which column the
+    artist aligned to the hinge line varies between mods (e.g. the F-16 rudder
+    hinge is the bone's local Y, the A-4 rudder hinge is its local Z). Rather
+    than assume a fixed column, pick the local axis whose world direction best
+    matches the expected hinge orientation: vertical (world +Y) for a yaw
+    surface (rudder), spanwise (world +X) for everything else. An explicit
+    `hinge_axis` ('x'/'y'/'z') forces a specific column when needed.
+    """
     for o in bundle.env.objects:
         if o.type.name != 'GameObject':
             continue
@@ -355,12 +365,22 @@ def hinge_frame_from_part(
         wm = _FLIP_X @ world_matrix(transform_pid, bundle.transforms, world_cache) @ _FLIP_X
         hinge_world = wm[:3, 3] * scale
         pivot_local = hinge_world + np.array([0.0, ground_offset_y, 0.0])
-        axis = wm[:3, axis_col].copy()
-        n = float(np.linalg.norm(axis))
-        if n > 1e-9:
-            axis /= n
+
+        def _norm(v: np.ndarray) -> np.ndarray:
+            n = float(np.linalg.norm(v))
+            return v / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+
+        cols = [_norm(wm[:3, i].copy()) for i in range(3)]
+        ref = np.array([0.0, 1.0, 0.0]) if control == 'yaw' else np.array([1.0, 0.0, 0.0])
+        if hinge_axis is not None:
+            axis = cols[{'x': 0, 'y': 1, 'z': 2}.get(hinge_axis.lower(), 0)]
         else:
-            axis = np.array([1.0, 0.0, 0.0])
+            axis = max(cols, key=lambda c: abs(float(c @ ref)))
+        # Orient the sign so the dominant component is positive (+Y for yaw,
+        # +X otherwise); the per-surface `sign` in the manifest is tuned against
+        # this convention.
+        if float(axis @ ref) < 0.0:
+            axis = -axis
         return pivot_local, axis
     return None
 
@@ -419,6 +439,54 @@ def import_mod(cfg: dict) -> int:
     skip_parts = tuple(cfg.get('skipNameParts', []))
     skip_exact = set(cfg.get('skipExact', []))
     skip_materials = tuple(cfg.get('skipMaterials', DEFAULT_SKIP_MATERIALS))
+    # A single Unity bundle may pack several aircraft that share part names
+    # (e.g. many 'WingR'/'Cockpit'); they are separable only by material. When
+    # set, only meshes whose renderer uses one of these materials are exported,
+    # carving one plane out of a multi-plane bundle. Empty = include all.
+    include_materials = set(cfg.get('includeMaterials', []))
+    # Some bundles pack two overlapping copies of the same plane (e.g. a
+    # flyable + a scenery prefab, or two liveries sharing one material). Left
+    # in, they z-fight and the model looks broken. When true, only the first
+    # mesh per unique GameObject name is kept, yielding one clean copy.
+    dedupe_parts = bool(cfg.get('dedupeParts', False))
+    seen_names: set[str] = set()
+    # Optional greyscale remap. Some liveries bake heavy panel/camo shading into
+    # their swatch texture, so sampling yields a high-contrast mix of near-black
+    # and white faces. In a flat-shaded renderer the near-black regions read as
+    # voids ("missing" fuselage/wings), and the plane is not the uniform grey a
+    # jet should be. When enabled, every sampled colour is desaturated to its
+    # luminance and remapped into a [lo, hi] grey band (lifting blacks, taming
+    # whites), yielding a clean, fully-visible grey aircraft. Value: true (uses
+    # the defaults) or {"lo": <0-255>, "hi": <0-255>}.
+    grayscale_cfg = cfg.get('grayscale')
+    if grayscale_cfg is True:
+        gray_lo, gray_hi = 90, 205
+    elif isinstance(grayscale_cfg, dict):
+        gray_lo = int(grayscale_cfg.get('lo', 90))
+        gray_hi = int(grayscale_cfg.get('hi', 205))
+    else:
+        grayscale_cfg = None
+        gray_lo = gray_hi = 0
+
+    def grayify(hexes: np.ndarray) -> np.ndarray:
+        """Map an array of '#rrggbb' colours to greys in the [lo, hi] band.
+        Non-hex entries (PaletteCategory names, e.g. 'GLASS') pass through."""
+        if not grayscale_cfg:
+            return hexes
+        out = hexes.copy()
+        for h in np.unique(hexes):
+            s = str(h)
+            if len(s) != 7 or s[0] != '#':
+                continue
+            try:
+                r, g, b = int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16)
+            except ValueError:
+                continue
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+            v = int(round(gray_lo + (gray_hi - gray_lo) * (lum / 255.0)))
+            v = max(0, min(255, v))
+            out[hexes == h] = f'#{v:02x}{v:02x}{v:02x}'
+        return out
 
     rotation_matrix = euler_matrix(rotation_euler) if rotation_euler else None
 
@@ -435,21 +503,26 @@ def import_mod(cfg: dict) -> int:
                     uvs: np.ndarray | None, pal: np.ndarray | None) -> np.ndarray:
         # 1. Explicit per-material override wins.
         if mat is not None and mat['name'] in material_colors:
-            return np.full(len(face_t), material_colors[mat['name']])
+            res = np.full(len(face_t), material_colors[mat['name']])
         # 2. Glass: a PaletteCategory glass colour (e.g. 'GLASS') always renders
         # as one uniform material so the sim can tint/dither it; a literal
         # '#rrggbb' still samples per-poly tint when the glass has a swatch.
-        if is_glass(name, mat):
+        elif is_glass(name, mat):
             if glass_color.startswith('#') and uvs is not None and pal is not None:
-                return sample_hex(pal, uvs[face_t].mean(axis=1))
-            return np.full(len(face_t), glass_color)
+                res = sample_hex(pal, uvs[face_t].mean(axis=1))
+            else:
+                # A PaletteCategory glass colour is left untouched by the grey
+                # remap so the sim keeps tinting/dithering it as glass.
+                return np.full(len(face_t), glass_color)
         # 3. Palette-swatch sampled per face.
-        if pal is not None and uvs is not None:
-            return sample_hex(pal, uvs[face_t].mean(axis=1))
+        elif pal is not None and uvs is not None:
+            res = sample_hex(pal, uvs[face_t].mean(axis=1))
         # 4. Flat material colour, else neutral fallback.
-        if mat is not None and mat['color']:
-            return np.full(len(face_t), rgba01_to_hex(mat['color']))
-        return np.full(len(face_t), DEFAULT_MATERIAL)
+        elif mat is not None and mat['color']:
+            res = np.full(len(face_t), rgba01_to_hex(mat['color']))
+        else:
+            res = np.full(len(face_t), DEFAULT_MATERIAL)
+        return grayify(res)
 
     def palette_array(mat: dict):
         if mat is None or not mat['main_tex']:
@@ -478,6 +551,55 @@ def import_mod(cfg: dict) -> int:
         has_override = sub_mat is not None and sub_mat['name'] in material_colors
         return bool(has_override or is_glass(name, sub_mat)
                     or pal is not None or (sub_mat is not None and sub_mat['color']))
+
+    # A multi-plane bundle shares generic glass materials (e.g. 'Canopy',
+    # 'Glass') across every aircraft, so some transparent parts belong to the
+    # target plane yet carry no livery material and are dropped by
+    # includeMaterials (e.g. the F-16's separate 'CanopyBack' glass). When
+    # rescueGlassUnderRoot is set, we first find the transform-hierarchy root(s)
+    # of the livery-matched parts, then re-admit any glass (low-alpha) mesh that
+    # lives under the same root -- capturing this plane's stray glass without
+    # pulling in other planes' identically-named canopies.
+    rescue_glass = bool(cfg.get('rescueGlassUnderRoot', False)) and bool(include_materials)
+
+    def _root_of(tpid: int) -> int:
+        seen: set[int] = set()
+        cur = tpid
+        while True:
+            t = bundle.transforms.get(cur)
+            if t is None:
+                return cur
+            father = t.m_Father.path_id
+            if not father or father not in bundle.transforms or father in seen:
+                return cur
+            seen.add(cur)
+            cur = father
+
+    def _has_glass_mat(pids) -> bool:
+        return any(bundle.materials.get(pid, {}).get('alpha', 1.0) < glass_alpha_max
+                   for pid in pids)
+
+    matched_roots: set[int] = set()
+    if rescue_glass:
+        for o in bundle.env.objects:
+            if o.type.name != 'GameObject':
+                continue
+            go = o.read()
+            tpid = None
+            mat_pids = []
+            for comp in go.m_Component:
+                co = bundle.by_path.get(comp.component.path_id)
+                if co is None:
+                    continue
+                if co.type.name == 'Transform':
+                    tpid = comp.component.path_id
+                elif co.type.name == 'MeshRenderer':
+                    tt = co.read_typetree()
+                    mat_pids = [m['m_PathID'] for m in tt.get('m_Materials', [])]
+            if tpid is not None and any(
+                    bundle.materials.get(pid, {}).get('name', '') in include_materials
+                    for pid in mat_pids):
+                matched_roots.add(_root_of(tpid))
 
     processed: list[dict] = []
     ground_contact_y = None
@@ -514,10 +636,22 @@ def import_mod(cfg: dict) -> int:
 
         if not mat_pids:
             continue
+        has_livery = (not include_materials) or any(
+            bundle.materials.get(pid, {}).get('name', '') in include_materials
+            for pid in mat_pids)
+        rescued = (rescue_glass and not has_livery
+                   and _root_of(transform_pid) in matched_roots
+                   and _has_glass_mat(mat_pids))
+        if include_materials and not has_livery and not rescued:
+            continue
         if any(any(s in bundle.materials.get(pid, {}).get('name', '')
                    for s in skip_materials)
                for pid in mat_pids):
             continue
+        if dedupe_parts:
+            if name in seen_names:
+                continue
+            seen_names.add(name)
 
         verts, uvs, sub_faces, sub_face_t = mesh_geometry(mesh, mat_pids)
         if len(verts) == 0 or not sub_faces:
@@ -577,7 +711,18 @@ def import_mod(cfg: dict) -> int:
             v = np.vstack(tris)
             f = np.arange(len(v), dtype=np.int64).reshape(-1, 3)
             m = trimesh.Trimesh(vertices=v, faces=f, process=False)
-            _ = m.vertex_normals
+            # Degenerate (zero-area) faces yield zero-length normals that trimesh
+            # normalises to NaN. Those NaNs land in the NORMAL accessor's min/max,
+            # and Python's json.dump happily writes the literal `NaN` -- which is
+            # invalid JSON, so the browser's JSON.parse (and thus GLTFLoader)
+            # rejects the entire file and the mesh silently fails to load. Replace
+            # any non-finite normal with a safe up-vector before export.
+            n = np.asarray(m.vertex_normals, dtype=np.float64)
+            bad = ~np.isfinite(n).all(axis=1)
+            if bad.any():
+                n = n.copy()
+                n[bad] = (0.0, 1.0, 0.0)
+                m.vertex_normals = n
             m.visual = trimesh.visual.TextureVisuals(
                 material=trimesh.visual.material.PBRMaterial(name=key))
             scene.add_geometry(m, node_name=f'0_{idx}_{key}', geom_name=f'{idx}_{key}')
@@ -666,16 +811,30 @@ def import_mod(cfg: dict) -> int:
         control = sd.get('control', 'pitch')
         role = sd.get('role', f'surf{si}')
 
+        # Hinge frame: an explicit `hingePart` bone, else -- unless disabled via
+        # `autoHinge: false` -- an auto-discovered bone following the mod's
+        # `B`+partName convention (e.g. Rudder -> BRudder, SlatsL -> BSlatsL).
+        # This lets any well-authored mod get its true (often tilted) hinge axis
+        # and pivot with no per-surface config.
         hinge_part = sd.get('hingePart')
         hinge_frame = None
         if hinge_part:
             hinge_frame = hinge_frame_from_part(
                 bundle, hinge_part, world_cache, scale, ground_offset_y,
-                sd.get('hingeAxis', 'x'),
+                control, sd.get('hingeAxis'),
             )
             if hinge_frame is None:
                 print(f'WARNING: hingePart "{hinge_part}" for surface "{role}" not found; '
                       'falling back to geometry pivot.')
+        elif sd.get('autoHinge', True) and sd.get('parts'):
+            bone_prefix = cfg.get('hingeBonePrefix', 'B')
+            hinge_part = bone_prefix + sd['parts'][0]
+            hinge_frame = hinge_frame_from_part(
+                bundle, hinge_part, world_cache, scale, ground_offset_y,
+                control, sd.get('hingeAxis'),
+            )
+            if hinge_frame is not None:
+                print(f'  auto hinge bone "{hinge_part}" for surface "{role}"')
 
         # Hinge axis: explicit override, else bone local axis, else spanwise
         # flap surfaces and vertical (UP) for the rudder.
@@ -827,8 +986,18 @@ def _write_gltf(scene: trimesh.Scene, out: str, buffer_prefix: str):
             f.write(export[buf['uri']])
         buf['uri'] = f'{buffer_prefix}{i}.bin'
 
+    # Defensive guard: glTF is JSON, and browsers reject the non-standard `NaN`
+    # /`Infinity` literals that Python's json.dump emits. Scrub any non-finite
+    # accessor bounds (they are only hints) so a stray degenerate value can never
+    # again produce a file that parses in Python but fails in the browser.
+    for acc in gltf.get('accessors', []):
+        for bound in ('min', 'max'):
+            vals = acc.get(bound)
+            if vals is not None and any(not math.isfinite(x) for x in vals):
+                acc[bound] = [0.0 if not math.isfinite(x) else x for x in vals]
+
     with open(out, 'w', encoding='utf-8') as f:
-        json.dump(gltf, f, indent=2)
+        json.dump(gltf, f, indent=2, allow_nan=False)
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,254 @@
+{
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0,
+        1
+      ],
+      "name": "0"
+    },
+    {
+      "name": "1",
+      "nodes": []
+    },
+    {
+      "name": "2",
+      "nodes": []
+    },
+    {
+      "name": "3",
+      "nodes": []
+    },
+    {
+      "name": "4",
+      "nodes": []
+    },
+    {
+      "name": "5",
+      "nodes": []
+    }
+  ],
+  "asset": {
+    "version": "2.0",
+    "generator": "https://github.com/mikedh/trimesh"
+  },
+  "accessors": [
+    {
+      "componentType": 5125,
+      "type": "SCALAR",
+      "bufferView": 0,
+      "count": 27,
+      "max": [
+        26
+      ],
+      "min": [
+        0
+      ]
+    },
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 1,
+      "count": 27,
+      "max": [
+        -0.003370166290551424,
+        0.05107004940509796,
+        0.9368258714675903
+      ],
+      "min": [
+        -1.8802696466445923,
+        -0.28302261233329773,
+        -1.3156882524490356
+      ]
+    },
+    {
+      "componentType": 5126,
+      "count": 27,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 2,
+      "max": [
+        1.0,
+        0.9900816679000854,
+        0.03929011523723602
+      ],
+      "min": [
+        -0.18543154001235962,
+        -6.837648780511074e-10,
+        -0.07791505008935928
+      ]
+    },
+    {
+      "componentType": 5125,
+      "type": "SCALAR",
+      "bufferView": 3,
+      "count": 15,
+      "max": [
+        14
+      ],
+      "min": [
+        0
+      ]
+    },
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 4,
+      "count": 15,
+      "max": [
+        -0.003370166290551424,
+        0.006540391128510237,
+        0.9368258714675903
+      ],
+      "min": [
+        -1.8802696466445923,
+        -0.28302261233329773,
+        -1.3156882524490356
+      ]
+    },
+    {
+      "componentType": 5126,
+      "count": 15,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 5,
+      "max": [
+        0.1404930055141449,
+        -0.989382803440094,
+        0.05138847231864929
+      ],
+      "min": [
+        0.10875141620635986,
+        -0.9927397966384888,
+        -0.060192640870809555
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "0_#a9a9a9",
+      "extras": {},
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2
+          },
+          "indices": 0,
+          "mode": 4,
+          "material": 0
+        }
+      ]
+    },
+    {
+      "name": "1_#b5b5b5",
+      "extras": {},
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 4,
+            "NORMAL": 5
+          },
+          "indices": 3,
+          "mode": 4,
+          "material": 1
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "#a9a9a9",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.6627450980392157,
+          0.6627450980392157,
+          0.6627450980392157,
+          1.0
+        ]
+      }
+    },
+    {
+      "name": "#b5b5b5",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.7098039215686275,
+          0.7098039215686275,
+          0.7098039215686275,
+          1.0
+        ]
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "name": "0_0_#a9a9a9",
+      "mesh": 0
+    },
+    {
+      "name": "0_1_#b5b5b5",
+      "mesh": 1
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "f16_surf_elevatorRight_buffer_0.bin",
+      "byteLength": 108
+    },
+    {
+      "uri": "f16_surf_elevatorRight_buffer_1.bin",
+      "byteLength": 324
+    },
+    {
+      "uri": "f16_surf_elevatorRight_buffer_2.bin",
+      "byteLength": 324
+    },
+    {
+      "uri": "f16_surf_elevatorRight_buffer_3.bin",
+      "byteLength": 60
+    },
+    {
+      "uri": "f16_surf_elevatorRight_buffer_4.bin",
+      "byteLength": 180
+    },
+    {
+      "uri": "f16_surf_elevatorRight_buffer_5.bin",
+      "byteLength": 180
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 108
+    },
+    {
+      "buffer": 1,
+      "byteOffset": 0,
+      "byteLength": 324
+    },
+    {
+      "buffer": 2,
+      "byteOffset": 0,
+      "byteLength": 324
+    },
+    {
+      "buffer": 3,
+      "byteOffset": 0,
+      "byteLength": 60
+    },
+    {
+      "buffer": 4,
+      "byteOffset": 0,
+      "byteLength": 180
+    },
+    {
+      "buffer": 5,
+      "byteOffset": 0,
+      "byteLength": 180
+    }
+  ]
+}
