@@ -1144,7 +1144,17 @@ def import_mod(cfg: dict) -> int:
             print(f'Gear contact points: {derived}')
 
     manifest = {
-        'name': cfg.get('name', stem),
+        'id': cfg.get('id', stem),
+        'name': cfg.get('displayName', cfg.get('name', stem)),
+        'displayName': cfg.get('displayName', cfg.get('name', stem)),
+        'canonicalName': cfg.get('canonicalName', cfg.get('name', stem)),
+        'category': cfg.get('category'),
+        'description': cfg.get('description'),
+        'tags': cfg.get('tags', []),
+        'sourceMod': cfg.get('sourceMod'),
+        'sourceModId': cfg.get('sourceModId'),
+        'sourceMaterial': cfg.get('sourceMaterial'),
+        'importMeta': cfg.get('importMeta', {}),
         'body': rel(body_path),
         'shadow': shadow_manifest,
         'gear': gear_manifest,

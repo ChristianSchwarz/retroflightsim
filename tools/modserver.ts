@@ -41,6 +41,32 @@ interface DiscoveredPlane {
     bodyParts?: number;
 }
 
+interface CatalogAircraft {
+    canonicalName: string;
+    displayName: string;
+    category?: string;
+    description?: string;
+    modelPath?: string;
+}
+
+interface ModCatalog {
+    modName?: string;
+    modId?: string;
+    aircraft: CatalogAircraft[];
+}
+
+interface PlaneImportPlan {
+    modId: string;
+    idSlug: string;
+    name: string;
+    displayName: string;
+    material: string | null;
+    category?: string;
+    description?: string;
+    sourceMaterial?: string;
+    confidence?: number;
+}
+
 interface ImportedAircraft {
     id: string;
     name: string;
@@ -103,6 +129,231 @@ function findEmbeddedConfig(zipBuffer: Buffer): Partial<ImportConfig> | null {
     return null;
 }
 
+function parseJsonLoose(text: string): unknown {
+    const withoutBom = text.replace(/^\uFEFF/, '');
+    const withoutTrailingCommas = withoutBom
+        .replace(/,\s*([}\]])/g, '$1');
+    return JSON.parse(withoutTrailingCommas);
+}
+
+function normalizeName(value: string): string {
+    return value
+        .toLowerCase()
+        .replace(/\.[0-9]+$/g, '')
+        .replace(/\b(material|mat|palette|pallete)\b/g, '')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+}
+
+function tokenizeName(value: string): Set<string> {
+    return new Set(normalizeName(value).split(/\s+/g).filter(Boolean));
+}
+
+function materialLooksLikeNoise(material: string): boolean {
+    const n = normalizeName(material);
+    return [
+        'light',
+        'screen',
+        'shared cockpit',
+        'cockpit',
+        'formation',
+        'gbu',
+        'shadow',
+    ].some(noise => n.includes(noise));
+}
+
+function readZipText(files: Record<string, Uint8Array>, entry: string): string | null {
+    const data = files[entry];
+    if (!data) return null;
+    return Buffer.from(data).toString('utf-8');
+}
+
+function zipEntryByName(files: Record<string, Uint8Array>, matcher: (normalized: string) => boolean): string | null {
+    for (const entry of Object.keys(files)) {
+        const normalized = entry.replace(/\\/g, '/').toLowerCase();
+        if (matcher(normalized)) {
+            return entry;
+        }
+    }
+    return null;
+}
+
+function extractModCatalog(zipBuffer: Buffer): ModCatalog | null {
+    try {
+        const files = unzipSync(new Uint8Array(zipBuffer));
+        const modEntry = zipEntryByName(files, name => name.endsWith('/mod.json') || name === 'mod.json');
+        const flyablesEntry = zipEntryByName(files, name => name.endsWith('/data/flyables.json'));
+        if (!flyablesEntry) return null;
+
+        const dbEntry = zipEntryByName(files, name => name.endsWith('/data/database/aircraft.json'));
+        const aircraft2Entries = Object.keys(files)
+            .filter(name => name.replace(/\\/g, '/').toLowerCase().includes('/data/aircraft2/') && name.toLowerCase().endsWith('.json'));
+
+        const modJsonText = modEntry ? readZipText(files, modEntry) : null;
+        const flyablesText = readZipText(files, flyablesEntry);
+        if (!flyablesText) return null;
+        const dbText = dbEntry ? readZipText(files, dbEntry) : null;
+
+        const modJson = modJsonText ? parseJsonLoose(modJsonText) as Record<string, unknown> : {};
+        const flyables = parseJsonLoose(flyablesText) as Array<Record<string, unknown>>;
+        const database = dbText ? parseJsonLoose(dbText) as Array<Record<string, unknown>> : [];
+
+        const dbByName = new Map<string, Record<string, unknown>>();
+        for (const row of database) {
+            const name = typeof row.Name === 'string' ? row.Name : '';
+            if (name) dbByName.set(normalizeName(name), row);
+        }
+
+        const aircraft2ByName = new Map<string, Record<string, unknown>>();
+        for (const entry of aircraft2Entries) {
+            const txt = readZipText(files, entry);
+            if (!txt) continue;
+            try {
+                const row = parseJsonLoose(txt) as Record<string, unknown>;
+                const name = typeof row.Name === 'string' ? row.Name : '';
+                if (name) aircraft2ByName.set(normalizeName(name), row);
+            } catch {
+                // Skip malformed sidecar files; keep catalog extraction resilient.
+            }
+        }
+
+        const aircraft: CatalogAircraft[] = [];
+        for (const flyable of flyables) {
+            const canonicalName = typeof flyable.Name === 'string' ? flyable.Name : '';
+            if (!canonicalName) continue;
+            const key = normalizeName(canonicalName);
+            const db = dbByName.get(key);
+            const a2 = aircraft2ByName.get(key);
+            const displayName = (typeof a2?.DisplayName === 'string' && a2.DisplayName)
+                || (typeof db?.DisplayName === 'string' && db.DisplayName)
+                || canonicalName;
+            const category = (typeof db?.Filter === 'string' && db.Filter)
+                || (typeof a2?.TargetType === 'string' ? a2.TargetType : undefined);
+            const description = (typeof db?.Description === 'string' ? db.Description : undefined);
+            const modelPath = (typeof a2?.ModelPath === 'string' ? a2.ModelPath : undefined);
+            aircraft.push({ canonicalName, displayName, category, description, modelPath });
+        }
+
+        if (!aircraft.length) return null;
+        return {
+            modName: typeof modJson?.DisplayName === 'string' ? modJson.DisplayName : undefined,
+            modId: typeof modJson?.Id === 'string' ? modJson.Id : undefined,
+            aircraft,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function scoreCatalogMatch(plane: DiscoveredPlane, aircraft: CatalogAircraft): number {
+    const planeNorm = normalizeName(`${plane.name} ${plane.material}`);
+    const aircraftNorm = normalizeName(`${aircraft.canonicalName} ${aircraft.displayName}`);
+    const aircraftFull = normalizeName(
+        `${aircraft.canonicalName} ${aircraft.displayName} ${aircraft.description ?? ''} ${aircraft.modelPath ?? ''}`,
+    );
+    if (!planeNorm || !aircraftNorm) return 0;
+    let score = 0;
+    if (planeNorm === aircraftNorm) score += 10;
+    if (planeNorm.includes(aircraftNorm) || aircraftNorm.includes(planeNorm)) score += 5;
+
+    const planeTokens = tokenizeName(`${plane.name} ${plane.material}`);
+    const aircraftTokens = tokenizeName(`${aircraft.canonicalName} ${aircraft.displayName}`);
+    let overlap = 0;
+    for (const token of planeTokens) {
+        if (aircraftTokens.has(token)) {
+            overlap++;
+            continue;
+        }
+        for (const at of aircraftTokens) {
+            if (token.length >= 3 && at.length >= 3 && (token.startsWith(at) || at.startsWith(token))) {
+                overlap++;
+                break;
+            }
+        }
+    }
+    score += overlap * 2;
+
+    if (aircraft.modelPath) {
+        const modelBase = path.basename(aircraft.modelPath, path.extname(aircraft.modelPath));
+        const modelNorm = normalizeName(modelBase);
+        if (modelNorm && (planeNorm.includes(modelNorm) || modelNorm.includes(planeNorm))) {
+            score += 4;
+        }
+    }
+
+    const keywordBoost: Array<[string, string]> = [
+        ['rnlaf', 'rnlaf'],
+        ['rdaf', 'rdaf'],
+        ['vvs', 'vvs'],
+        ['gdr', 'gdr'],
+        ['czaf', 'czaf'],
+        ['sabers', '52'],
+        ['sabers', '15'],
+    ];
+    for (const [planeKey, aircraftKey] of keywordBoost) {
+        if (planeNorm.includes(planeKey) && aircraftFull.includes(aircraftKey)) {
+            score += 4;
+        }
+    }
+    return score;
+}
+
+function buildPlanesFromCatalog(
+    discovered: DiscoveredPlane[],
+    catalog: ModCatalog | null,
+    baseSlug: string,
+): PlaneImportPlan[] {
+    const filtered = discovered.filter(p => !materialLooksLikeNoise(p.material));
+    if (!catalog) {
+        return filtered.map((plane) => {
+            const idSlug = slugify(plane.material);
+            return {
+                modId: uniqueModId(`${baseSlug}_${idSlug}`),
+                idSlug,
+                name: plane.name,
+                displayName: plane.name,
+                material: plane.material,
+                sourceMaterial: plane.material,
+                confidence: 0.5,
+            };
+        });
+    }
+
+    const bestByAircraft = new Map<string, { plane: DiscoveredPlane; score: number; aircraft: CatalogAircraft }>();
+    for (const plane of filtered) {
+        let best: { score: number; aircraft: CatalogAircraft } | null = null;
+        for (const aircraft of catalog.aircraft) {
+            const score = scoreCatalogMatch(plane, aircraft);
+            if (!best || score > best.score) {
+                best = { score, aircraft };
+            }
+        }
+        if (!best || best.score < 2) continue;
+        const key = normalizeName(best.aircraft.canonicalName);
+        const prev = bestByAircraft.get(key);
+        if (!prev || best.score > prev.score) {
+            bestByAircraft.set(key, { plane, score: best.score, aircraft: best.aircraft });
+        }
+    }
+
+    const plans: PlaneImportPlan[] = [];
+    for (const { plane, score, aircraft } of bestByAircraft.values()) {
+        const idSlug = slugify(aircraft.canonicalName);
+        plans.push({
+            modId: uniqueModId(`${baseSlug}_${idSlug}`),
+            idSlug,
+            name: aircraft.canonicalName,
+            displayName: aircraft.displayName,
+            material: plane.material,
+            category: aircraft.category,
+            description: aircraft.description,
+            sourceMaterial: plane.material,
+            confidence: Number((Math.min(1, score / 12)).toFixed(3)),
+        });
+    }
+    return plans;
+}
+
 interface PythonResult {
     code: number | null;
     stdout: string;
@@ -141,12 +392,11 @@ async function discoverPlanes(bundlePath: string): Promise<DiscoveredPlane[]> {
 
 function buildPlaneConfig(
     bundlePath: string,
-    modId: string,
-    planeName: string,
-    material: string | null,
+    plane: PlaneImportPlan,
     embedded: Partial<ImportConfig> | null,
+    catalog: ModCatalog | null,
 ): ImportConfig {
-    const multiPlane = material !== null;
+    const multiPlane = plane.material !== null;
     const base: ImportConfig = embedded
         ? { ...embedded, bundle: bundlePath }
         : {
@@ -161,12 +411,24 @@ function buildPlaneConfig(
 
     return {
         ...base,
-        name: planeName,
+        id: plane.modId,
+        name: plane.displayName || plane.name,
+        displayName: plane.displayName,
+        canonicalName: plane.name,
+        category: plane.category,
+        description: plane.description,
+        sourceMaterial: plane.sourceMaterial,
+        sourceMod: catalog?.modName ?? prettyName(path.basename(bundlePath)),
+        sourceModId: catalog?.modId,
+        importMeta: {
+            confidence: plane.confidence ?? 0,
+            discoveredFrom: plane.sourceMaterial ?? null,
+        },
         bundle: bundlePath,
-        out: `${IMPORTS_PREFIX}/${modId}_static.gltf`,
-        flyable: { ...(base.flyable ?? {}), outPrefix: `${IMPORTS_PREFIX}/${modId}` },
+        out: `${IMPORTS_PREFIX}/${plane.modId}_static.gltf`,
+        flyable: { ...(base.flyable ?? {}), outPrefix: `${IMPORTS_PREFIX}/${plane.modId}` },
         ...(multiPlane ? {
-            includeMaterials: [material!],
+            includeMaterials: [plane.material!],
             dedupeParts: true,
             rescueGlassUnderRoot: true,
         } : {}),
@@ -187,8 +449,8 @@ function listAircraftPacks(): ImportedAircraft[] {
         let name = id;
         const manifestPath = manifestPathForId(id);
         if (manifestPath) {
-            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as { name?: string };
-            name = manifest.name ?? id;
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as { name?: string; displayName?: string };
+            name = manifest.displayName ?? manifest.name ?? id;
         }
         packs.push({ id, name, packUrl: `assets/${file}` });
     }
@@ -228,32 +490,45 @@ app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Resp
     fs.writeFileSync(zipPath, req.file.buffer);
 
     const embedded = findEmbeddedConfig(req.file.buffer);
+    const catalog = extractModCatalog(req.file.buffer);
     const log: string[] = [];
     const imported: ImportedAircraft[] = [];
 
     try {
-        let planes: { modId: string; name: string; material: string | null }[];
+        let planes: PlaneImportPlan[];
 
         if (embedded?.includeMaterials?.length) {
-            const modId = uniqueModId(baseSlug);
-            planes = [{ modId, name: embedded.name ?? prettyName(originalName), material: null }];
+            const idSlug = slugify(embedded.name ?? baseSlug);
+            planes = [{
+                modId: uniqueModId(baseSlug),
+                idSlug,
+                name: embedded.name ?? prettyName(originalName),
+                displayName: embedded.name ?? prettyName(originalName),
+                material: null,
+                confidence: 1,
+            }];
         } else {
             const discovered = await discoverPlanes(zipPath);
             log.push(`$ python tools/import_mod.py --bundle ... --discover\n${JSON.stringify(discovered, null, 2)}\n`);
-
-            if (discovered.length === 0) {
-                planes = [{ modId: uniqueModId(baseSlug), name: prettyName(originalName), material: null }];
-            } else {
-                planes = discovered.map((plane) => {
-                    const matSlug = slugify(plane.material);
-                    const modId = uniqueModId(`${baseSlug}_${matSlug}`);
-                    return { modId, name: plane.name, material: plane.material };
-                });
+            if (catalog) {
+                log.push(`[catalog] ${catalog.aircraft.length} aircraft entries from mod metadata`);
+            }
+            planes = buildPlanesFromCatalog(discovered, catalog, baseSlug);
+            if (planes.length === 0) {
+                // Fallback: still allow import if matching fails.
+                planes = [{
+                    modId: uniqueModId(baseSlug),
+                    idSlug: baseSlug,
+                    name: prettyName(originalName),
+                    displayName: prettyName(originalName),
+                    material: null,
+                    confidence: 0,
+                }];
             }
         }
 
         const importJobs = planes.map((plane) => {
-            const config = buildPlaneConfig(zipPath, plane.modId, plane.name, plane.material, embedded);
+            const config = buildPlaneConfig(zipPath, plane, embedded, catalog);
             const configPath = path.join(UPLOADS_DIR, `${plane.modId}-${stamp}.config.json`);
             fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
             return importPlaneConfig(configPath, log);
@@ -275,7 +550,7 @@ app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Resp
             const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as { name?: string };
             imported.push({
                 id: plane.modId,
-                name: manifest.name || plane.name,
+                name: manifest.name || plane.displayName || plane.name,
                 packUrl: `assets/${plane.modId}.aircraft.pack`,
             });
         }
