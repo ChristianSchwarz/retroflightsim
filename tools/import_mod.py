@@ -769,10 +769,6 @@ def import_mod(cfg: dict) -> int:
     flyable = cfg.get('flyable')
     surface_defs = flyable.get('surfaces', []) if flyable else []
     gear_names = set(flyable.get('gear', [])) if flyable else set()
-    surface_of_part: dict[str, int] = {}
-    for si, sd in enumerate(surface_defs):
-        for pn in sd.get('parts', []):
-            surface_of_part[pn] = si
 
     def colourable(name: str, sub_mat: dict | None, pal) -> bool:
         has_override = sub_mat is not None and sub_mat['name'] in material_colors
@@ -1000,6 +996,11 @@ def import_mod(cfg: dict) -> int:
         if detected_gear:
             gear_names = detected_gear
             print(f'Auto-detected {len(gear_names)} gear part(s)')
+
+    surface_of_part: dict[str, int] = {}
+    for si, sd in enumerate(surface_defs):
+        for pn in sd.get('parts', []):
+            surface_of_part[pn] = si
 
     # ---- Flyable: split into body / per-surface / gear sub-models + manifest.
     out_dir = os.path.dirname(out)
