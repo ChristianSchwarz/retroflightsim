@@ -1,6 +1,7 @@
 """Pack flyable aircraft mods into single .aircraft.pack files for dist."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import zipfile
@@ -8,6 +9,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASSETS_DIR = PROJECT_ROOT / 'assets'
+IMPORTS_DIR = PROJECT_ROOT / 'tools' / 'mods' / 'imports'
 DIST_ASSETS = PROJECT_ROOT / 'dist' / 'assets'
 
 
@@ -15,6 +17,8 @@ def pack_relative(path: str) -> str:
     p = path.replace('\\', '/')
     if p.startswith('assets/'):
         return p[len('assets/'):]
+    if p.startswith('tools/mods/imports/'):
+        return p[len('tools/mods/imports/'):]
     return os.path.basename(p)
 
 
@@ -52,6 +56,7 @@ def collect_manifest_paths(manifest: dict) -> list[str]:
 
 
 def collect_files(manifest_path: Path) -> tuple[set[str], dict, str]:
+    base_dir = manifest_path.parent
     mod_id = manifest_path.name[:-len('.aircraft.json')]
     with open(manifest_path, encoding='utf-8') as f:
         manifest = json.load(f)
@@ -60,14 +65,14 @@ def collect_files(manifest_path: Path) -> tuple[set[str], dict, str]:
     pending = [pack_relative(p) for p in collect_manifest_paths(manifest)]
 
     static_gltf = f'{mod_id}_static.gltf'
-    if (ASSETS_DIR / static_gltf).exists() and static_gltf not in pending:
+    if (base_dir / static_gltf).exists() and static_gltf not in pending:
         pending.append(static_gltf)
 
     while pending:
         rel = pending.pop()
         if rel in files:
             continue
-        asset_path = ASSETS_DIR / rel
+        asset_path = base_dir / rel
         if not asset_path.exists():
             raise FileNotFoundError(f'Missing asset for {manifest_path.name}: {rel}')
         files.add(rel)
@@ -111,6 +116,7 @@ def cleanup_loose_mod_files(mod_id: str) -> None:
 
 
 def pack_mod(manifest_path: Path) -> None:
+    base_dir = manifest_path.parent
     files, manifest, mod_id = collect_files(manifest_path)
     pack_manifest = rewrite_manifest(manifest, mod_id, files)
 
@@ -120,17 +126,35 @@ def pack_mod(manifest_path: Path) -> None:
     with zipfile.ZipFile(out_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.writestr('manifest.json', json.dumps(pack_manifest, indent=2))
         for rel in sorted(files):
-            zf.write(ASSETS_DIR / rel, rel)
+            zf.write(base_dir / rel, rel)
 
     size = out_path.stat().st_size
     cleanup_loose_mod_files(mod_id)
     print(f'Wrote {out_path} ({len(files) + 1} entries, {size:,} bytes)')
 
 
+def find_manifests() -> list[Path]:
+    manifests: list[Path] = []
+    if ASSETS_DIR.exists():
+        manifests.extend(sorted(ASSETS_DIR.glob('*.aircraft.json')))
+    if IMPORTS_DIR.exists():
+        manifests.extend(sorted(IMPORTS_DIR.glob('*.aircraft.json')))
+    return manifests
+
+
 def main() -> int:
-    manifests = sorted(ASSETS_DIR.glob('*.aircraft.json'))
+    ap = argparse.ArgumentParser(description='Pack flyable aircraft mods for dist.')
+    ap.add_argument('--imports-only', action='store_true',
+                    help='Only pack manifests under tools/mods/imports/.')
+    args = ap.parse_args()
+
+    if args.imports_only:
+        manifests = sorted(IMPORTS_DIR.glob('*.aircraft.json')) if IMPORTS_DIR.exists() else []
+    else:
+        manifests = find_manifests()
+
     if not manifests:
-        print('No aircraft manifests found in assets/')
+        print('No aircraft manifests found')
         return 0
     for manifest_path in manifests:
         pack_mod(manifest_path)

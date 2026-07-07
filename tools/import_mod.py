@@ -44,6 +44,7 @@ import json
 import math
 import os
 import shutil
+import sys
 import tempfile
 import zipfile
 from collections import defaultdict
@@ -215,7 +216,8 @@ def resolve_bundle_path(path: str) -> str:
         out = os.path.join(tmp, os.path.basename(chosen.filename))
         with z.open(chosen) as src, open(out, 'wb') as dst:
             shutil.copyfileobj(src, dst)
-        print(f'Extracted asset bundle "{chosen.filename}" from {os.path.basename(path)}')
+        print(f'Extracted asset bundle "{chosen.filename}" from {os.path.basename(path)}',
+              file=sys.stderr)
         return out
 
 
@@ -318,6 +320,116 @@ def _renderer_material_names(bundle: Bundle, go):
     return names if has_mesh else None
 
 
+# Substrings that identify exterior airframe meshes when discovering liveries.
+_BODY_PART_HINTS = (
+    'Fuselage', 'Wing', 'Nose', 'Elevator', 'Rudder', 'Aileron',
+    'Tail', 'Fin', 'Stabilizer', 'Slat', 'Flap', 'Intake', 'Nozzle',
+    'SpeedBrake', 'Body', 'Hull',
+)
+
+_DISCOVER_SKIP_NAME_PARTS = (
+    'Collider', 'Shadow', 'Stick', 'Gauge', 'Needle', 'Pylon', 'Weapon',
+    'Cockpit', 'Seat', 'Mirror', 'Empty', 'FX', 'Light', 'Bolt', 'AIM',
+    'Gun', 'Tank', 'Launcher',
+)
+
+
+def _discover_skip_part(name: str) -> bool:
+    return any(s in name for s in _DISCOVER_SKIP_NAME_PARTS)
+
+
+def _is_body_part(name: str) -> bool:
+    return any(h in name for h in _BODY_PART_HINTS)
+
+
+def _is_fuselage_part(name: str) -> bool:
+    return 'Fuselage' in name or name in ('Body', 'Hull', 'Fuse')
+
+
+def _livery_material_name(name: str, skip_materials: tuple) -> bool:
+    if any(s in name for s in skip_materials):
+        return False
+    low = name.lower()
+    if 'glass' in low or 'canopy' in low or 'windscreen' in low or 'collider' in low:
+        return False
+    if any(s in low for s in ('missile', 'weapon', 'pylon', 'bomb', 'rocket', 'pod')):
+        return False
+    return True
+
+
+def discover_livery_materials(bundle_path: str) -> list[dict]:
+    """Find distinct flyable aircraft liveries in a multi-plane Unity bundle.
+
+    Multi-plane packs (e.g. Tiny Combat Arena collections) reuse the same mesh
+    part names across aircraft; only the Unity *material* (livery) differs.
+    Returns one entry per livery material, suitable for ``includeMaterials``.
+    """
+    bundle = Bundle(bundle_path)
+    skip_materials = DEFAULT_SKIP_MATERIALS
+    body_parts: dict[str, set[str]] = defaultdict(set)
+    fuselage_mats: set[str] = set()
+    mesh_hits: dict[str, int] = defaultdict(int)
+
+    for o in bundle.env.objects:
+        if o.type.name != 'GameObject':
+            continue
+        go = o.read()
+        name = go.m_Name
+        if _discover_skip_part(name):
+            continue
+        mat_pids: list[int] = []
+        has_mesh = False
+        for comp in go.m_Component:
+            co = bundle.by_path.get(comp.component.path_id)
+            if co is None:
+                continue
+            if co.type.name == 'MeshFilter':
+                has_mesh = True
+            elif co.type.name == 'MeshRenderer':
+                tt = co.read_typetree()
+                mat_pids = [m['m_PathID'] for m in tt.get('m_Materials', [])]
+        if not has_mesh or not mat_pids:
+            continue
+
+        for pid in mat_pids:
+            mat = bundle.materials.get(pid)
+            if mat is None:
+                continue
+            mat_name = mat.get('name', '')
+            if not _livery_material_name(mat_name, skip_materials):
+                continue
+            if mat.get('alpha', 1.0) < 0.9:
+                continue
+            mesh_hits[mat_name] += 1
+            if _is_body_part(name):
+                body_parts[mat_name].add(name)
+            if _is_fuselage_part(name):
+                fuselage_mats.add(mat_name)
+
+    candidates = sorted(fuselage_mats) if fuselage_mats else sorted(
+        m for m, parts in body_parts.items() if len(parts) >= 3)
+
+    if not candidates and body_parts:
+        candidates = sorted(
+            m for m, parts in body_parts.items() if len(parts) >= 2)
+
+    # Drop materials with too few distinct airframe parts (decals, weapons, etc.).
+    candidates = [
+        m for m in candidates
+        if len(body_parts.get(m, ())) >= 5 or m in fuselage_mats
+    ]
+
+    out = []
+    for mat_name in candidates:
+        out.append({
+            'material': mat_name,
+            'name': mat_name,
+            'partCount': mesh_hits[mat_name],
+            'bodyParts': len(body_parts.get(mat_name, ())),
+        })
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Import
 # --------------------------------------------------------------------------- #
@@ -327,6 +439,71 @@ def _should_include(name: str, include_exact, skip_parts, skip_exact) -> bool:
     if name in include_exact:
         return True
     return not any(part in name for part in skip_parts)
+
+
+# Tiny Combat Arena / workshop mods reuse these GameObject names across aircraft.
+# When flyable.surfaces is omitted (generic F10 import), match them automatically.
+_AUTO_SURFACE_RULES: list[tuple[tuple[str, ...], str, str, int, float]] = [
+    (('ElevatorLeft', 'ElevatorL'), 'elevatorLeft', 'pitch', 1, 0.42),
+    (('ElevatorRight', 'ElevatorR'), 'elevatorRight', 'pitch', 1, 0.42),
+    (('AileronL', 'AileronLeft'), 'aileronLeft', 'roll', 1, 0.4),
+    (('AileronR', 'AileronRight'), 'aileronRight', 'roll', -1, 0.4),
+    (('FlapL', 'FlapLeft'), 'flapLeft', 'flaps', -1, 0.5),
+    (('FlapR', 'FlapRight'), 'flapRight', 'flaps', -1, 0.5),
+    (('SlatsL', 'SlatL', 'SlatLeft'), 'slatLeft', 'slats', 1, 0.35),
+    (('SlatsR', 'SlatR', 'SlatRight'), 'slatRight', 'slats', 1, 0.35),
+    (('SpeedBrakeL',), 'speedbrakeLeft', 'flaps', 1, 0.3),
+    (('SpeedBrakeR',), 'speedbrakeRight', 'flaps', 1, 0.3),
+]
+
+_AUTO_GEAR_PARTS = (
+    'GearNoseWheel', 'GearMainWheelL', 'GearMainWheelR',
+    'GearNoseStrut', 'GearMainStrutL', 'GearMainStrutR',
+    'GearNoseBase', 'GearNoseBase2', 'GearMainBaseL', 'GearMainBaseR',
+    'GearDoorFront', 'GearDoorL', 'GearDoorR', 'GearNoseDoor',
+    'GearLSupport1', 'GearLSupport2', 'GearRSupport1', 'GearRSupport2',
+    'GearNoseSupport', 'GearNoseSupporter1', 'GearNoseSupporter2',
+)
+
+
+def auto_surface_defs(available: set[str]) -> list[dict]:
+    """Build flyable surface entries from standard TCA part names."""
+    surfaces: list[dict] = []
+    used_roles: set[str] = set()
+    used_parts: set[str] = set()
+    for part_names, role, control, sign, range_rad in _AUTO_SURFACE_RULES:
+        if role in used_roles:
+            continue
+        part = next((pn for pn in part_names if pn in available and pn not in used_parts), None)
+        if part is None:
+            continue
+        surfaces.append({
+            'role': role,
+            'parts': [part],
+            'control': control,
+            'sign': sign,
+            'rangeRad': range_rad,
+        })
+        used_roles.add(role)
+        used_parts.add(part)
+
+    # Some mods split the rudder into left/right meshes instead of one "Rudder".
+    if 'rudder' not in used_roles:
+        rudder_parts = [p for p in ('Rudder', 'RudderLeft', 'RudderRight')
+                        if p in available and p not in used_parts]
+        if rudder_parts:
+            surfaces.append({
+                'role': 'rudder',
+                'parts': rudder_parts,
+                'control': 'yaw',
+                'sign': 1,
+                'rangeRad': 0.45,
+            })
+    return surfaces
+
+
+def auto_gear_names(available: set[str]) -> set[str]:
+    return {p for p in _AUTO_GEAR_PARTS if p in available}
 
 
 def transform_root(tpid: int, transforms) -> int:
@@ -799,6 +976,18 @@ def import_mod(cfg: dict) -> int:
         print(f'ground_min_y: {ground_min_y:.3f}, ground_offset_y: {ground_offset_y:.3f}')
         return 0
 
+    available = {p['name'] for p in processed}
+    if not surface_defs and flyable.get('autoSurfaces', True) is not False:
+        surface_defs = auto_surface_defs(available)
+        if surface_defs:
+            print(f'Auto-detected {len(surface_defs)} control surface(s): '
+                  + ', '.join(sd['role'] for sd in surface_defs))
+    if not gear_names and flyable.get('autoGear', True) is not False:
+        detected_gear = auto_gear_names(available)
+        if detected_gear:
+            gear_names = detected_gear
+            print(f'Auto-detected {len(gear_names)} gear part(s)')
+
     # ---- Flyable: split into body / per-surface / gear sub-models + manifest.
     out_dir = os.path.dirname(out)
     stem = os.path.splitext(os.path.basename(out))[0]
@@ -1053,6 +1242,8 @@ def main(argv=None) -> int:
     ap.add_argument('--rotate', help='XYZ Euler rotation in degrees, e.g. "0,180,0", to reorient the model.')
     ap.add_argument('--swatch-max', type=int, help='Max texture size (px) treated as a palette swatch.')
     ap.add_argument('--list', action='store_true', help='List textures/materials/objects and exit.')
+    ap.add_argument('--discover', action='store_true',
+                    help='List distinct aircraft liveries (JSON) and exit.')
     args = ap.parse_args(argv)
 
     cfg: dict = load_config(args.config) if args.config else {}
@@ -1071,6 +1262,10 @@ def main(argv=None) -> int:
 
     if 'bundle' not in cfg:
         ap.error('a bundle is required (via --bundle or --config)')
+
+    if args.discover:
+        print(json.dumps(discover_livery_materials(cfg['bundle']), indent=2))
+        return 0
 
     if args.list:
         list_bundle(Bundle(cfg['bundle']))

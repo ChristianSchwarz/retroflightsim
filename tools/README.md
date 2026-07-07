@@ -28,6 +28,28 @@ palette category so it stays tinted.
 pip install UnityPy trimesh numpy pillow
 ```
 
+## In-app import (F10)
+
+The command-line workflow below is for authoring and repeatable builds. For a
+quick import while the sim is running, press **`F10`** in the app and select a
+mod `.zip`. The dev server (`tools/modserver.ts`, started by `npm run serve`)
+receives the upload at `POST /api/import-mod`, runs `import_mod.py` and
+`pack_aircraft_mods.py` for you, and the app registers and lets you fly the
+result. The Python requirements above must be installed for this to work.
+
+By default the in-app import uses a generic flyable config (no animated control
+surfaces, active flight model). **Multi-plane mod packs are split by Unity livery
+material** ù each aircraft becomes its own `.aircraft.pack` with its colours
+preserved. To ship full fidelity for a single plane, drop a `retroflight.json`
+file (the same schema as `tools/mods/*.json`) inside the mod `.zip`; the server
+will use it, overriding only `bundle`/`out`/`outPrefix`.
+
+Inspect liveries in a bundle before importing:
+
+```
+python tools/import_mod.py --bundle "mods/mod.zip" --discover
+```
+
 ## Usage
 
 The `--bundle` input can be a mod **`.zip`** (e.g. a Tiny Combat Arena workshop
@@ -74,10 +96,10 @@ python tools/build_a4e_gltf.py
 ### 3. Wire it into the sim
 
 The importer produces loose glTF files under `assets/` for editing and tests.
-At build time, `tools/pack_aircraft_mods.py` bundles each `assets/*.aircraft.json`
-mod (manifest, flyable sub-models, buffers, and the static ramp model) into a
-single `dist/assets/{id}.aircraft.pack` file. Webpack skips copying those loose
-mod files into `dist/`.
+At build time, `tools/pack_aircraft_mods.py` bundles each flyable mod into a
+single `dist/assets/{id}.aircraft.pack` file. Shipped mods (A-4E, F-16) keep
+their manifests under `assets/`; **F10 imports** stage loose glTF files under
+`tools/mods/imports/` until packing ó they are not written into `assets/`.
 
 To register a flyable mod, load its pack in `src/script/state/game.ts`:
 
