@@ -506,6 +506,16 @@ def auto_gear_names(available: set[str]) -> set[str]:
     return {p for p in _AUTO_GEAR_PARTS if p in available}
 
 
+# Unity/TCA mods label canopy glass by material and/or part name; alpha is not
+# always below the auto-glass threshold (e.g. the shared "Glass" material is 1.0).
+_GLASS_MATERIAL_NAMES = frozenset({
+    'Glass', 'Canopy', 'Glass HUD', 'CanopyGlass', 'Windscreen', 'CanopyBack',
+})
+_GLASS_PART_NAME_PARTS = (
+    'CanopyGlass', 'CanopyFront', 'CanopyBack', 'Windscreen', 'CanopyEject',
+)
+
+
 def transform_root(tpid: int, transforms) -> int:
     """Walk the Unity Transform parent chain to the top-most ancestor path_id."""
     seen: set[int] = set()
@@ -709,6 +719,10 @@ def import_mod(cfg: dict) -> int:
     def is_glass(name: str, mat: dict | None) -> bool:
         if any(p in name for p in glass_parts):
             return True
+        if any(p in name for p in _GLASS_PART_NAME_PARTS):
+            return True
+        if mat is not None and mat.get('name', '') in _GLASS_MATERIAL_NAMES:
+            return True
         if glass_auto_alpha and mat is not None and mat['alpha'] < glass_alpha_max:
             return True
         return False
@@ -722,12 +736,11 @@ def import_mod(cfg: dict) -> int:
         # as one uniform material so the sim can tint/dither it; a literal
         # '#rrggbb' still samples per-poly tint when the glass has a swatch.
         elif is_glass(name, mat):
-            if glass_color.startswith('#') and uvs is not None and pal is not None:
-                res = sample_hex(pal, uvs[face_t].mean(axis=1))
-            else:
-                # A PaletteCategory glass colour is left untouched by the grey
-                # remap so the sim keeps tinting/dithering it as glass.
-                return np.full(len(face_t), glass_color)
+            # Always tag glass faces with the configured glass colour (usually the
+            # PaletteCategory 'GLASS'). Do not palette-sample glass: livery swatches
+            # on canopy parts would export as opaque hex colours the renderer cannot
+            # treat as see-through glass.
+            return np.full(len(face_t), glass_color)
         # 3. Palette-swatch sampled per face.
         elif pal is not None and uvs is not None:
             res = sample_hex(pal, uvs[face_t].mean(axis=1))

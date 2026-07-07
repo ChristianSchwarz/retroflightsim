@@ -154,6 +154,7 @@ function buildPlaneConfig(
             groundDistance: 2.0,
             scale: 1.0,
             swatchMax: 64,
+            glassColor: 'GLASS',
             glassAutoAlpha: true,
             skipMaterials: ['Collider', 'ShadowDepthOffset', 'Shadow'],
         };
