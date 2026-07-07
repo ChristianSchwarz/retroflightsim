@@ -329,6 +329,29 @@ def _should_include(name: str, include_exact, skip_parts, skip_exact) -> bool:
     return not any(part in name for part in skip_parts)
 
 
+def transform_root(tpid: int, transforms) -> int:
+    """Walk the Unity Transform parent chain to the top-most ancestor path_id."""
+    seen: set[int] = set()
+    cur = tpid
+    while True:
+        t = transforms.get(cur)
+        if t is None:
+            return cur
+        father = t.m_Father.path_id
+        if not father or father not in transforms or father in seen:
+            return cur
+        seen.add(cur)
+        cur = father
+
+
+def _transform_pid_of(go, bundle: Bundle) -> int | None:
+    for comp in go.m_Component:
+        co = bundle.by_path.get(comp.component.path_id)
+        if co is not None and co.type.name == 'Transform':
+            return comp.component.path_id
+    return None
+
+
 def hinge_frame_from_part(
     bundle: Bundle,
     part_name: str,
@@ -337,6 +360,7 @@ def hinge_frame_from_part(
     ground_offset_y: float,
     control: str = 'pitch',
     hinge_axis: str | None = None,
+    root_pid: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Pivot + hinge axis from a Unity bone/empty (e.g. BSlatL) in the sim body frame.
 
@@ -347,42 +371,55 @@ def hinge_frame_from_part(
     matches the expected hinge orientation: vertical (world +Y) for a yaw
     surface (rudder), spanwise (world +X) for everything else. An explicit
     `hinge_axis` ('x'/'y'/'z') forces a specific column when needed.
+
+    A single Unity bundle may pack several aircraft that share bone names (e.g.
+    12 different planes each with a `BAileronL`). When `root_pid` is given, the
+    bone under that aircraft's transform root is preferred so the surface always
+    gets *its own* plane's hinge, not the first identically-named bone in the
+    bundle. Falls back to the first name match if none share the root.
     """
+    matches: list[int] = []
     for o in bundle.env.objects:
         if o.type.name != 'GameObject':
             continue
         go = o.read()
         if go.m_Name != part_name:
             continue
-        transform_pid = None
-        for comp in go.m_Component:
-            co = bundle.by_path.get(comp.component.path_id)
-            if co is not None and co.type.name == 'Transform':
-                transform_pid = comp.component.path_id
+        tp = _transform_pid_of(go, bundle)
+        if tp is not None:
+            matches.append(tp)
+    if not matches:
+        return None
+
+    transform_pid = None
+    if root_pid is not None:
+        for tp in matches:
+            if transform_root(tp, bundle.transforms) == root_pid:
+                transform_pid = tp
                 break
-        if transform_pid is None:
-            return None
-        wm = _FLIP_X @ world_matrix(transform_pid, bundle.transforms, world_cache) @ _FLIP_X
-        hinge_world = wm[:3, 3] * scale
-        pivot_local = hinge_world + np.array([0.0, ground_offset_y, 0.0])
+    if transform_pid is None:
+        transform_pid = matches[0]
 
-        def _norm(v: np.ndarray) -> np.ndarray:
-            n = float(np.linalg.norm(v))
-            return v / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+    wm = _FLIP_X @ world_matrix(transform_pid, bundle.transforms, world_cache) @ _FLIP_X
+    hinge_world = wm[:3, 3] * scale
+    pivot_local = hinge_world + np.array([0.0, ground_offset_y, 0.0])
 
-        cols = [_norm(wm[:3, i].copy()) for i in range(3)]
-        ref = np.array([0.0, 1.0, 0.0]) if control == 'yaw' else np.array([1.0, 0.0, 0.0])
-        if hinge_axis is not None:
-            axis = cols[{'x': 0, 'y': 1, 'z': 2}.get(hinge_axis.lower(), 0)]
-        else:
-            axis = max(cols, key=lambda c: abs(float(c @ ref)))
-        # Orient the sign so the dominant component is positive (+Y for yaw,
-        # +X otherwise); the per-surface `sign` in the manifest is tuned against
-        # this convention.
-        if float(axis @ ref) < 0.0:
-            axis = -axis
-        return pivot_local, axis
-    return None
+    def _norm(v: np.ndarray) -> np.ndarray:
+        n = float(np.linalg.norm(v))
+        return v / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+
+    cols = [_norm(wm[:3, i].copy()) for i in range(3)]
+    ref = np.array([0.0, 1.0, 0.0]) if control == 'yaw' else np.array([1.0, 0.0, 0.0])
+    if hinge_axis is not None:
+        axis = cols[{'x': 0, 'y': 1, 'z': 2}.get(hinge_axis.lower(), 0)]
+    else:
+        axis = max(cols, key=lambda c: abs(float(c @ ref)))
+    # Orient the sign so the dominant component is positive (+Y for yaw,
+    # +X otherwise); the per-surface `sign` in the manifest is tuned against
+    # this convention.
+    if float(axis @ ref) < 0.0:
+        axis = -axis
+    return pivot_local, axis
 
 
 def derive_gear_points(
@@ -563,17 +600,7 @@ def import_mod(cfg: dict) -> int:
     rescue_glass = bool(cfg.get('rescueGlassUnderRoot', False)) and bool(include_materials)
 
     def _root_of(tpid: int) -> int:
-        seen: set[int] = set()
-        cur = tpid
-        while True:
-            t = bundle.transforms.get(cur)
-            if t is None:
-                return cur
-            father = t.m_Father.path_id
-            if not father or father not in bundle.transforms or father in seen:
-                return cur
-            seen.add(cur)
-            cur = father
+        return transform_root(tpid, bundle.transforms)
 
     def _has_glass_mat(pids) -> bool:
         return any(bundle.materials.get(pid, {}).get('alpha', 1.0) < glass_alpha_max
@@ -675,6 +702,7 @@ def import_mod(cfg: dict) -> int:
         processed.append({
             'name': name, 'world_v': world_v, 'uvs': uvs,
             'sub_faces': sub_faces, 'sub_face_t': sub_face_t, 'sub_mats': sub_mats,
+            'tpid': transform_pid,
         })
 
     if not processed:
@@ -811,6 +839,13 @@ def import_mod(cfg: dict) -> int:
         control = sd.get('control', 'pitch')
         role = sd.get('role', f'surf{si}')
 
+        # A bundle may pack many planes sharing bone names, so resolve the hinge
+        # bone within the same aircraft hierarchy (transform root) as this
+        # surface's own mesh -- otherwise a left surface can grab another plane's
+        # identically-named bone and hinge about the wrong axis/pivot.
+        member_tpid = next((p.get('tpid') for p in members if p.get('tpid') is not None), None)
+        surface_root = _root_of(member_tpid) if member_tpid is not None else None
+
         # Hinge frame: an explicit `hingePart` bone, else -- unless disabled via
         # `autoHinge: false` -- an auto-discovered bone following the mod's
         # `B`+partName convention (e.g. Rudder -> BRudder, SlatsL -> BSlatsL).
@@ -821,7 +856,7 @@ def import_mod(cfg: dict) -> int:
         if hinge_part:
             hinge_frame = hinge_frame_from_part(
                 bundle, hinge_part, world_cache, scale, ground_offset_y,
-                control, sd.get('hingeAxis'),
+                control, sd.get('hingeAxis'), surface_root,
             )
             if hinge_frame is None:
                 print(f'WARNING: hingePart "{hinge_part}" for surface "{role}" not found; '
@@ -831,7 +866,7 @@ def import_mod(cfg: dict) -> int:
             hinge_part = bone_prefix + sd['parts'][0]
             hinge_frame = hinge_frame_from_part(
                 bundle, hinge_part, world_cache, scale, ground_offset_y,
-                control, sd.get('hingeAxis'),
+                control, sd.get('hingeAxis'), surface_root,
             )
             if hinge_frame is not None:
                 print(f'  auto hinge bone "{hinge_part}" for surface "{role}"')

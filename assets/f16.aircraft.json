@@ -9,9 +9,9 @@
       "role": "elevatorLeft",
       "path": "assets/f16_surf_elevatorLeft.gltf",
       "pivot": [
-        1.6669,
-        -0.6483,
-        -7.2866
+        1.0412,
+        -0.2318,
+        -5.2554
       ],
       "axis": [
         1.0,
@@ -94,14 +94,14 @@
       "role": "slatLeft",
       "path": "assets/f16_surf_slatLeft.gltf",
       "pivot": [
-        3.2634,
-        -0.1002,
-        -1.1683
+        2.9597,
+        -0.1227,
+        -0.6303
       ],
       "axis": [
-        0.7599,
-        -0.049,
-        -0.6482
+        0.7985,
+        -0.0236,
+        -0.6015
       ],
       "control": "slats",
       "sign": 1,
