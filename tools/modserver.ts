@@ -491,7 +491,84 @@ async function importPlaneConfig(configPath: string, log: string[]): Promise<voi
     }
 }
 
+const LIVE_RELOAD = process.env.LIVE_RELOAD === '1';
+
+const LIVE_RELOAD_SCRIPT = `<script>
+(() => {
+  const es = new EventSource('/__live_reload');
+  es.onmessage = () => window.location.reload();
+})();
+</script>`;
+
+let liveReloadClients: Response[] = [];
+
+function notifyLiveReload(): void {
+    for (const client of liveReloadClients) {
+        client.write('data: reload\n\n');
+    }
+}
+
+function watchBundleForReload(): void {
+    const bundlePath = path.join(DIST_DIR, 'bundle.js');
+    let debounce: ReturnType<typeof setTimeout> | undefined;
+
+    const startWatching = () => {
+        fs.watch(bundlePath, () => {
+            clearTimeout(debounce);
+            debounce = setTimeout(notifyLiveReload, 150);
+        });
+        console.log('Live reload enabled — browser refreshes when bundle.js rebuilds');
+    };
+
+    if (fs.existsSync(bundlePath)) {
+        startWatching();
+        return;
+    }
+
+    const dirWatcher = fs.watch(DIST_DIR, () => {
+        if (!fs.existsSync(bundlePath)) {
+            return;
+        }
+        dirWatcher.close();
+        startWatching();
+    });
+}
+
 const app = express();
+
+if (LIVE_RELOAD) {
+    app.get('/__live_reload', (req: Request, res: Response) => {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+        liveReloadClients.push(res);
+        req.on('close', () => {
+            liveReloadClients = liveReloadClients.filter((client) => client !== res);
+        });
+    });
+
+    app.use((req: Request, res: Response, next) => {
+        if (req.method !== 'GET' || (req.path !== '/' && req.path !== '/index.html')) {
+            next();
+            return;
+        }
+
+        const indexPath = path.join(DIST_DIR, 'index.html');
+        if (!fs.existsSync(indexPath)) {
+            next();
+            return;
+        }
+
+        const html = fs.readFileSync(indexPath, 'utf8');
+        if (!html.includes('</body>')) {
+            res.type('html').send(html);
+            return;
+        }
+
+        res.type('html').send(html.replace('</body>', `${LIVE_RELOAD_SCRIPT}</body>`));
+    });
+}
 
 app.get('/api/health', (_req: Request, res: Response) => {
     res.json({ ok: true, server: 'modserver' });
@@ -596,6 +673,7 @@ app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Resp
 });
 
 app.use(express.static(DIST_DIR, {
+    index: LIVE_RELOAD ? false : 'index.html',
     setHeaders(res, filePath) {
         if (filePath.endsWith('.js') || filePath.endsWith('.html')) {
             res.setHeader('Cache-Control', 'no-store');
@@ -607,4 +685,7 @@ app.listen(PORT, () => {
     console.log(`retroflightsim dev server running at http://localhost:${PORT}`);
     console.log(`Serving ${DIST_DIR}`);
     console.log('Mod import endpoint: POST /api/import-mod (F10 in-app upload)');
+    if (LIVE_RELOAD) {
+        watchBundleForReload();
+    }
 });
