@@ -1369,12 +1369,12 @@ def import_mod(cfg: dict) -> int:
         zmin, zmax = float(v[:, 2].min()), float(v[:, 2].max())
         zrange = zmax - zmin
         if zrange >= 0.5:
-            zlo = zmin + 0.25 * zrange
-            zhi = zmin + 0.65 * zrange
+            zlo = zmin + 0.05 * zrange
+            zhi = zmin + 0.95 * zrange
             band = v[(v[:, 2] >= zlo) & (v[:, 2] <= zhi)]
             if len(band) >= 8:
                 v = band
-        ycut = float(np.percentile(v[:, 1], 80))
+        ycut = float(np.percentile(v[:, 1], 75))
         low = v[v[:, 1] <= ycut]
         if len(low) >= 4:
             v = low
