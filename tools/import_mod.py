@@ -1359,6 +1359,38 @@ def import_mod(cfg: dict) -> int:
         radius = float(np.median(radii)) if radii else None
         return points, radius
 
+    def wingtip_trail_origins(parts, translate) -> list | None:
+        """Wingtip vortex trail origins at the outermost lateral body vertices."""
+        if not parts:
+            return None
+        v = np.vstack([p['world_v'] for p in parts]) + translate
+        if len(v) < 8:
+            return None
+        zmin, zmax = float(v[:, 2].min()), float(v[:, 2].max())
+        zrange = zmax - zmin
+        if zrange >= 0.5:
+            zlo = zmin + 0.25 * zrange
+            zhi = zmin + 0.65 * zrange
+            band = v[(v[:, 2] >= zlo) & (v[:, 2] <= zhi)]
+            if len(band) >= 8:
+                v = band
+        ycut = float(np.percentile(v[:, 1], 80))
+        low = v[v[:, 1] <= ycut]
+        if len(low) >= 4:
+            v = low
+        li = int(np.argmax(v[:, 0]))
+        ri = int(np.argmin(v[:, 0]))
+        left = v[li]
+        right = v[ri]
+        outward = float(max(left[0], -right[0]))
+        if outward < 0.1:
+            return None
+        ref = left if left[0] >= -right[0] else right
+        return [
+            [round(outward, 4), round(float(ref[1]), 4), round(float(ref[2]), 4)],
+            [round(-outward, 4), round(float(ref[1]), 4), round(float(ref[2]), 4)],
+        ]
+
     fx = dict(flyable.get('fx') or {})
     if fx.get('nozzles') is None:
         auto_nozzles, auto_radius = nozzle_exhaust_points(
@@ -1372,7 +1404,14 @@ def import_mod(cfg: dict) -> int:
             fx.setdefault('nozzles', None)
     fx.setdefault('nozzles', None)
     fx.setdefault('nozzleRadius', None)
-    fx.setdefault('wingtips', None)
+    if fx.get('wingtips') is None:
+        auto_wingtips = wingtip_trail_origins(
+            body_parts, np.asarray(ground_translate))
+        if auto_wingtips:
+            fx['wingtips'] = auto_wingtips
+            print(f'Wingtip trails: {auto_wingtips}')
+        else:
+            fx.setdefault('wingtips', None)
 
     flight = dict(cfg.get('flight') or {})
     ground_rest_height_m = ground_distance

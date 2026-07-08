@@ -595,7 +595,13 @@ app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Resp
     }
 });
 
-app.use(express.static(DIST_DIR));
+app.use(express.static(DIST_DIR, {
+    setHeaders(res, filePath) {
+        if (filePath.endsWith('.js') || filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-store');
+        }
+    },
+}));
 
 app.listen(PORT, () => {
     console.log(`retroflightsim dev server running at http://localhost:${PORT}`);
