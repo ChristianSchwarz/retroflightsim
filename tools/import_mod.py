@@ -8,15 +8,25 @@ Others simply rely on per-material flat `_Color` values.
 
 This tool recovers those real per-polygon colours by, for each mesh face:
   1. an explicit per-material override colour (config `materialColors`), else
-  2. a palette-swatch sample at the face's UV centroid, else
-  3. the material's flat `_Color`, else a neutral fallback.
+  2. an afterburner nozzle interior -> the 'FX_FIRE' PaletteCategory, else
+  3. glass -> the configured glass colour (usually 'GLASS'), else
+  4. an emissive "light" (bright emission over a dark base) -> its literal colour, else
+  5. a palette-swatch sample at the face's UV centroid, else
+  6. the material's flat `_Color`, else a neutral fallback.
 Faces are grouped by colour and written to a glTF with one mesh/material per
 distinct colour. Each material is named '#rrggbb' so the sim renders that
 literal colour (see ModelManager.rawColorFor). A material name may also be a
-PaletteCategory (e.g. 'GLASS') to let the sim tint it per palette/time.
+PaletteCategory (e.g. 'GLASS' for glass, 'FX_FIRE' for the throttle-driven
+afterburner nozzle glow) to let the sim tint/drive it.
 
 Transparent materials (low alpha) are auto-detected as glass; you can also
 force parts to glass by name, and control the glass colour.
+
+Tiny Combat Arena "shared materials" (Canopy, ColliderMat, NozzleInteriorMat,
+ShadowDepthOffset/HeightOffset) are referenced by GUID and are usually NOT
+bundled with a workshop mod, so their material *name* cannot be resolved. Glass,
+nozzle, and collider/shadow classification therefore also fall back to mesh-name
+conventions so those parts are still handled when the material is unresolved.
 
 The --bundle input may be a mod .zip (e.g. a Tiny Combat Arena workshop
 download), a raw Unity asset bundle file, or a folder; a .zip is unpacked and
@@ -60,6 +70,17 @@ GLASS_CATEGORY = 'GLASS'
 DEFAULT_MATERIAL = '#909094'  # neutral grey fallback
 # PaletteCategory used for a generated flyable-aircraft shadow silhouette.
 SHADOW_MATERIAL = 'VEHICLE_PLANE_GREY'
+# PaletteCategory the sim throttle-drives as the afterburner nozzle glow (see
+# PlayerEntity.collectAfterburnerPaneMaterials). Faces tagged with this material
+# name light up with the engine automatically -- no per-aircraft wiring needed.
+FX_FIRE_MATERIAL = 'FX_FIRE'
+
+# Emissive "light" detection: a material is treated as a self-lit lamp only when
+# its _EmissionColor is at least this bright AND its base _Color is darker than
+# EMISSION_BASE_MAX (the F4EEmissiveMat pattern: black base + bright emission).
+# This keeps ordinary lit surfaces on the palette/flat-colour path.
+EMISSION_MIN = 0.35
+EMISSION_BASE_MAX = 0.2
 
 # UnityPy's mesh.export() negates X to convert Unity's left-handed coordinates
 # to a right-handed OBJ/glTF system. Transforms read from the bundle are still
@@ -138,7 +159,12 @@ def euler_matrix(degrees) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 def mesh_geometry(mesh, mat_pids: list) -> tuple[np.ndarray, np.ndarray | None, list[np.ndarray], list[np.ndarray]]:
     """Return verts, uvs, per-submesh face indices, and per-submesh UV indices."""
-    verts, uvs, face_v, face_t = parse_obj(mesh.export())
+    # UnityPy's Mesh.export() returns False for meshes it cannot decode (e.g.
+    # certain compressed/skinned meshes). Skip those parts instead of crashing.
+    obj_text = mesh.export()
+    if not isinstance(obj_text, str):
+        return np.empty((0, 3)), None, [], []
+    verts, uvs, face_v, face_t = parse_obj(obj_text)
     if len(verts) == 0 or len(face_v) == 0:
         return np.empty((0, 3)), None, [], []
     return verts, uvs, [face_v], [face_t]
@@ -260,11 +286,16 @@ class Bundle:
                     if key == '_MainTex':
                         break
         color = colors.get('_Color') or colors.get('_BaseColor') or {}
+        # TinyDiffuse exposes emission via _EmissionColor (bright for lights,
+        # black otherwise). NozzleInteriorMat instead uses _Emissive; that mesh
+        # is handled by nozzle detection, so lights only look at _EmissionColor.
+        emission = colors.get('_EmissionColor') or {}
         return {
             'name': tt.get('m_Name', ''),
             'main_tex': main_tex,
             'color': color,
             'alpha': float(color.get('a', 1.0)) if color else 1.0,
+            'emission': emission,
         }
 
     @staticmethod
@@ -515,6 +546,28 @@ _GLASS_PART_NAME_PARTS = (
     'CanopyGlass', 'CanopyFront', 'CanopyBack', 'Windscreen', 'CanopyEject',
 )
 
+# TCA's shared "NozzleInteriorMat" is its own single-material mesh that glows
+# with the afterburner. Detect it by shared-material name or, when that material
+# is an unbundled external GUID reference, by the mesh name.
+_NOZZLE_MATERIAL_NAMES = frozenset({'NozzleInterior', 'NozzleInteriorMat'})
+_NOZZLE_PART_NAME_PARTS = ('NozzleInterior', 'AfterburnerInterior', 'BurnerInterior')
+
+# In multi-plane bundles the shared nozzle-interior meshes are often pooled under
+# a transform root separate from the selected plane, so they cannot be rescued.
+# Each plane still carries its OWN engine/exhaust parts (livery material), which
+# ARE correctly isolated -- use their mesh names to derive nozzle exit points.
+# Bare "Tail" is excluded (that is the vertical fin); "TailInner" is the exhaust.
+_ENGINE_PART_NAME_PARTS = (
+    'Engine', 'Nozzle', 'Exhaust', 'Burner', 'Jetpipe', 'Tailpipe',
+    'Afterburner', 'TailInner',
+)
+
+# Shared "ColliderMat"/"ShadowDepthOffset" materials are referenced by GUID and
+# are usually NOT bundled with a workshop mod, so their material *name* cannot be
+# resolved. Fall back to these mesh-name substrings so colliders and authored
+# shadow meshes are still dropped (the sim generates its own shadow silhouette).
+_DEFAULT_SKIP_NAME_PARTS = ('Collider', 'Shadow')
+
 
 def transform_root(tpid: int, transforms) -> int:
     """Walk the Unity Transform parent chain to the top-most ancestor path_id."""
@@ -653,6 +706,15 @@ def import_mod(cfg: dict) -> int:
     glass_parts = tuple(cfg.get('glassParts', []))
     glass_auto_alpha = bool(cfg.get('glassAutoAlpha', True))
     glass_alpha_max = float(cfg.get('glassAlphaMax', 0.9))
+    # Afterburner nozzle interiors -> FX_FIRE (sim throttle-drives the glow).
+    nozzle_auto = bool(cfg.get('nozzleAuto', True))
+    nozzle_parts = tuple(cfg.get('nozzleParts', []))
+    nozzle_materials = tuple(cfg.get('nozzleMaterials', []))
+    # Emissive "lights": a bright _EmissionColor over a dark base colour is
+    # exported as its literal bright colour. An optional allow-list restricts
+    # which material names may glow (empty = any qualifying material).
+    emissive_lights = bool(cfg.get('emissiveLights', True))
+    emissive_materials = set(cfg.get('emissiveMaterials', []))
     # Explicit per-material colour overrides: Unity material name -> '#rrggbb'
     # or a PaletteCategory name (e.g. 'GLASS'). Supersedes palette sampling.
     material_colors = dict(cfg.get('materialColors', {}))
@@ -660,7 +722,10 @@ def import_mod(cfg: dict) -> int:
     ground_part_names = list(cfg.get('groundParts', cfg.get('gearWheelParts', [])))
     ground_parts = set(ground_part_names)
     include_exact = set(cfg.get('includeExact', []))
-    skip_parts = tuple(cfg.get('skipNameParts', []))
+    # Always apply the collider/shadow name fallbacks so unbundled shared
+    # materials cannot let those meshes leak in; includeExact still rescues any
+    # legitimate part that happens to match.
+    skip_parts = tuple(cfg.get('skipNameParts', [])) + _DEFAULT_SKIP_NAME_PARTS
     skip_exact = set(cfg.get('skipExact', []))
     skip_materials = tuple(cfg.get('skipMaterials', DEFAULT_SKIP_MATERIALS))
     # A single Unity bundle may pack several aircraft that share part names
@@ -727,12 +792,54 @@ def import_mod(cfg: dict) -> int:
             return True
         return False
 
+    def is_nozzle(name: str, mat: dict | None) -> bool:
+        """True for an afterburner nozzle-interior mesh (shared NozzleInteriorMat
+        or a matching mesh name when that material is an unbundled GUID ref)."""
+        if not nozzle_auto:
+            return False
+        if any(p in name for p in nozzle_parts):
+            return True
+        if any(p in name for p in _NOZZLE_PART_NAME_PARTS):
+            return True
+        if mat is None:
+            return False
+        mat_name = mat.get('name', '')
+        if mat_name in _NOZZLE_MATERIAL_NAMES:
+            return True
+        return any(p in mat_name for p in nozzle_materials)
+
+    def emissive_hex(mat: dict | None) -> str | None:
+        """Bright emissive 'light' colour ('#rrggbb') for a material, else None.
+
+        Targets true lamps (dark base colour + bright _EmissionColor, e.g.
+        F4EEmissiveMat); ordinary lit surfaces fall through to palette/flat
+        colouring. An optional emissiveMaterials allow-list narrows this."""
+        if not emissive_lights or mat is None:
+            return None
+        if emissive_materials and mat.get('name', '') not in emissive_materials:
+            return None
+        em = mat.get('emission') or {}
+        if not em:
+            return None
+        er, eg, eb = em.get('r', 0.0), em.get('g', 0.0), em.get('b', 0.0)
+        if max(er, eg, eb) < EMISSION_MIN:
+            return None
+        base = mat.get('color') or {}
+        if base and max(base.get('r', 0.0), base.get('g', 0.0),
+                        base.get('b', 0.0)) > EMISSION_BASE_MAX:
+            return None
+        return rgba01_to_hex(em)
+
     def face_colors(name: str, mat: dict | None, face_t: np.ndarray,
                     uvs: np.ndarray | None, pal: np.ndarray | None) -> np.ndarray:
         # 1. Explicit per-material override wins.
         if mat is not None and mat['name'] in material_colors:
             res = np.full(len(face_t), material_colors[mat['name']])
-        # 2. Glass: a PaletteCategory glass colour (e.g. 'GLASS') always renders
+        # 2. Afterburner nozzle interior -> FX_FIRE. The sim throttle-drives this
+        # material, so it must be one uniform category (never palette-sampled).
+        elif is_nozzle(name, mat):
+            return np.full(len(face_t), FX_FIRE_MATERIAL)
+        # 3. Glass: a PaletteCategory glass colour (e.g. 'GLASS') always renders
         # as one uniform material so the sim can tint/dither it; a literal
         # '#rrggbb' still samples per-poly tint when the glass has a swatch.
         elif is_glass(name, mat):
@@ -741,10 +848,14 @@ def import_mod(cfg: dict) -> int:
             # on canopy parts would export as opaque hex colours the renderer cannot
             # treat as see-through glass.
             return np.full(len(face_t), glass_color)
-        # 3. Palette-swatch sampled per face.
+        # 4. Emissive light (bright emission over a dark base). Exported as its
+        # literal colour and never desaturated by the livery grayscale remap.
+        elif (light := emissive_hex(mat)) is not None:
+            return np.full(len(face_t), light)
+        # 5. Palette-swatch sampled per face.
         elif pal is not None and uvs is not None:
             res = sample_hex(pal, uvs[face_t].mean(axis=1))
-        # 4. Flat material colour, else neutral fallback.
+        # 6. Flat material colour, else neutral fallback.
         elif mat is not None and mat['color']:
             res = np.full(len(face_t), rgba01_to_hex(mat['color']))
         else:
@@ -772,18 +883,20 @@ def import_mod(cfg: dict) -> int:
 
     def colourable(name: str, sub_mat: dict | None, pal) -> bool:
         has_override = sub_mat is not None and sub_mat['name'] in material_colors
-        return bool(has_override or is_glass(name, sub_mat)
+        return bool(has_override or is_nozzle(name, sub_mat) or is_glass(name, sub_mat)
+                    or emissive_hex(sub_mat) is not None
                     or pal is not None or (sub_mat is not None and sub_mat['color']))
 
-    # A multi-plane bundle shares generic glass materials (e.g. 'Canopy',
-    # 'Glass') across every aircraft, so some transparent parts belong to the
-    # target plane yet carry no livery material and are dropped by
-    # includeMaterials (e.g. the F-16's separate 'CanopyBack' glass). When
-    # rescueGlassUnderRoot is set, we first find the transform-hierarchy root(s)
-    # of the livery-matched parts, then re-admit any glass (low-alpha) mesh that
-    # lives under the same root -- capturing this plane's stray glass without
-    # pulling in other planes' identically-named canopies.
+    # A multi-plane bundle can have per-plane companion materials that are not
+    # the selected livery (e.g. glass or nozzle interiors). Without a rescue
+    # path those parts are dropped by includeMaterials. We first find the
+    # transform-hierarchy root(s) of the livery-matched parts, then optionally
+    # re-admit same-root parts:
+    #   - glass-only (rescueGlassUnderRoot), or
+    #   - any non-skipped material (rescueMaterialsUnderRoot).
+    # This keeps key per-plane details while avoiding cross-plane bleed.
     rescue_glass = bool(cfg.get('rescueGlassUnderRoot', False)) and bool(include_materials)
+    rescue_materials = bool(cfg.get('rescueMaterialsUnderRoot', False)) and bool(include_materials)
 
     def _root_of(tpid: int) -> int:
         return transform_root(tpid, bundle.transforms)
@@ -852,9 +965,15 @@ def import_mod(cfg: dict) -> int:
         has_livery = (not include_materials) or any(
             bundle.materials.get(pid, {}).get('name', '') in include_materials
             for pid in mat_pids)
-        rescued = (rescue_glass and not has_livery
-                   and _root_of(transform_pid) in matched_roots
-                   and _has_glass_mat(mat_pids))
+        same_root = _root_of(transform_pid) in matched_roots
+        rescued = (
+            not has_livery
+            and same_root
+            and (
+                (rescue_glass and _has_glass_mat(mat_pids))
+                or rescue_materials
+            )
+        )
         if include_materials and not has_livery and not rescued:
             continue
         if any(any(s in bundle.materials.get(pid, {}).get('name', '')
@@ -1129,6 +1248,132 @@ def import_mod(cfg: dict) -> int:
     if shadow_manifest:
         print(f'Wrote {shadow_path}')
 
+    def _points_from_groups(groups: dict) -> tuple[list, list]:
+        """Reduce name->vertex-lists groups to (exit points, radii). Each group is
+        one nozzle: lateral/vertical centre at the aft-most (exit) rim."""
+        points, radii = [], []
+        for verts_list in groups.values():
+            v = np.vstack(verts_list)
+            points.append([
+                round(float(v[:, 0].mean()), 4),
+                round(float(v[:, 1].mean()), 4),
+                round(float(v[:, 2].min()), 4),  # aft-most rim = exhaust exit
+            ])
+            radii.append(0.5 * max(float(v[:, 0].max() - v[:, 0].min()),
+                                   float(v[:, 1].max() - v[:, 1].min())))
+        order = sorted(range(len(points)), key=lambda i: points[i][0])
+        return [points[i] for i in order], [radii[i] for i in order]
+
+    def _consolidate_nozzles(points: list, radii: list) -> tuple[list, list]:
+        """Collapse spurious extra exhaust points into the real nozzle count.
+
+        Twin-engine models often carry a center part between the two engines
+        (e.g. 'EngineB', 'TailInner', a center 'NozzleInt' fairing). When exit
+        points exist on BOTH sides of the centerline the plane is a twin, so any
+        near-center point is that fairing -- not an engine -- and is dropped.
+        Multiple points on the same side are averaged into one nozzle. Planes with
+        only centered/one-sided points are left as single/asymmetric as found."""
+        if len(points) <= 1:
+            return points, radii
+        tol = 0.35  # m: real twin nozzles sit well outside this; fairings within
+        rad = list(radii) if radii else [None] * len(points)
+        left = [(p, r) for p, r in zip(points, rad) if p[0] < -tol]
+        right = [(p, r) for p, r in zip(points, rad) if p[0] > tol]
+        center = [(p, r) for p, r in zip(points, rad) if abs(p[0]) <= tol]
+
+        def _merge(group):
+            ps = np.vstack([np.asarray(p, dtype=float) for p, _ in group])
+            rs = [r for _, r in group if r is not None]
+            pt = [round(float(x), 4) for x in ps.mean(axis=0)]
+            return pt, (float(np.median(rs)) if rs else None)
+
+        groups = ([left, right] if left and right
+                  else [g for g in (left, center, right) if g])
+        out_pts, out_rad = [], []
+        for g in groups:
+            pt, r = _merge(g)
+            out_pts.append(pt)
+            if r is not None:
+                out_rad.append(r)
+        return out_pts, out_rad
+
+    def _derive_from_body(parts, translate) -> tuple[list, list]:
+        """Fallback: estimate nozzle exits from the aft body slab when no engine
+        part is named. Keeps the lower half by Y (drops the vertical fin) and
+        splits into twin nozzles on a clear lateral gap."""
+        if not parts:
+            return [], []
+        v = np.vstack([p['world_v'] for p in parts]) + translate
+        zmin, zmax = float(v[:, 2].min()), float(v[:, 2].max())
+        slab_depth = max(0.6, 0.08 * max(zmax - zmin, 1e-3))
+        slab = v[v[:, 2] <= zmin + slab_depth]
+        if len(slab) < 8:
+            return [], []
+        low = slab[slab[:, 1] <= float(np.median(slab[:, 1]))]
+        if len(low) < 6:
+            low = slab
+        xs = np.sort(low[:, 0])
+        xspan = float(xs[-1] - xs[0])
+        clusters = [low]
+        if len(xs) > 1 and xspan > 0.9:
+            gaps = np.diff(xs)
+            gi = int(np.argmax(gaps))
+            gap = float(gaps[gi])
+            split_x = 0.5 * (xs[gi] + xs[gi + 1])
+            left, right = low[low[:, 0] <= split_x], low[low[:, 0] > split_x]
+            if gap > 0.35 * xspan and gap > 0.4 and len(left) >= 4 and len(right) >= 4:
+                clusters = [left, right]
+        groups = {i: [c] for i, c in enumerate(clusters)}
+        return _points_from_groups(groups)
+
+    def nozzle_exhaust_points(parts, translate) -> tuple[list, float | None]:
+        """Afterburner exhaust-cone origins (+ representative radius) in the body's
+        aircraft-local frame, so the sim can auto-place throttle-driven plumes.
+
+        Priority: (1) real nozzle-interior meshes when reachable; (2) the plane's
+        own engine/exhaust parts by name (robust for multi-plane bundles whose
+        shared nozzle meshes are pooled under another root); (3) an aft-slab
+        geometric estimate. Same frame as the emitted body (ground_translate)."""
+        offset = [p.copy() for p in parts]
+        for p in offset:
+            p['world_v'] = p['world_v'] + translate
+
+        nozzle_groups: dict[str, list] = {}
+        engine_groups: dict[str, list] = {}
+        for p in offset:
+            if is_nozzle(p['name'], None) or any(is_nozzle(p['name'], sm) for sm in p['sub_mats']):
+                nozzle_groups.setdefault(p['name'], []).append(p['world_v'])
+            elif any(tok in p['name'] for tok in _ENGINE_PART_NAME_PARTS):
+                engine_groups.setdefault(p['name'], []).append(p['world_v'])
+
+        for source in (nozzle_groups, engine_groups):
+            if source:
+                points, radii = _points_from_groups(source)
+                points, radii = _consolidate_nozzles(points, radii)
+                if points:
+                    radius = float(np.median(radii)) if radii else None
+                    return points, radius
+
+        points, radii = _derive_from_body(parts, translate)
+        points, radii = _consolidate_nozzles(points, radii)
+        radius = float(np.median(radii)) if radii else None
+        return points, radius
+
+    fx = dict(flyable.get('fx') or {})
+    if fx.get('nozzles') is None:
+        auto_nozzles, auto_radius = nozzle_exhaust_points(
+            body_parts, np.asarray(ground_translate))
+        if auto_nozzles:
+            fx['nozzles'] = auto_nozzles
+            if auto_radius is not None and fx.get('nozzleRadius') is None:
+                fx['nozzleRadius'] = round(max(0.15, min(auto_radius, 1.5)), 4)
+            print(f'Afterburner nozzles: {auto_nozzles} (r={fx.get("nozzleRadius")})')
+        else:
+            fx.setdefault('nozzles', None)
+    fx.setdefault('nozzles', None)
+    fx.setdefault('nozzleRadius', None)
+    fx.setdefault('wingtips', None)
+
     flight = dict(cfg.get('flight') or {})
     ground_rest_height_m = ground_distance
     if ground_part_names and flight:
@@ -1160,7 +1405,7 @@ def import_mod(cfg: dict) -> int:
         'gear': gear_manifest,
         'static': rel(out),
         'surfaces': surfaces_manifest,
-        'fx': flyable.get('fx', {'nozzles': None, 'wingtips': None}),
+        'fx': fx,
         'cockpitOffset': flyable.get('cockpitOffset', [0.0, 1.0, 4.0]),
         'spawn': flyable.get('spawn', {}),
         'groundOffsetY': round(float(ground_offset_y), 4),

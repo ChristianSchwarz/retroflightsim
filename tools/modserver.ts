@@ -73,6 +73,15 @@ interface ImportedAircraft {
     packUrl: string;
 }
 
+interface AircraftManifestListMeta {
+    name?: string;
+    displayName?: string;
+    canonicalName?: string;
+    sourceMod?: string;
+    sourceModId?: string;
+    sourceMaterial?: string;
+}
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 function slugify(name: string): string {
@@ -431,6 +440,7 @@ function buildPlaneConfig(
             includeMaterials: [plane.material!],
             dedupeParts: true,
             rescueGlassUnderRoot: true,
+            rescueMaterialsUnderRoot: true,
         } : {}),
     };
 }
@@ -440,21 +450,37 @@ function listAircraftPacks(): ImportedAircraft[] {
     if (!fs.existsSync(distAssets)) {
         return [];
     }
-    const packs: ImportedAircraft[] = [];
+    const deduped = new Map<string, { entry: ImportedAircraft; mtimeMs: number }>();
     for (const file of fs.readdirSync(distAssets)) {
         if (!file.endsWith('.aircraft.pack')) {
             continue;
         }
         const id = file.slice(0, -'.aircraft.pack'.length);
+        const packPath = path.join(distAssets, file);
+        const stat = fs.statSync(packPath);
         let name = id;
+        let dedupeKey = id;
         const manifestPath = manifestPathForId(id);
         if (manifestPath) {
-            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as { name?: string; displayName?: string };
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as AircraftManifestListMeta;
             name = manifest.displayName ?? manifest.name ?? id;
+            // Re-imports produce suffixed ids (_2, _3, ...). Collapse identical
+            // aircraft/material variants and keep only the newest pack in the menu.
+            if (manifest.canonicalName || manifest.sourceModId || manifest.sourceMod || manifest.sourceMaterial) {
+                dedupeKey = [
+                    manifest.sourceModId ?? manifest.sourceMod ?? '',
+                    manifest.canonicalName ?? name,
+                    manifest.sourceMaterial ?? '',
+                ].join('::');
+            }
         }
-        packs.push({ id, name, packUrl: `assets/${file}` });
+        const entry = { id, name, packUrl: `assets/${file}` };
+        const prev = deduped.get(dedupeKey);
+        if (!prev || stat.mtimeMs > prev.mtimeMs) {
+            deduped.set(dedupeKey, { entry, mtimeMs: stat.mtimeMs });
+        }
     }
-    return packs.sort((a, b) => a.name.localeCompare(b.name));
+    return [...deduped.values()].map(v => v.entry).sort((a, b) => a.name.localeCompare(b.name));
 }
 
 async function importPlaneConfig(configPath: string, log: string[]): Promise<void> {
