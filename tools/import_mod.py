@@ -37,7 +37,7 @@ Usage:
     python tools/import_mod.py --bundle "C:/Downloads/mod.zip" --list
 
     # Import using a JSON config (see tools/mods/_template.json for all fields):
-    python tools/import_mod.py --config tools/mods/a4e.json
+    python tools/import_mod.py --config tools/mods/mod.json
 
     # Import straight from the CLI (zero-config: include everything, auto glass):
     python tools/import_mod.py --bundle "C:/Downloads/mod.zip" --out assets/foo.gltf
@@ -605,8 +605,8 @@ def hinge_frame_from_part(
     """Pivot + hinge axis from a Unity bone/empty (e.g. BSlatL) in the sim body frame.
 
     The hinge axis is one of the bone's three local axes, but which column the
-    artist aligned to the hinge line varies between mods (e.g. the F-16 rudder
-    hinge is the bone's local Y, the A-4 rudder hinge is its local Z). Rather
+    artist aligned to the hinge line varies between mods (e.g. one mod's rudder
+    hinge is the bone's local Y, another's is its local Z). Rather
     than assume a fixed column, pick the local axis whose world direction best
     matches the expected hinge orientation: vertical (world +Y) for a yaw
     surface (rudder), spanwise (world +X) for everything else. An explicit
@@ -1542,7 +1542,7 @@ def load_config(path: str) -> dict:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='Import a Unity asset-bundle mod into a retroflightsim glTF.')
-    ap.add_argument('--config', help='JSON config file (see tools/mods/a4e.json).')
+    ap.add_argument('--config', help='JSON config file (see tools/mods/mod.json).')
     ap.add_argument('--bundle', help='Path to a mod .zip, a Unity asset bundle file, or a folder.')
     ap.add_argument('--out', help='Output .gltf path (relative to project root).')
     ap.add_argument('--ground', type=float, help='Distance from origin to ground (default 2.0).')

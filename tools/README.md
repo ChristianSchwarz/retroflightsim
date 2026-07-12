@@ -1,7 +1,7 @@
 # Mod import tools
 
-Tools for converting external Unity asset-bundle mods (e.g. the Tiny Combat
-Arena A-4E) into retroflightsim-compatible glTF models.
+Tools for converting external Unity asset-bundle mods (e.g. Tiny Combat Arena
+aircraft) into retroflightsim-compatible glTF models.
 
 ## Why this is needed
 
@@ -64,7 +64,7 @@ palette-swatch atlases), materials (texture / colour / alpha), and every mesh
 GameObject with its material(s):
 
 ```
-python tools/import_mod.py --bundle "C:/Downloads/3617819835_A-4E_Skyhawk.zip" --list
+python tools/import_mod.py --bundle "C:/Downloads/my_aircraft_mod.zip" --list
 ```
 
 ### 2. Import
@@ -79,7 +79,7 @@ Or, for repeatability, with a JSON config (recommended). Copy
 `tools/mods/_template.json`, fill in `bundle` + `out`, and tweak from there:
 
 ```
-python tools/import_mod.py --config tools/mods/a4e.json
+python tools/import_mod.py --config tools/mods/mod.json
 ```
 
 Only `bundle` and `out` are required; every other field has a sensible default
@@ -87,28 +87,28 @@ Only `bundle` and `out` are required; every other field has a sensible default
 swatch). Use `--list` to discover part and material names before narrowing the
 include/skip lists.
 
-The A-4E has its own convenience wrapper:
+A mod can have its own convenience wrapper:
 
 ```
-python tools/build_a4e_gltf.py
+python tools/build_mod_gltf.py
 ```
 
 ### 3. Wire it into the sim
 
 The importer produces loose glTF files under `assets/` for editing and tests.
 At build time, `tools/pack_aircraft_mods.py` bundles each flyable mod into a
-single `dist/assets/{id}.aircraft.pack` file. Shipped mods (A-4E, F-16) keep
+single `dist/assets/{id}.aircraft.pack` file. Shipped mods keep
 their manifests under `assets/`; **F10 imports** stage loose glTF files under
 `tools/mods/imports/` until packing ù they are not written into `assets/`.
 
 To register a flyable mod, load its pack in `src/script/state/game.ts`:
 
 ```
-await this.aircraftRegistry.loadPack('a4e', 'assets/a4e.aircraft.pack');
+await this.aircraftRegistry.loadPack('mymod', 'assets/mymod.aircraft.pack');
 ```
 
 For parked ramp models, reference pack URLs in
-`src/script/state/staticModelViews.ts` (e.g. `pack:a4e/a4e_static.gltf`).
+`src/script/state/staticModelViews.ts` (e.g. `pack:mymod/mymod_static.gltf`).
 
 ### 4. Build
 
@@ -117,7 +117,7 @@ npm run build
 ```
 
 Runs webpack and then `npm run pack-mods`. The deployable mod output is
-`dist/assets/*.aircraft.pack`, not the hundreds of loose `a4e_*` files in
+`dist/assets/*.aircraft.pack`, not the hundreds of loose per-mod glTF files in
 `assets/`.
 
 ## Config schema (`tools/mods/*.json`)
