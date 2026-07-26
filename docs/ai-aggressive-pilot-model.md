@@ -50,7 +50,7 @@ mission logic stays shared across all three models.
 |-------|-------------------|-----------|-------|
 | ATTACK | AOT &lt; 75°, range &lt; 5 km | Lead Pursuit, High Yo-Yo | No lag-pursuit/low-yo-yo caution — always drives the lead-pursuit turn at max-G; high yo-yo only fires when an overshoot is truly imminent at knife-fight range. |
 | MERGE | Head-on / high offset | Head-On Press, Post-Merge Reversal | Commits to a nose-to-nose gunfight instead of a cautious lead turn or energy climb; reverses hard right after the pass to regain an offensive angle. |
-| COUNTER | Bandit ATA &lt; 60°, range &lt; 2.5 km | Scissors Counter | **Never breaks away or extends.** Rolls/pulls into the bandit's flight path, cutting inside its turn to force an overshoot — this is the model's defining "never flees" trait. |
+| COUNTER | Bandit ATA &lt; 60°, range &lt; 2.5 km | Scissors Counter | **Never breaks away or extends.** Always rolls/pulls straight at the bandit's current bearing — never off to a side or away — forcing an overshoot instead of escaping; this is the model's defining "never flees" trait. |
 
 Compared to Shaw/Classic, firing is also more permissive: a wider
 tracking-angle cone (~14° vs. Shaw's 8°/5°) and snap-shooting out to ~1.2x the
