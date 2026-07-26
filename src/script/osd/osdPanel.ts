@@ -120,9 +120,11 @@ function setupUnitSystem(config: ConfigService) {
 
     unitMetric.addEventListener('change', () => {
         config.unitSystem.setActive(UnitSystems.METRIC);
+        updateSettings({ unitSystem: UnitSystems.METRIC });
     });
     unitImperial.addEventListener('change', () => {
         config.unitSystem.setActive(UnitSystems.IMPERIAL);
+        updateSettings({ unitSystem: UnitSystems.IMPERIAL });
     });
 }
 
@@ -134,9 +136,11 @@ function setupAiPilotModel(config: ConfigService) {
 
     classic.addEventListener('change', () => {
         config.aiPilotModels.setActive(AiPilotModels.CLASSIC);
+        updateSettings({ aiPilotModel: AiPilotModels.CLASSIC });
     });
     shaw.addEventListener('change', () => {
         config.aiPilotModels.setActive(AiPilotModels.SHAW);
+        updateSettings({ aiPilotModel: AiPilotModels.SHAW });
     });
 }
 
@@ -194,6 +198,14 @@ function syncSettingsUI(config: ConfigService, keyboardInput: KeyboardControlDev
         [FlightModels.DEBUG]: 'flightmodel-debug',
         [FlightModels.JSBSIM]: 'flightmodel-jsbsim',
     };
+    const unitSystemRadioIds: Record<UnitSystems, string> = {
+        [UnitSystems.METRIC]: 'units-metric',
+        [UnitSystems.IMPERIAL]: 'units-imperial',
+    };
+    const aiPilotRadioIds: Record<AiPilotModels, string> = {
+        [AiPilotModels.CLASSIC]: 'aipilot-classic',
+        [AiPilotModels.SHAW]: 'aipilot-shaw',
+    };
     const keyboardLayoutRadioIds: Record<KeyboardControlLayoutId, string> = {
         [KeyboardControlLayoutId.QWERTY]: 'layout-qwerty',
         [KeyboardControlLayoutId.QWERTZ]: 'layout-qwertz',
@@ -204,6 +216,8 @@ function syncSettingsUI(config: ConfigService, keyboardInput: KeyboardControlDev
 
     checkRadio(techProfileRadioIds[config.techProfiles.getActiveKey()]);
     checkRadio(flightModelRadioIds[config.flightModels.getActiveKey()]);
+    checkRadio(unitSystemRadioIds[config.unitSystem.getActive()]);
+    checkRadio(aiPilotRadioIds[config.aiPilotModels.getActive()]);
     checkRadio(keyboardLayoutRadioIds[keyboardInput.getKeyboardLayoutId()]);
 }
 
