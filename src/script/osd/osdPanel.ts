@@ -131,12 +131,17 @@ function setupAiPilotModel(config: ConfigService) {
     assertIsDefined(classic);
     const shaw = document.getElementById('aipilot-shaw');
     assertIsDefined(shaw);
+    const aggressive = document.getElementById('aipilot-aggressive');
+    assertIsDefined(aggressive);
 
     classic.addEventListener('change', () => {
         config.aiPilotModels.setActive(AiPilotModels.CLASSIC);
     });
     shaw.addEventListener('change', () => {
         config.aiPilotModels.setActive(AiPilotModels.SHAW);
+    });
+    aggressive.addEventListener('change', () => {
+        config.aiPilotModels.setActive(AiPilotModels.AGGRESSIVE);
     });
 }
 
