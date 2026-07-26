@@ -20,11 +20,13 @@ export class ConfigService {
         flightModels: { [id: string]: FlightModel },
         initialTechProfile?: string,
         initialFlightModel?: string,
+        initialUnitSystem?: UnitSystems,
+        initialAiPilotModel?: AiPilotModels,
     ) {
         this.techProfiles = new ConfigSet(profiles, initialTechProfile);
         this.flightModels = new ConfigSet(flightModels, initialFlightModel);
-        this.unitSystem = new UnitSystemSetting();
-        this.aiPilotModels = new AiPilotModelSetting();
+        this.unitSystem = new UnitSystemSetting(initialUnitSystem);
+        this.aiPilotModels = new AiPilotModelSetting(initialAiPilotModel);
     }
 }
 
@@ -87,8 +89,12 @@ class ConfigSet<T> {
 }
 
 export class UnitSystemSetting {
-    private active: UnitSystems = UnitSystems.METRIC;
+    private active: UnitSystems;
     private listeners: Set<UnitSystemChangeListener> = new Set();
+
+    constructor(initial: UnitSystems = UnitSystems.METRIC) {
+        this.active = initial;
+    }
 
     getActive(): UnitSystems {
         return this.active;
@@ -112,8 +118,12 @@ export class UnitSystemSetting {
 }
 
 export class AiPilotModelSetting {
-    private active: AiPilotModels = AiPilotModels.CLASSIC;
+    private active: AiPilotModels;
     private listeners: Set<AiPilotModelChangeListener> = new Set();
+
+    constructor(initial: AiPilotModels = AiPilotModels.CLASSIC) {
+        this.active = initial;
+    }
 
     getActive(): AiPilotModels {
         return this.active;
