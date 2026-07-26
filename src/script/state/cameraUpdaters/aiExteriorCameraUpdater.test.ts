@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import { PlayerEntity } from '../../scene/entities/player';
 import { ExteriorViewHeading } from './exteriorFrontBehindCameraUpdater';
 import { AiExteriorCameraUpdater, ChaseTarget } from './aiExteriorCameraUpdater';
+import { duelMidpoint } from './duelCameraUtils';
 
 function actorAt(position: THREE.Vector3): PlayerEntity {
     return {
@@ -28,16 +29,29 @@ function horizontalDistanceToLine(point: THREE.Vector3, a: THREE.Vector3, b: THR
     if (len < 1e-9) {
         return Math.sqrt((px - ax) ** 2 + (pz - az) ** 2);
     }
-    // 2D cross product magnitude / line length.
     return Math.abs((px - ax) * dz - (pz - az) * dx) / len;
+}
+
+function cameraForward(camera: THREE.PerspectiveCamera): THREE.Vector3 {
+    return new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion).normalize();
+}
+
+function isInFrontOfCamera(camera: THREE.PerspectiveCamera, worldPoint: THREE.Vector3): boolean {
+    const forward = cameraForward(camera);
+    const toPoint = worldPoint.clone().sub(camera.position).normalize();
+    return forward.dot(toPoint) > 0;
+}
+
+function isLookingAt(camera: THREE.PerspectiveCamera, target: THREE.Vector3, tolerance = 0.999): boolean {
+    const forward = cameraForward(camera);
+    const toTarget = target.clone().sub(camera.position).normalize();
+    return forward.dot(toTarget) > tolerance;
 }
 
 describe('AiExteriorCameraUpdater', () => {
     it('keeps the camera on the axis joining player and target even when the target is not facing the player', () => {
         const playerPos = new THREE.Vector3(0, 0, 0);
         const targetPos = new THREE.Vector3(0, 0, -500);
-        // Target facing perpendicular to the line-of-sight (yawed 90deg), so a
-        // heading-based offset would push the camera off to the side.
         const targetQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2);
 
         const player = actorAt(playerPos);
@@ -51,7 +65,7 @@ describe('AiExteriorCameraUpdater', () => {
         assert.ok(distance < 1e-6, `expected camera on axis, but it is ${distance}m off`);
     });
 
-    it('flips to the other side of the target when the heading toggles', () => {
+    it('places BACK and FRONT on opposite sides outside the player-target segment', () => {
         const playerPos = new THREE.Vector3(0, 0, 0);
         const targetPos = new THREE.Vector3(0, 0, -500);
         const targetQuat = new THREE.Quaternion();
@@ -68,25 +82,28 @@ describe('AiExteriorCameraUpdater', () => {
         updater.update(0);
         const frontZ = camera.position.z;
 
-        // BACK continues past the target away from the player; FRONT sits between
-        // the player and the target. They should land on opposite sides of the target.
-        assert.ok((backZ - targetPos.z) * (frontZ - targetPos.z) < 0);
+        assert.ok((backZ - playerPos.z) * (backZ - targetPos.z) > 0, 'BACK should sit outside the segment');
+        assert.ok((frontZ - playerPos.z) * (frontZ - targetPos.z) > 0, 'FRONT should sit outside the segment');
+        assert.ok((backZ - playerPos.z) * (frontZ - playerPos.z) < 0, 'BACK and FRONT should be on opposite sides');
     });
 
-    it('always looks at the player', () => {
+    it('aims at the duel midpoint and keeps both aircraft in front of the camera', () => {
         const playerPos = new THREE.Vector3(120, 30, -80);
         const targetPos = new THREE.Vector3(-40, 60, 300);
         const targetQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), 1.3);
+        const midpoint = duelMidpoint(playerPos, targetPos, new THREE.Vector3());
 
-        const player = actorAt(playerPos);
-        const target = chaseTargetAt(targetPos, targetQuat);
-        const camera = new THREE.PerspectiveCamera();
-        const updater = new AiExteriorCameraUpdater(player, camera, target, ExteriorViewHeading.BACK);
+        for (const heading of [ExteriorViewHeading.BACK, ExteriorViewHeading.FRONT]) {
+            const player = actorAt(playerPos);
+            const target = chaseTargetAt(targetPos, targetQuat);
+            const camera = new THREE.PerspectiveCamera();
+            const updater = new AiExteriorCameraUpdater(player, camera, target, heading);
 
-        updater.update(0);
+            updater.update(0);
 
-        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion).normalize();
-        const toPlayer = playerPos.clone().sub(camera.position).normalize();
-        assert.ok(forward.dot(toPlayer) > 0.999, `camera is not looking at the player (dot=${forward.dot(toPlayer)})`);
+            assert.ok(isLookingAt(camera, midpoint), `expected ${heading} view to look at midpoint`);
+            assert.ok(isInFrontOfCamera(camera, playerPos), `player not visible in ${heading} view`);
+            assert.ok(isInFrontOfCamera(camera, targetPos), `target not visible in ${heading} view`);
+        }
     });
 });
