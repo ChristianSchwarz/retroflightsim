@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { PlayerEntity } from '../../scene/entities/player';
-import { FORWARD, UP } from '../../utils/math';
+import { UP } from '../../utils/math';
 import { CameraUpdater } from './cameraUpdater';
 import { ExteriorViewHeading } from './exteriorFrontBehindCameraUpdater';
 
@@ -43,9 +43,13 @@ export class AiExteriorCameraUpdater extends CameraUpdater {
         const subjectPos = this.orbitSubject.getDisplayPosition();
         const playerPos = this.actor.getDisplayPosition();
 
+        // Offset along the line joining the two aircraft (not the target's own
+        // heading), so the camera stays on the same axis as both planes instead
+        // of swinging out to the side whenever the target isn't pointed straight
+        // at (or away from) the player.
         this._v
-            .copy(FORWARD)
-            .applyQuaternion(this.orbitSubject.getDisplayQuaternion())
+            .copy(subjectPos)
+            .sub(playerPos)
             .setY(0);
         if (this._v.lengthSq() < 1e-6) {
             this._v.set(0, 0, 1);
