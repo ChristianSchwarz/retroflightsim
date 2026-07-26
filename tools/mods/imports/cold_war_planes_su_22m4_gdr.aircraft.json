@@ -1,0 +1,138 @@
+{
+  "id": "cold_war_planes_su_22m4_gdr",
+  "name": "Su-22M4",
+  "displayName": "Su-22M4",
+  "canonicalName": "Su-22M4 GDR",
+  "category": "Fighter",
+  "description": "The Sukhoi Su-17/20/22 is a variable-sweep wing fighter-bomber developed for the Soviet military. The 22 is the export version, which is downgraded from the actual Su-17. The M4 variant is the last variant of the fitter featuring better avionics and more. With the GDR skin.",
+  "tags": [],
+  "sourceMod": "Cold War Planes",
+  "sourceModId": null,
+  "sourceMaterial": "Su-22M4 GDR",
+  "importMeta": {
+    "confidence": 1,
+    "discoveredFrom": "Su-22M4 GDR"
+  },
+  "body": "tools/mods/imports/cold_war_planes_su_22m4_gdr_body.gltf",
+  "shadow": "tools/mods/imports/cold_war_planes_su_22m4_gdr_shadow.gltf",
+  "gear": "tools/mods/imports/cold_war_planes_su_22m4_gdr_gear.gltf",
+  "static": "tools/mods/imports/cold_war_planes_su_22m4_gdr_static.gltf",
+  "surfaces": [
+    {
+      "role": "elevatorLeft",
+      "path": "tools/mods/imports/cold_war_planes_su_22m4_gdr_surf_elevatorLeft.gltf",
+      "pivot": [
+        0.687,
+        0.0464,
+        -6.3528
+      ],
+      "axis": [
+        0.9958,
+        -0.0,
+        -0.0916
+      ],
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    },
+    {
+      "role": "elevatorRight",
+      "path": "tools/mods/imports/cold_war_planes_su_22m4_gdr_surf_elevatorRight.gltf",
+      "pivot": [
+        -0.687,
+        0.0464,
+        -6.3528
+      ],
+      "axis": [
+        0.9958,
+        0.0,
+        0.0916
+      ],
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    },
+    {
+      "role": "aileronLeft",
+      "path": "tools/mods/imports/cold_war_planes_su_22m4_gdr_surf_aileronLeft.gltf",
+      "pivot": [
+        2.452,
+        -0.3799,
+        -3.7041
+      ],
+      "axis": [
+        1.0,
+        -0.0,
+        -0.0
+      ],
+      "control": "roll",
+      "sign": 1,
+      "rangeRad": 0.4
+    },
+    {
+      "role": "aileronRight",
+      "path": "tools/mods/imports/cold_war_planes_su_22m4_gdr_surf_aileronRight.gltf",
+      "pivot": [
+        -2.452,
+        -0.3799,
+        -3.7041
+      ],
+      "axis": [
+        1.0,
+        -0.0,
+        -0.0
+      ],
+      "control": "roll",
+      "sign": -1,
+      "rangeRad": 0.4
+    },
+    {
+      "role": "rudder",
+      "path": "tools/mods/imports/cold_war_planes_su_22m4_gdr_surf_rudder.gltf",
+      "pivot": [
+        -0.0233,
+        1.9272,
+        -7.1913
+      ],
+      "axis": [
+        -0.0,
+        0.7176,
+        0.6964
+      ],
+      "control": "yaw",
+      "sign": 1,
+      "rangeRad": 0.45
+    }
+  ],
+  "fx": {
+    "nozzles": [
+      [
+        0.0,
+        0.0217,
+        -6.3358
+      ]
+    ],
+    "nozzleRadius": 0.4381,
+    "wingtips": [
+      [
+        6.8567,
+        -0.1595,
+        -3.2243
+      ],
+      [
+        -6.8567,
+        -0.1595,
+        -3.2243
+      ]
+    ]
+  },
+  "cockpitOffset": [
+    0.0,
+    1.0,
+    4.0
+  ],
+  "spawn": {},
+  "groundOffsetY": 0.0464,
+  "groundRestHeightM": 2.0,
+  "flight": null
+}

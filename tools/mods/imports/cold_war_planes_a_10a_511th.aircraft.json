@@ -1,0 +1,92 @@
+{
+  "id": "cold_war_planes_a_10a_511th",
+  "name": "A-10A Thunderbolt II",
+  "displayName": "A-10A Thunderbolt II",
+  "canonicalName": "A-10A 511th",
+  "category": "Attacker",
+  "description": "The Fairchild Republic A-10 Thunderbolt II is a single-seat, twin-turbofan, straight-wing, subsonic attack aircraft developed by Fairchild Republic for the United States Air Force (USAF). The A version is the earliest version of the A-10.",
+  "tags": [],
+  "sourceMod": "Cold War Planes",
+  "sourceModId": null,
+  "sourceMaterial": "A-10A Mat",
+  "importMeta": {
+    "confidence": 0.333,
+    "discoveredFrom": "A-10A Mat"
+  },
+  "body": "tools/mods/imports/cold_war_planes_a_10a_511th_body.gltf",
+  "shadow": "tools/mods/imports/cold_war_planes_a_10a_511th_shadow.gltf",
+  "gear": "tools/mods/imports/cold_war_planes_a_10a_511th_gear.gltf",
+  "static": "tools/mods/imports/cold_war_planes_a_10a_511th_static.gltf",
+  "surfaces": [
+    {
+      "role": "elevatorLeft",
+      "path": "tools/mods/imports/cold_war_planes_a_10a_511th_surf_elevatorLeft.gltf",
+      "pivot": [
+        1.6669,
+        0.1375,
+        -7.2866
+      ],
+      "axis": [
+        1.0,
+        -0.0,
+        0.0
+      ],
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    },
+    {
+      "role": "elevatorRight",
+      "path": "tools/mods/imports/cold_war_planes_a_10a_511th_surf_elevatorRight.gltf",
+      "pivot": [
+        -1.6669,
+        0.1375,
+        -7.2866
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        -0.0
+      ],
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    }
+  ],
+  "fx": {
+    "nozzles": [
+      [
+        -1.4339,
+        1.164,
+        -5.0279
+      ],
+      [
+        1.4339,
+        1.164,
+        -5.0279
+      ]
+    ],
+    "nozzleRadius": 0.4163,
+    "wingtips": [
+      [
+        8.7901,
+        0.1515,
+        0.402
+      ],
+      [
+        -8.7901,
+        0.1515,
+        0.402
+      ]
+    ]
+  },
+  "cockpitOffset": [
+    0.0,
+    1.0,
+    4.0
+  ],
+  "spawn": {},
+  "groundOffsetY": 0.5407,
+  "groundRestHeightM": 2.0,
+  "flight": null
+}

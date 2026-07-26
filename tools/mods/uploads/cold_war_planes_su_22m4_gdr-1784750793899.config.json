@@ -1,0 +1,35 @@
+{
+  "bundle": "C:\\Users\\chris\\Projects\\retroflightsim\\tools\\mods\\uploads\\cold_war_planes-1784750793899.zip",
+  "groundDistance": 2,
+  "scale": 1,
+  "swatchMax": 64,
+  "glassColor": "GLASS",
+  "glassAutoAlpha": true,
+  "skipMaterials": [
+    "Collider",
+    "ShadowDepthOffset",
+    "Shadow"
+  ],
+  "id": "cold_war_planes_su_22m4_gdr",
+  "name": "Su-22M4",
+  "displayName": "Su-22M4",
+  "canonicalName": "Su-22M4 GDR",
+  "category": "Fighter",
+  "description": "The Sukhoi Su-17/20/22 is a variable-sweep wing fighter-bomber developed for the Soviet military. The 22 is the export version, which is downgraded from the actual Su-17. The M4 variant is the last variant of the fitter featuring better avionics and more. With the GDR skin.",
+  "sourceMaterial": "Su-22M4 GDR",
+  "sourceMod": "Cold War Planes",
+  "importMeta": {
+    "confidence": 1,
+    "discoveredFrom": "Su-22M4 GDR"
+  },
+  "out": "tools/mods/imports/cold_war_planes_su_22m4_gdr_static.gltf",
+  "flyable": {
+    "outPrefix": "tools/mods/imports/cold_war_planes_su_22m4_gdr"
+  },
+  "includeMaterials": [
+    "Su-22M4 GDR"
+  ],
+  "dedupeParts": true,
+  "rescueGlassUnderRoot": true,
+  "rescueMaterialsUnderRoot": true
+}

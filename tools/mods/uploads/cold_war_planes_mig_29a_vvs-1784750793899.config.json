@@ -1,0 +1,35 @@
+{
+  "bundle": "C:\\Users\\chris\\Projects\\retroflightsim\\tools\\mods\\uploads\\cold_war_planes-1784750793899.zip",
+  "groundDistance": 2,
+  "scale": 1,
+  "swatchMax": 64,
+  "glassColor": "GLASS",
+  "glassAutoAlpha": true,
+  "skipMaterials": [
+    "Collider",
+    "ShadowDepthOffset",
+    "Shadow"
+  ],
+  "id": "cold_war_planes_mig_29a_vvs",
+  "name": "MiG-29A 9.12",
+  "displayName": "MiG-29A 9.12",
+  "canonicalName": "MiG-29A VVS",
+  "category": "Fighter",
+  "description": "The Mikoyan MiG-29 Fulcrum is a twin-engine fighter aircraft designed in the Soviet Union. The 9.13 Variant possessed an enlarged dorsal spine to accommodate a larger No.1 fuel tank and the installation of the L-203BE Gardenyia-1 jammer that was lacking on the initial 9.12 version. With the VVS skin.",
+  "sourceMaterial": "MiG-29 9.12 Mat",
+  "sourceMod": "Cold War Planes",
+  "importMeta": {
+    "confidence": 0.333,
+    "discoveredFrom": "MiG-29 9.12 Mat"
+  },
+  "out": "tools/mods/imports/cold_war_planes_mig_29a_vvs_static.gltf",
+  "flyable": {
+    "outPrefix": "tools/mods/imports/cold_war_planes_mig_29a_vvs"
+  },
+  "includeMaterials": [
+    "MiG-29 9.12 Mat"
+  ],
+  "dedupeParts": true,
+  "rescueGlassUnderRoot": true,
+  "rescueMaterialsUnderRoot": true
+}

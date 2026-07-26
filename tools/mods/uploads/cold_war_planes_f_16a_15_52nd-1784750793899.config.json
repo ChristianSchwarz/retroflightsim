@@ -1,0 +1,35 @@
+{
+  "bundle": "C:\\Users\\chris\\Projects\\retroflightsim\\tools\\mods\\uploads\\cold_war_planes-1784750793899.zip",
+  "groundDistance": 2,
+  "scale": 1,
+  "swatchMax": 64,
+  "glassColor": "GLASS",
+  "glassAutoAlpha": true,
+  "skipMaterials": [
+    "Collider",
+    "ShadowDepthOffset",
+    "Shadow"
+  ],
+  "id": "cold_war_planes_f_16a_15_52nd",
+  "name": "F-16A Block 15",
+  "displayName": "F-16A Block 15",
+  "canonicalName": "F-16A 15 52nd",
+  "category": "Fighter",
+  "description": "The General Dynamics F-16 Fighting Falcon is an American single-engine supersonic multirole fighter aircraft originally developed by General Dynamics for the United States Air Force (USAF). The Block 15 aircraft featured larger horizontal stabilators, the addition of two hardpoints to the chin inlet, an improved AN/APG-66(V)2 radar, and increased capacity for the underwing hardpoints.",
+  "sourceMaterial": "F-16A Sabers",
+  "sourceMod": "Cold War Planes",
+  "importMeta": {
+    "confidence": 1,
+    "discoveredFrom": "F-16A Sabers"
+  },
+  "out": "tools/mods/imports/cold_war_planes_f_16a_15_52nd_static.gltf",
+  "flyable": {
+    "outPrefix": "tools/mods/imports/cold_war_planes_f_16a_15_52nd"
+  },
+  "includeMaterials": [
+    "F-16A Sabers"
+  ],
+  "dedupeParts": true,
+  "rescueGlassUnderRoot": true,
+  "rescueMaterialsUnderRoot": true
+}

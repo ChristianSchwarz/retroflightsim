@@ -1,0 +1,138 @@
+{
+  "id": "cold_war_planes_mirage_5ba_2nd",
+  "name": "Mirage 5BA",
+  "displayName": "Mirage 5BA",
+  "canonicalName": "Mirage 5BA 2nd",
+  "category": "Fighter",
+  "description": "The Dassault Mirage 5 is a French-built supersonic fighter-bomber aircraft developed in the 1960s. The Mirage 5BA is an export variant for the belgiums. 2nd squadron livery.",
+  "tags": [],
+  "sourceMod": "Cold War Planes",
+  "sourceModId": null,
+  "sourceMaterial": "Mirage 5BA Mat",
+  "importMeta": {
+    "confidence": 0.333,
+    "discoveredFrom": "Mirage 5BA Mat"
+  },
+  "body": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_body.gltf",
+  "shadow": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_shadow.gltf",
+  "gear": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_gear.gltf",
+  "static": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_static.gltf",
+  "surfaces": [
+    {
+      "role": "elevatorLeft",
+      "path": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_surf_elevatorLeft.gltf",
+      "pivot": [
+        0.9305,
+        -0.4808,
+        -3.7006
+      ],
+      "axis": [
+        1.0,
+        -0.0,
+        0.0
+      ],
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    },
+    {
+      "role": "elevatorRight",
+      "path": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_surf_elevatorRight.gltf",
+      "pivot": [
+        -0.9305,
+        -0.4808,
+        -3.7006
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        -0.0
+      ],
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    },
+    {
+      "role": "aileronLeft",
+      "path": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_surf_aileronLeft.gltf",
+      "pivot": [
+        2.452,
+        -0.4775,
+        -3.7041
+      ],
+      "axis": [
+        1.0,
+        -0.0,
+        -0.0
+      ],
+      "control": "roll",
+      "sign": 1,
+      "rangeRad": 0.4
+    },
+    {
+      "role": "aileronRight",
+      "path": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_surf_aileronRight.gltf",
+      "pivot": [
+        -2.452,
+        -0.4775,
+        -3.7041
+      ],
+      "axis": [
+        1.0,
+        -0.0,
+        -0.0
+      ],
+      "control": "roll",
+      "sign": -1,
+      "rangeRad": 0.4
+    },
+    {
+      "role": "rudder",
+      "path": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_surf_rudder.gltf",
+      "pivot": [
+        0.0,
+        1.2215,
+        -5.6717
+      ],
+      "axis": [
+        -0.0,
+        0.8118,
+        -0.5839
+      ],
+      "control": "yaw",
+      "sign": 1,
+      "rangeRad": 0.45
+    }
+  ],
+  "fx": {
+    "nozzles": [
+      [
+        0.0,
+        -0.0759,
+        -6.3358
+      ]
+    ],
+    "nozzleRadius": 0.4381,
+    "wingtips": [
+      [
+        3.6918,
+        -0.4349,
+        -3.7069
+      ],
+      [
+        -3.6918,
+        -0.4349,
+        -3.7069
+      ]
+    ]
+  },
+  "cockpitOffset": [
+    0.0,
+    1.0,
+    4.0
+  ],
+  "spawn": {},
+  "groundOffsetY": -0.0512,
+  "groundRestHeightM": 2.0,
+  "flight": null
+}

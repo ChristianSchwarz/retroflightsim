@@ -1,0 +1,35 @@
+{
+  "bundle": "C:\\Users\\chris\\Projects\\retroflightsim\\tools\\mods\\uploads\\cold_war_planes-1784750793899.zip",
+  "groundDistance": 2,
+  "scale": 1,
+  "swatchMax": 64,
+  "glassColor": "GLASS",
+  "glassAutoAlpha": true,
+  "skipMaterials": [
+    "Collider",
+    "ShadowDepthOffset",
+    "Shadow"
+  ],
+  "id": "cold_war_planes_su_25k_czaf",
+  "name": "Su-25K",
+  "displayName": "Su-25K",
+  "canonicalName": "Su-25K CzAF",
+  "category": "Attacker",
+  "description": "The Sukhoi Su-25 Grach is a subsonic, single-seat, twin-engine jet aircraft developed in the Soviet Union by Sukhoi. It was designed to provide close air support for Soviet Ground Forces. This variant is the export version of the original frogfoot, This variant of the aircraft represents the backbone of the Russian Aerospace Forces' Su-25 fleet, currently the largest in the world.",
+  "sourceMaterial": "Su-25K Mat",
+  "sourceMod": "Cold War Planes",
+  "importMeta": {
+    "confidence": 0.333,
+    "discoveredFrom": "Su-25K Mat"
+  },
+  "out": "tools/mods/imports/cold_war_planes_su_25k_czaf_static.gltf",
+  "flyable": {
+    "outPrefix": "tools/mods/imports/cold_war_planes_su_25k_czaf"
+  },
+  "includeMaterials": [
+    "Su-25K Mat"
+  ],
+  "dedupeParts": true,
+  "rescueGlassUnderRoot": true,
+  "rescueMaterialsUnderRoot": true
+}

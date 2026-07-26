@@ -1,0 +1,35 @@
+{
+  "bundle": "C:\\Users\\chris\\Projects\\retroflightsim\\tools\\mods\\uploads\\cold_war_planes-1784750793899.zip",
+  "groundDistance": 2,
+  "scale": 1,
+  "swatchMax": 64,
+  "glassColor": "GLASS",
+  "glassAutoAlpha": true,
+  "skipMaterials": [
+    "Collider",
+    "ShadowDepthOffset",
+    "Shadow"
+  ],
+  "id": "cold_war_planes_f_16a_10_rnlaf",
+  "name": "F-16A Block 10 RNLAF",
+  "displayName": "F-16A Block 10 RNLAF",
+  "canonicalName": "F-16A 10 RNLAF",
+  "category": "Fighter",
+  "description": "The General Dynamics F-16 Fighting Falcon is an American single-engine supersonic multirole fighter aircraft originally developed by General Dynamics for the United States Air Force (USAF). The Block 10 is one of the earlier versions of the F-16. With the most ugliest skin.",
+  "sourceMaterial": "F-16A RNLAF",
+  "sourceMod": "Cold War Planes",
+  "importMeta": {
+    "confidence": 0.833,
+    "discoveredFrom": "F-16A RNLAF"
+  },
+  "out": "tools/mods/imports/cold_war_planes_f_16a_10_rnlaf_static.gltf",
+  "flyable": {
+    "outPrefix": "tools/mods/imports/cold_war_planes_f_16a_10_rnlaf"
+  },
+  "includeMaterials": [
+    "F-16A RNLAF"
+  ],
+  "dedupeParts": true,
+  "rescueGlassUnderRoot": true,
+  "rescueMaterialsUnderRoot": true
+}

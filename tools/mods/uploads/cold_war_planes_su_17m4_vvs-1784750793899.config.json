@@ -1,0 +1,35 @@
+{
+  "bundle": "C:\\Users\\chris\\Projects\\retroflightsim\\tools\\mods\\uploads\\cold_war_planes-1784750793899.zip",
+  "groundDistance": 2,
+  "scale": 1,
+  "swatchMax": 64,
+  "glassColor": "GLASS",
+  "glassAutoAlpha": true,
+  "skipMaterials": [
+    "Collider",
+    "ShadowDepthOffset",
+    "Shadow"
+  ],
+  "id": "cold_war_planes_su_17m4_vvs",
+  "name": "Su-17M4",
+  "displayName": "Su-17M4",
+  "canonicalName": "Su-17M4 VVS",
+  "category": "Fighter",
+  "description": "The Sukhoi Su-17/20/22 is a variable-sweep wing fighter-bomber developed for the Soviet military. The 17 is the main version. The M4 variant is the last variant of the fitter featuring better avionics and more. With the VVS skin.",
+  "sourceMaterial": "Su-17M4 VVS",
+  "sourceMod": "Cold War Planes",
+  "importMeta": {
+    "confidence": 1,
+    "discoveredFrom": "Su-17M4 VVS"
+  },
+  "out": "tools/mods/imports/cold_war_planes_su_17m4_vvs_static.gltf",
+  "flyable": {
+    "outPrefix": "tools/mods/imports/cold_war_planes_su_17m4_vvs"
+  },
+  "includeMaterials": [
+    "Su-17M4 VVS"
+  ],
+  "dedupeParts": true,
+  "rescueGlassUnderRoot": true,
+  "rescueMaterialsUnderRoot": true
+}

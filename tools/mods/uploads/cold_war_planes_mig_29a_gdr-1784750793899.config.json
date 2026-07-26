@@ -1,0 +1,35 @@
+{
+  "bundle": "C:\\Users\\chris\\Projects\\retroflightsim\\tools\\mods\\uploads\\cold_war_planes-1784750793899.zip",
+  "groundDistance": 2,
+  "scale": 1,
+  "swatchMax": 64,
+  "glassColor": "GLASS",
+  "glassAutoAlpha": true,
+  "skipMaterials": [
+    "Collider",
+    "ShadowDepthOffset",
+    "Shadow"
+  ],
+  "id": "cold_war_planes_mig_29a_gdr",
+  "name": "MiG-29A 9.12A",
+  "displayName": "MiG-29A 9.12A",
+  "canonicalName": "MiG-29A GDR",
+  "category": "Fighter",
+  "description": "The Mikoyan MiG-29 Fulcrum is a twin-engine fighter aircraft designed in the Soviet Union. The Export variant of the 9.12 for Warsaw Pact pact countries which included a downgraded RPLK-29E radar, downgraded OEPrNK-29E optoelectronic and navigation systems and older IFF transponders. This variant also lacked the capability to deliver nuclear weapons. With the GDR skin.",
+  "sourceMaterial": "MiG-29A 9.12A Mat",
+  "sourceMod": "Cold War Planes",
+  "importMeta": {
+    "confidence": 1,
+    "discoveredFrom": "MiG-29A 9.12A Mat"
+  },
+  "out": "tools/mods/imports/cold_war_planes_mig_29a_gdr_static.gltf",
+  "flyable": {
+    "outPrefix": "tools/mods/imports/cold_war_planes_mig_29a_gdr"
+  },
+  "includeMaterials": [
+    "MiG-29A 9.12A Mat"
+  ],
+  "dedupeParts": true,
+  "rescueGlassUnderRoot": true,
+  "rescueMaterialsUnderRoot": true
+}

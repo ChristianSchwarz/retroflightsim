@@ -1,0 +1,254 @@
+{
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0,
+        1
+      ],
+      "name": "0"
+    },
+    {
+      "name": "1",
+      "nodes": []
+    },
+    {
+      "name": "2",
+      "nodes": []
+    },
+    {
+      "name": "3",
+      "nodes": []
+    },
+    {
+      "name": "4",
+      "nodes": []
+    },
+    {
+      "name": "5",
+      "nodes": []
+    }
+  ],
+  "asset": {
+    "version": "2.0",
+    "generator": "https://github.com/mikedh/trimesh"
+  },
+  "accessors": [
+    {
+      "componentType": 5125,
+      "type": "SCALAR",
+      "bufferView": 0,
+      "count": 21,
+      "max": [
+        20
+      ],
+      "min": [
+        0
+      ]
+    },
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 1,
+      "count": 21,
+      "max": [
+        0.8375115990638733,
+        0.07930100709199905,
+        0.3416730761528015
+      ],
+      "min": [
+        -0.8372591137886047,
+        0.021109620109200478,
+        -0.436428427696228
+      ]
+    },
+    {
+      "componentType": 5126,
+      "count": 21,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 2,
+      "max": [
+        0.011569779366254807,
+        0.9967690706253052,
+        -0.0794832855463028
+      ],
+      "min": [
+        0.0032007640693336725,
+        0.9952029585838318,
+        -0.09735571593046188
+      ]
+    },
+    {
+      "componentType": 5125,
+      "type": "SCALAR",
+      "bufferView": 3,
+      "count": 57,
+      "max": [
+        56
+      ],
+      "min": [
+        0
+      ]
+    },
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 4,
+      "count": 57,
+      "max": [
+        0.8375115990638733,
+        0.07930100709199905,
+        0.34243929386138916
+      ],
+      "min": [
+        -0.8374559879302979,
+        -0.05672548711299896,
+        -0.9148663282394409
+      ]
+    },
+    {
+      "componentType": 5126,
+      "count": 57,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 5,
+      "max": [
+        0.9999971389770508,
+        1.0,
+        0.9256835579872131
+      ],
+      "min": [
+        -0.9999971389770508,
+        -0.9983741044998169,
+        -0.09846752136945724
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "0_#a7b1b2",
+      "extras": {},
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2
+          },
+          "indices": 0,
+          "mode": 4,
+          "material": 0
+        }
+      ]
+    },
+    {
+      "name": "1_#b2b4b2",
+      "extras": {},
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 4,
+            "NORMAL": 5
+          },
+          "indices": 3,
+          "mode": 4,
+          "material": 1
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "#a7b1b2",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.6549019607843137,
+          0.6941176470588235,
+          0.6980392156862745,
+          1.0
+        ]
+      }
+    },
+    {
+      "name": "#b2b4b2",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.6980392156862745,
+          0.7058823529411765,
+          0.6980392156862745,
+          1.0
+        ]
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "name": "0_0_#a7b1b2",
+      "mesh": 0
+    },
+    {
+      "name": "0_1_#b2b4b2",
+      "mesh": 1
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "cold_war_planes_f_15c_32nd_surf_aileronRight_buffer_0.bin",
+      "byteLength": 84
+    },
+    {
+      "uri": "cold_war_planes_f_15c_32nd_surf_aileronRight_buffer_1.bin",
+      "byteLength": 252
+    },
+    {
+      "uri": "cold_war_planes_f_15c_32nd_surf_aileronRight_buffer_2.bin",
+      "byteLength": 252
+    },
+    {
+      "uri": "cold_war_planes_f_15c_32nd_surf_aileronRight_buffer_3.bin",
+      "byteLength": 228
+    },
+    {
+      "uri": "cold_war_planes_f_15c_32nd_surf_aileronRight_buffer_4.bin",
+      "byteLength": 684
+    },
+    {
+      "uri": "cold_war_planes_f_15c_32nd_surf_aileronRight_buffer_5.bin",
+      "byteLength": 684
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 84
+    },
+    {
+      "buffer": 1,
+      "byteOffset": 0,
+      "byteLength": 252
+    },
+    {
+      "buffer": 2,
+      "byteOffset": 0,
+      "byteLength": 252
+    },
+    {
+      "buffer": 3,
+      "byteOffset": 0,
+      "byteLength": 228
+    },
+    {
+      "buffer": 4,
+      "byteOffset": 0,
+      "byteLength": 684
+    },
+    {
+      "buffer": 5,
+      "byteOffset": 0,
+      "byteLength": 684
+    }
+  ]
+}

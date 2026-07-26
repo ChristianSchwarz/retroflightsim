@@ -1,0 +1,150 @@
+{
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ],
+      "name": "0"
+    },
+    {
+      "name": "1",
+      "nodes": []
+    },
+    {
+      "name": "2",
+      "nodes": []
+    },
+    {
+      "name": "3",
+      "nodes": []
+    },
+    {
+      "name": "4",
+      "nodes": []
+    },
+    {
+      "name": "5",
+      "nodes": []
+    }
+  ],
+  "asset": {
+    "version": "2.0",
+    "generator": "https://github.com/mikedh/trimesh"
+  },
+  "accessors": [
+    {
+      "componentType": 5125,
+      "type": "SCALAR",
+      "bufferView": 0,
+      "count": 118497,
+      "max": [
+        118496
+      ],
+      "min": [
+        0
+      ]
+    },
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 1,
+      "count": 118497,
+      "max": [
+        7.182427883148193,
+        0.0,
+        8.195015907287598
+      ],
+      "min": [
+        -7.182427883148193,
+        0.0,
+        -7.345050811767578
+      ]
+    },
+    {
+      "componentType": 5126,
+      "count": 118497,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 2,
+      "max": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "min": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "0_VEHICLE_PLANE_GREY",
+      "extras": {},
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2
+          },
+          "indices": 0,
+          "mode": 4,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "VEHICLE_PLANE_GREY",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "name": "0_0_VEHICLE_PLANE_GREY",
+      "mesh": 0
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "cold_war_planes_su_25k_czaf_shadow_buffer_0.bin",
+      "byteLength": 473988
+    },
+    {
+      "uri": "cold_war_planes_su_25k_czaf_shadow_buffer_1.bin",
+      "byteLength": 1421964
+    },
+    {
+      "uri": "cold_war_planes_su_25k_czaf_shadow_buffer_2.bin",
+      "byteLength": 1421964
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 473988
+    },
+    {
+      "buffer": 1,
+      "byteOffset": 0,
+      "byteLength": 1421964
+    },
+    {
+      "buffer": 2,
+      "byteOffset": 0,
+      "byteLength": 1421964
+    }
+  ]
+}

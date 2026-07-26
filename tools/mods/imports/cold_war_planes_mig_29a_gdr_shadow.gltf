@@ -1,0 +1,150 @@
+{
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ],
+      "name": "0"
+    },
+    {
+      "name": "1",
+      "nodes": []
+    },
+    {
+      "name": "2",
+      "nodes": []
+    },
+    {
+      "name": "3",
+      "nodes": []
+    },
+    {
+      "name": "4",
+      "nodes": []
+    },
+    {
+      "name": "5",
+      "nodes": []
+    }
+  ],
+  "asset": {
+    "version": "2.0",
+    "generator": "https://github.com/mikedh/trimesh"
+  },
+  "accessors": [
+    {
+      "componentType": 5125,
+      "type": "SCALAR",
+      "bufferView": 0,
+      "count": 69093,
+      "max": [
+        69092
+      ],
+      "min": [
+        0
+      ]
+    },
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 1,
+      "count": 69093,
+      "max": [
+        5.682465553283691,
+        0.0,
+        9.258835792541504
+      ],
+      "min": [
+        -5.682465553283691,
+        0.0,
+        -7.8175201416015625
+      ]
+    },
+    {
+      "componentType": 5126,
+      "count": 69093,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 2,
+      "max": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "min": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "0_VEHICLE_PLANE_GREY",
+      "extras": {},
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2
+          },
+          "indices": 0,
+          "mode": 4,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "VEHICLE_PLANE_GREY",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "name": "0_0_VEHICLE_PLANE_GREY",
+      "mesh": 0
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "cold_war_planes_mig_29a_gdr_shadow_buffer_0.bin",
+      "byteLength": 276372
+    },
+    {
+      "uri": "cold_war_planes_mig_29a_gdr_shadow_buffer_1.bin",
+      "byteLength": 829116
+    },
+    {
+      "uri": "cold_war_planes_mig_29a_gdr_shadow_buffer_2.bin",
+      "byteLength": 829116
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 276372
+    },
+    {
+      "buffer": 1,
+      "byteOffset": 0,
+      "byteLength": 829116
+    },
+    {
+      "buffer": 2,
+      "byteOffset": 0,
+      "byteLength": 829116
+    }
+  ]
+}

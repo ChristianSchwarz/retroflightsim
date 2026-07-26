@@ -1,0 +1,150 @@
+{
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ],
+      "name": "0"
+    },
+    {
+      "name": "1",
+      "nodes": []
+    },
+    {
+      "name": "2",
+      "nodes": []
+    },
+    {
+      "name": "3",
+      "nodes": []
+    },
+    {
+      "name": "4",
+      "nodes": []
+    },
+    {
+      "name": "5",
+      "nodes": []
+    }
+  ],
+  "asset": {
+    "version": "2.0",
+    "generator": "https://github.com/mikedh/trimesh"
+  },
+  "accessors": [
+    {
+      "componentType": 5125,
+      "type": "SCALAR",
+      "bufferView": 0,
+      "count": 72,
+      "max": [
+        71
+      ],
+      "min": [
+        0
+      ]
+    },
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 1,
+      "count": 72,
+      "max": [
+        0.07740786671638489,
+        0.8481651544570923,
+        0.8739215731620789
+      ],
+      "min": [
+        -0.030867088586091995,
+        -0.8481650352478027,
+        -1.4082865715026855
+      ]
+    },
+    {
+      "componentType": 5126,
+      "count": 72,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 2,
+      "max": [
+        0.9999507069587708,
+        1.0,
+        0.6964530348777771
+      ],
+      "min": [
+        -0.9999507069587708,
+        -1.0,
+        -0.8739320635795593
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "0_#a2a3a2",
+      "extras": {},
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2
+          },
+          "indices": 0,
+          "mode": 4,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "#a2a3a2",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.6352941176470588,
+          0.6392156862745098,
+          0.6352941176470588,
+          1.0
+        ]
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "name": "0_0_#a2a3a2",
+      "mesh": 0
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "cold_war_planes_su_17m4_vvs_surf_rudder_buffer_0.bin",
+      "byteLength": 288
+    },
+    {
+      "uri": "cold_war_planes_su_17m4_vvs_surf_rudder_buffer_1.bin",
+      "byteLength": 864
+    },
+    {
+      "uri": "cold_war_planes_su_17m4_vvs_surf_rudder_buffer_2.bin",
+      "byteLength": 864
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 288
+    },
+    {
+      "buffer": 1,
+      "byteOffset": 0,
+      "byteLength": 864
+    },
+    {
+      "buffer": 2,
+      "byteOffset": 0,
+      "byteLength": 864
+    }
+  ]
+}

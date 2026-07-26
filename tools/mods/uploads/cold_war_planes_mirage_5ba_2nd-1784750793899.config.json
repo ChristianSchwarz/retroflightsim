@@ -1,0 +1,35 @@
+{
+  "bundle": "C:\\Users\\chris\\Projects\\retroflightsim\\tools\\mods\\uploads\\cold_war_planes-1784750793899.zip",
+  "groundDistance": 2,
+  "scale": 1,
+  "swatchMax": 64,
+  "glassColor": "GLASS",
+  "glassAutoAlpha": true,
+  "skipMaterials": [
+    "Collider",
+    "ShadowDepthOffset",
+    "Shadow"
+  ],
+  "id": "cold_war_planes_mirage_5ba_2nd",
+  "name": "Mirage 5BA",
+  "displayName": "Mirage 5BA",
+  "canonicalName": "Mirage 5BA 2nd",
+  "category": "Fighter",
+  "description": "The Dassault Mirage 5 is a French-built supersonic fighter-bomber aircraft developed in the 1960s. The Mirage 5BA is an export variant for the belgiums. 2nd squadron livery.",
+  "sourceMaterial": "Mirage 5BA Mat",
+  "sourceMod": "Cold War Planes",
+  "importMeta": {
+    "confidence": 0.333,
+    "discoveredFrom": "Mirage 5BA Mat"
+  },
+  "out": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd_static.gltf",
+  "flyable": {
+    "outPrefix": "tools/mods/imports/cold_war_planes_mirage_5ba_2nd"
+  },
+  "includeMaterials": [
+    "Mirage 5BA Mat"
+  ],
+  "dedupeParts": true,
+  "rescueGlassUnderRoot": true,
+  "rescueMaterialsUnderRoot": true
+}

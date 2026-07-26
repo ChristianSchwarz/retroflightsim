@@ -1,0 +1,35 @@
+{
+  "bundle": "C:\\Users\\chris\\Projects\\retroflightsim\\tools\\mods\\uploads\\cold_war_planes-1784750793899.zip",
+  "groundDistance": 2,
+  "scale": 1,
+  "swatchMax": 64,
+  "glassColor": "GLASS",
+  "glassAutoAlpha": true,
+  "skipMaterials": [
+    "Collider",
+    "ShadowDepthOffset",
+    "Shadow"
+  ],
+  "id": "cold_war_planes_a_10a_511th",
+  "name": "A-10A Thunderbolt II",
+  "displayName": "A-10A Thunderbolt II",
+  "canonicalName": "A-10A 511th",
+  "category": "Attacker",
+  "description": "The Fairchild Republic A-10 Thunderbolt II is a single-seat, twin-turbofan, straight-wing, subsonic attack aircraft developed by Fairchild Republic for the United States Air Force (USAF). The A version is the earliest version of the A-10.",
+  "sourceMaterial": "A-10A Mat",
+  "sourceMod": "Cold War Planes",
+  "importMeta": {
+    "confidence": 0.333,
+    "discoveredFrom": "A-10A Mat"
+  },
+  "out": "tools/mods/imports/cold_war_planes_a_10a_511th_static.gltf",
+  "flyable": {
+    "outPrefix": "tools/mods/imports/cold_war_planes_a_10a_511th"
+  },
+  "includeMaterials": [
+    "A-10A Mat"
+  ],
+  "dedupeParts": true,
+  "rescueGlassUnderRoot": true,
+  "rescueMaterialsUnderRoot": true
+}

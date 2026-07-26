@@ -1,0 +1,160 @@
+{
+  "id": "cold_war_planes_f_15c_32nd",
+  "name": "F-15C",
+  "displayName": "F-15C",
+  "canonicalName": "F-15C 32nd",
+  "category": "Fighter",
+  "description": "The McDonnell Douglas F-15 Eagle is an American twin-engine, all-weather tactical fighter aircraft designed by McDonnell Douglas. The C is a Improved single-seat all-weather air-superiority fighter version. Although this is an early version that cant carry AMRAAMs.",
+  "tags": [],
+  "sourceMod": "Cold War Planes",
+  "sourceModId": null,
+  "sourceMaterial": "F-15CEMat",
+  "importMeta": {
+    "confidence": 0.333,
+    "discoveredFrom": "F-15CEMat"
+  },
+  "body": "tools/mods/imports/cold_war_planes_f_15c_32nd_body.gltf",
+  "shadow": "tools/mods/imports/cold_war_planes_f_15c_32nd_shadow.gltf",
+  "gear": "tools/mods/imports/cold_war_planes_f_15c_32nd_gear.gltf",
+  "static": "tools/mods/imports/cold_war_planes_f_15c_32nd_static.gltf",
+  "surfaces": [
+    {
+      "role": "elevatorLeft",
+      "path": "tools/mods/imports/cold_war_planes_f_15c_32nd_surf_elevatorLeft.gltf",
+      "pivot": [
+        1.8564,
+        0.1953,
+        -7.4653
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    },
+    {
+      "role": "elevatorRight",
+      "path": "tools/mods/imports/cold_war_planes_f_15c_32nd_surf_elevatorRight.gltf",
+      "pivot": [
+        -1.8564,
+        0.1953,
+        -7.4653
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    },
+    {
+      "role": "aileronLeft",
+      "path": "tools/mods/imports/cold_war_planes_f_15c_32nd_surf_aileronLeft.gltf",
+      "pivot": [
+        4.7698,
+        0.5897,
+        -4.3643
+      ],
+      "axis": [
+        0.9256,
+        -0.0155,
+        -0.3781
+      ],
+      "control": "roll",
+      "sign": 1,
+      "rangeRad": 0.4
+    },
+    {
+      "role": "aileronRight",
+      "path": "tools/mods/imports/cold_war_planes_f_15c_32nd_surf_aileronRight.gltf",
+      "pivot": [
+        -4.7698,
+        0.5897,
+        -4.3643
+      ],
+      "axis": [
+        0.9256,
+        0.0155,
+        0.3781
+      ],
+      "control": "roll",
+      "sign": -1,
+      "rangeRad": 0.4
+    },
+    {
+      "role": "flapLeft",
+      "path": "tools/mods/imports/cold_war_planes_f_15c_32nd_surf_flapLeft.gltf",
+      "pivot": [
+        2.9921,
+        0.669,
+        -4.0222
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "control": "flaps",
+      "sign": -1,
+      "rangeRad": 0.5
+    },
+    {
+      "role": "flapRight",
+      "path": "tools/mods/imports/cold_war_planes_f_15c_32nd_surf_flapRight.gltf",
+      "pivot": [
+        -2.9921,
+        0.669,
+        -4.0222
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "control": "flaps",
+      "sign": -1,
+      "rangeRad": 0.5
+    }
+  ],
+  "fx": {
+    "nozzles": [
+      [
+        -0.6698,
+        0.3172,
+        -7.8063
+      ],
+      [
+        0.6698,
+        0.3172,
+        -7.8063
+      ]
+    ],
+    "nozzleRadius": 0.4522,
+    "wingtips": [
+      [
+        6.5282,
+        0.5471,
+        -4.0002
+      ],
+      [
+        -6.5282,
+        0.5471,
+        -4.0002
+      ]
+    ]
+  },
+  "cockpitOffset": [
+    0.0,
+    1.0,
+    4.0
+  ],
+  "spawn": {},
+  "groundOffsetY": 0.1535,
+  "groundRestHeightM": 2.0,
+  "flight": null
+}
