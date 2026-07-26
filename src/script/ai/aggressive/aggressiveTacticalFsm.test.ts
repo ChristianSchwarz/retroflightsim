@@ -106,3 +106,54 @@ describe('AggressiveTacticalFSM maneuvers', () => {
         assert.equal(command.useAirbrakes, false);
     });
 });
+
+/**
+ * Regression tests for a "rolls stupid left/right" bug: SCISSORS_COUNTER and
+ * POST_MERGE_REVERSAL pick a binary left/right cut side from the sign of a
+ * dot product that sits near zero mid-fight. Without hysteresis that sign
+ * (and therefore the commanded direction) flipped almost every frame.
+ */
+describe('AggressiveTacticalFSM side-selection stability (no left/right chatter)', () => {
+    it('keeps SCISSORS_COUNTER committed to one side despite tiny geometry noise, but can still flip on a real cross-over', () => {
+        const fsm = new AggressiveTacticalFSM({ gunRange: 900 });
+        const self = snap({ pos: [0, 2000, 800], vel: [0, 0, 180] });
+
+        const straight = snap({ pos: [0, 2000, 0], vel: [0, 0, 200] });
+        const c1 = fsm.update(self, straight, 1 / 60);
+        assert.equal(c1.stateName, 'COUNTER');
+        const lateral1 = c1.targetDirection.dot(self.right);
+
+        // Tiny lateral noise in the bandit's heading (dot product barely
+        // crosses zero) must NOT flip the cut side.
+        const wobbled = snap({ pos: [0, 2000, 0], vel: [-10, 0, 200] });
+        const c2 = fsm.update(self, wobbled, 1 / 60);
+        assert.equal(c2.stateName, 'COUNTER');
+        const lateral2 = c2.targetDirection.dot(self.right);
+        assert.equal(Math.sign(lateral1), Math.sign(lateral2), 'cut side flipped on tiny noise');
+
+        // A clear, sustained cross-over should still be able to flip the side
+        // (the latch must not get stuck forever).
+        const clearlyOpposite = snap({ pos: [0, 2000, 0], vel: [-60, 0, 200] });
+        const c3 = fsm.update(self, clearlyOpposite, 1 / 60);
+        const lateral3 = c3.targetDirection.dot(self.right);
+        assert.notEqual(Math.sign(lateral1), Math.sign(lateral3), 'cut side never adapted to a real geometry change');
+    });
+
+    it('keeps POST_MERGE_REVERSAL committed to one side despite tiny geometry noise', () => {
+        const fsm = new AggressiveTacticalFSM({ gunRange: 900 });
+        const self = snap({ pos: [0, 2000, 0], vel: [0, 0, 200] });
+
+        const headOn = snap({ pos: [0, 2000, 1200], vel: [0, 0, -200] });
+        const geom = computeTacticalGeometry(self, headOn);
+        assert.ok(geom.range < 1500 && geom.closureRate > 0, `range=${geom.range} closure=${geom.closureRate}`);
+        const c1 = fsm.update(self, headOn, 1 / 60);
+        assert.equal(c1.maneuverName, 'POST_MERGE_REVERSAL');
+        const lateral1 = c1.targetDirection.dot(self.right);
+
+        const wobbled = snap({ pos: [0, 2000, 1200], vel: [10, 0, -200] });
+        const c2 = fsm.update(self, wobbled, 1 / 60);
+        assert.equal(c2.maneuverName, 'POST_MERGE_REVERSAL');
+        const lateral2 = c2.targetDirection.dot(self.right);
+        assert.equal(Math.sign(lateral1), Math.sign(lateral2), 'reversal side flipped on tiny noise');
+    });
+});
