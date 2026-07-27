@@ -54,9 +54,11 @@ import json
 import math
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import zipfile
+import zlib
 from collections import defaultdict
 
 import numpy as np
@@ -152,6 +154,453 @@ def euler_matrix(degrees) -> np.ndarray:
     my = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)
     mz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float64)
     return mz @ my @ mx
+
+
+def unity_hash(s: str) -> int:
+    """CRC32 path hash used by Unity animation bindings."""
+    return zlib.crc32(s.encode('utf-8')) & 0xFFFFFFFF
+
+
+def unity_euler_quat(x_deg: float, y_deg: float, z_deg: float) -> np.ndarray:
+    """Quaternion (x,y,z,w) matching Unity Quaternion.Euler(x,y,z)."""
+    # Unity applies Y, then X, then Z (world axes) == intrinsic ZXY.
+    rx, ry, rz = np.radians([x_deg, y_deg, z_deg])
+    cx, sx = np.cos(rx * 0.5), np.sin(rx * 0.5)
+    cy, sy = np.cos(ry * 0.5), np.sin(ry * 0.5)
+    cz, sz = np.cos(rz * 0.5), np.sin(rz * 0.5)
+    # q = qy * qx * qz
+    qx = np.array([sx, 0.0, 0.0, cx])
+    qy = np.array([0.0, sy, 0.0, cy])
+    qz = np.array([0.0, 0.0, sz, cz])
+
+    def qmul(a, b):
+        ax, ay, az, aw = a
+        bx, by, bz, bw = b
+        return np.array([
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ], dtype=np.float64)
+
+    return qmul(qy, qmul(qx, qz))
+
+
+def quat_to_matrix(q: np.ndarray) -> np.ndarray:
+    x, y, z, w = q
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array([
+        [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+        [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+        [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+    ], dtype=np.float64)
+
+
+def matrix_to_trs(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Decompose a 4x4 (no shear) into translation, quaternion (xyzw), scale."""
+    t = mat[:3, 3].copy()
+    sx = float(np.linalg.norm(mat[:3, 0]))
+    sy = float(np.linalg.norm(mat[:3, 1]))
+    sz = float(np.linalg.norm(mat[:3, 2]))
+    # Preserve orientation when a scale axis collapses (m_IsActive hide).
+    if sx < 1e-8:
+        sx = 1e-8
+    if sy < 1e-8:
+        sy = 1e-8
+    if sz < 1e-8:
+        sz = 1e-8
+    r = mat[:3, :3].copy()
+    r[:, 0] /= sx
+    r[:, 1] /= sy
+    r[:, 2] /= sz
+    # Orthonormalise in case of tiny numeric drift.
+    r[:, 0] /= max(np.linalg.norm(r[:, 0]), 1e-12)
+    r[:, 1] = np.cross(r[:, 2], r[:, 0])
+    r[:, 1] /= max(np.linalg.norm(r[:, 1]), 1e-12)
+    r[:, 2] = np.cross(r[:, 0], r[:, 1])
+    r[:, 2] /= max(np.linalg.norm(r[:, 2]), 1e-12)
+    # Rotation matrix -> quaternion (xyzw).
+    tr = float(r[0, 0] + r[1, 1] + r[2, 2])
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (r[2, 1] - r[1, 2]) / s
+        qy = (r[0, 2] - r[2, 0]) / s
+        qz = (r[1, 0] - r[0, 1]) / s
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = math.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2.0
+        qw = (r[2, 1] - r[1, 2]) / s
+        qx = 0.25 * s
+        qy = (r[0, 1] + r[1, 0]) / s
+        qz = (r[0, 2] + r[2, 0]) / s
+    elif r[1, 1] > r[2, 2]:
+        s = math.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2.0
+        qw = (r[0, 2] - r[2, 0]) / s
+        qx = (r[0, 1] + r[1, 0]) / s
+        qy = 0.25 * s
+        qz = (r[1, 2] + r[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2.0
+        qw = (r[1, 0] - r[0, 1]) / s
+        qx = (r[0, 2] + r[2, 0]) / s
+        qy = (r[1, 2] + r[2, 1]) / s
+        qz = 0.25 * s
+    q = np.array([qx, qy, qz, qw], dtype=np.float64)
+    q /= max(np.linalg.norm(q), 1e-12)
+    return t, q, np.array([sx, sy, sz], dtype=np.float64)
+
+
+# Unity generic-binding attribute IDs used by TCA GearUp clips.
+_ATTR_POSITION = 1
+_ATTR_ROTATION = 2
+_ATTR_SCALE = 3
+_ATTR_EULER = 4
+_ATTR_IS_ACTIVE = 2086281974  # CRC of "m_IsActive"
+
+
+def _u32_to_f32(u: int) -> float:
+    return struct.unpack('<f', struct.pack('<I', int(u) & 0xFFFFFFFF))[0]
+
+
+def _decode_streamed_clip(data: list[int], curve_count: int) -> list[dict]:
+    """Decode Unity StreamedClip frames (AssetStudio layout).
+
+    Each key is index + 4 float coeffs; value = coeff[3].
+    """
+    frames: list[dict] = []
+    i = 0
+    n = len(data)
+    while i + 2 <= n:
+        time = _u32_to_f32(data[i])
+        i += 1
+        num = int(data[i])
+        i += 1
+        if num < 0 or num > curve_count + 8 or i + num * 5 > n:
+            break
+        keys = []
+        for _ in range(num):
+            index = int(data[i])
+            value = _u32_to_f32(data[i + 4])
+            keys.append({'index': index, 'value': value})
+            i += 5
+        frames.append({'time': time, 'keys': keys})
+        if not math.isfinite(time) and time > 0:
+            break
+    return frames
+
+
+def _lerp_keyframes(keys: list[tuple[float, float]], t: float) -> float:
+    if not keys:
+        return 0.0
+    if t <= keys[0][0]:
+        return keys[0][1]
+    if t >= keys[-1][0]:
+        return keys[-1][1]
+    for i in range(1, len(keys)):
+        t0, v0 = keys[i - 1]
+        t1, v1 = keys[i]
+        if t <= t1:
+            if t1 <= t0:
+                return v1
+            u = (t - t0) / (t1 - t0)
+            return v0 + (v1 - v0) * u
+    return keys[-1][1]
+
+
+def build_transform_path_index(bundle: 'Bundle') -> tuple[dict, dict, dict]:
+    """Return (t_info, path_hash->[(rel_path, tpid)], tpid->full_path)."""
+    go_names: dict[int, str] = {}
+    for o in bundle.env.objects:
+        if o.type.name != 'GameObject':
+            continue
+        go_names[o.path_id] = o.read().m_Name
+
+    t_info: dict[int, dict] = {}
+    for pid, transform in bundle.transforms.items():
+        go_pid = transform.m_GameObject.path_id
+        father = transform.m_Father.path_id if transform.m_Father else 0
+        t_info[pid] = {
+            'name': go_names.get(go_pid, '?'),
+            'father': father if father in bundle.transforms else 0,
+            'go': go_pid,
+            'transform': transform,
+        }
+
+    def full_path(tpid: int) -> str:
+        parts = []
+        cur = tpid
+        seen: set[int] = set()
+        while cur and cur in t_info and cur not in seen:
+            seen.add(cur)
+            parts.append(t_info[cur]['name'])
+            cur = t_info[cur]['father']
+        return '/'.join(reversed(parts))
+
+    full_paths = {tid: full_path(tid) for tid in t_info}
+    path_index: dict[int, list[tuple[str, int]]] = defaultdict(list)
+    for tid, path in full_paths.items():
+        parts = path.split('/') if path else []
+        for i in range(len(parts)):
+            rel = '/'.join(parts[i:])
+            path_index[unity_hash(rel)].append((rel, tid))
+        path_index[unity_hash(t_info[tid]['name'])].append((t_info[tid]['name'], tid))
+    return t_info, path_index, full_paths
+
+
+def discover_gear_up_clip(bundle: 'Bundle', available_names: set[str] | None = None) -> dict | None:
+    """Find and decode a TCA GearUp AnimationClip from the bundle.
+
+    When several clips exist (multi-plane packs), prefer the one whose animated
+    leaf names overlap most with `available_names` (the meshes being exported).
+    """
+    clip_objs = []
+    for o in bundle.env.objects:
+        if o.type.name != 'AnimationClip':
+            continue
+        name = o.read_typetree().get('m_Name', '') or ''
+        clip_objs.append((name, o))
+    if not clip_objs:
+        return None
+
+    def score_name(name: str) -> int:
+        n = name.lower()
+        if 'gearup' in n:
+            return 2
+        if 'gear' in n:
+            return 1
+        return 0
+
+    clip_objs.sort(key=lambda x: -score_name(x[0]))
+
+    t_info, path_index, _full_paths = build_transform_path_index(bundle)
+
+    def decode_one(clip_obj) -> dict | None:
+        tt = clip_obj.read_typetree()
+        clip = clip_obj.read()
+        muscle = tt.get('m_MuscleClip') or {}
+        duration = float(muscle.get('m_StopTime') or 0.0)
+        if duration <= 1e-6:
+            settings = tt.get('m_AnimationClipSettings') or {}
+            duration = float(settings.get('m_StopTime') or 0.0)
+        clip_data = ((muscle.get('m_Clip') or {}).get('data')) or {}
+        streamed = clip_data.get('m_StreamedClip') or {}
+        data = streamed.get('data') or []
+        curve_count = int(streamed.get('curveCount') or 0)
+        if not data or curve_count <= 0:
+            return None
+
+        frames = _decode_streamed_clip(data, curve_count)
+        finite = [f for f in frames if math.isfinite(f['time']) and f['time'] >= 0.0]
+        if not finite:
+            return None
+        if duration <= 1e-6:
+            duration = max(f['time'] for f in finite)
+
+        deltas = muscle.get('m_ValueArrayDelta') or []
+        curves: dict[int, list[tuple[float, float]]] = {
+            i: [(0.0, float((deltas[i] if i < len(deltas) else {}).get('m_Start', 0.0)))]
+            for i in range(curve_count)
+        }
+        for fr in finite:
+            t = float(fr['time'])
+            if t > duration + 1e-4:
+                continue
+            for k in fr['keys']:
+                idx = int(k['index'])
+                if idx < 0 or idx >= curve_count:
+                    continue
+                val = float(k['value'])
+                series = curves[idx]
+                if series and abs(series[-1][0] - t) < 1e-6:
+                    series[-1] = (t, val)
+                else:
+                    series.append((t, val))
+
+        for idx, series in curves.items():
+            if not series:
+                continue
+            if series[-1][0] < duration - 1e-6:
+                stop = float((deltas[idx] if idx < len(deltas) else {}).get('m_Stop', series[-1][1]))
+                series.append((duration, stop))
+
+        def resolve_path(path_hash: int) -> str | None:
+            hits = path_index.get(path_hash) or []
+            if not hits:
+                return None
+            hits_sorted = sorted(hits, key=lambda h: (-h[0].count('/'), -len(h[0])))
+            return hits_sorted[0][0]
+
+        bindings_raw = list(clip.m_ClipBindingConstant.genericBindings)
+        bindings = []
+        curve_idx = 0
+        animated_paths: set[str] = set()
+        animated_leaves: set[str] = set()
+        for b in bindings_raw:
+            attr = int(b.attribute)
+            if attr in (_ATTR_POSITION, _ATTR_SCALE, _ATTR_EULER):
+                dim = 3
+            elif attr == _ATTR_ROTATION:
+                dim = 4
+            else:
+                dim = 1
+            rel = resolve_path(int(b.path))
+            if rel:
+                animated_paths.add(rel)
+                parts = rel.split('/')
+                animated_leaves.add(parts[-1])
+                for i in range(len(parts)):
+                    animated_paths.add('/'.join(parts[i:]))
+            bindings.append({
+                'path': rel,
+                'path_hash': int(b.path),
+                'attribute': attr,
+                'curve_index': curve_idx,
+                'dim': dim,
+            })
+            curve_idx += dim
+
+        overlap = 0
+        if available_names:
+            overlap = len(animated_leaves & available_names)
+
+        return {
+            'name': tt.get('m_Name', 'GearUp'),
+            'duration': duration,
+            'curves': curves,
+            'bindings': bindings,
+            'animated_paths': animated_paths,
+            'animated_leaves': animated_leaves,
+            'overlap': overlap,
+            't_info': t_info,
+            'path_index': path_index,
+        }
+
+    best = None
+    for name, obj in clip_objs:
+        if score_name(name) == 0 and best is not None:
+            continue
+        decoded = decode_one(obj)
+        if decoded is None:
+            continue
+        if best is None or decoded['overlap'] > best['overlap'] or (
+                decoded['overlap'] == best['overlap']
+                and score_name(decoded['name']) > score_name(best['name'])):
+            best = decoded
+    return best
+
+
+def sample_gear_clip(clip: dict, t: float) -> dict[str, dict]:
+    """Sample local TRS + active overrides keyed by relative binding path."""
+    curves = clip['curves']
+    out: dict[str, dict] = {}
+    for b in clip['bindings']:
+        path = b['path']
+        if not path:
+            continue
+        slot = out.setdefault(path, {})
+        base = b['curve_index']
+        attr = b['attribute']
+        if attr == _ATTR_POSITION:
+            slot['position'] = np.array([
+                _lerp_keyframes(curves[base], t),
+                _lerp_keyframes(curves[base + 1], t),
+                _lerp_keyframes(curves[base + 2], t),
+            ], dtype=np.float64)
+        elif attr == _ATTR_SCALE:
+            slot['scale'] = np.array([
+                _lerp_keyframes(curves[base], t),
+                _lerp_keyframes(curves[base + 1], t),
+                _lerp_keyframes(curves[base + 2], t),
+            ], dtype=np.float64)
+        elif attr == _ATTR_EULER:
+            slot['euler'] = np.array([
+                _lerp_keyframes(curves[base], t),
+                _lerp_keyframes(curves[base + 1], t),
+                _lerp_keyframes(curves[base + 2], t),
+            ], dtype=np.float64)
+        elif attr == _ATTR_ROTATION:
+            slot['rotation'] = np.array([
+                _lerp_keyframes(curves[base], t),
+                _lerp_keyframes(curves[base + 1], t),
+                _lerp_keyframes(curves[base + 2], t),
+                _lerp_keyframes(curves[base + 3], t),
+            ], dtype=np.float64)
+        elif attr == _ATTR_IS_ACTIVE:
+            slot['active'] = _lerp_keyframes(curves[base], t) >= 0.5
+    return out
+
+
+def animated_local_matrix(transform, overrides: dict | None) -> np.ndarray:
+    """Local 4x4 for a Transform, with optional animation overrides."""
+    overrides = overrides or {}
+    if 'position' in overrides:
+        pos = overrides['position']
+    else:
+        pos = vec3(transform.m_LocalPosition)
+    if 'scale' in overrides:
+        scale = overrides['scale']
+    else:
+        scale = vec3(transform.m_LocalScale)
+    if 'euler' in overrides:
+        rot_m = quat_to_matrix(unity_euler_quat(*overrides['euler']))
+    elif 'rotation' in overrides:
+        q = overrides['rotation']
+        n = float(np.linalg.norm(q))
+        rot_m = quat_to_matrix(q / n if n > 1e-12 else np.array([0.0, 0.0, 0.0, 1.0]))
+    else:
+        rot_m = quat_to_matrix(quat(transform.m_LocalRotation))
+    mat = np.eye(4, dtype=np.float64)
+    mat[:3, :3] = rot_m * scale
+    mat[:3, 3] = pos
+    return mat
+
+
+def world_matrix_animated(tpid: int, t_info: dict, sample: dict[str, dict],
+                          full_paths: dict[int, str], cache: dict) -> tuple[np.ndarray, bool]:
+    """World matrix + hierarchy-active flag at a sampled animation pose."""
+    if tpid in cache:
+        return cache[tpid]
+    info = t_info[tpid]
+    # Resolve overrides: bindings use paths relative to the animated root, so
+    # try every suffix of the full path.
+    full = full_paths.get(tpid, info['name'])
+    parts = full.split('/') if full else [info['name']]
+    overrides = None
+    for i in range(len(parts)):
+        rel = '/'.join(parts[i:])
+        if rel in sample:
+            overrides = sample[rel]
+            break
+        if info['name'] in sample:
+            overrides = sample[info['name']]
+    active = True if not overrides or 'active' not in overrides else bool(overrides['active'])
+    local = animated_local_matrix(info['transform'], overrides)
+    parent = info['father']
+    if parent and parent in t_info:
+        pw, p_active = world_matrix_animated(parent, t_info, sample, full_paths, cache)
+        mat = pw @ local
+        active = active and p_active
+    else:
+        mat = local
+    cache[tpid] = (mat, active)
+    return cache[tpid]
+
+
+def gear_clip_sample_times(clip: dict, max_samples: int = 48) -> np.ndarray:
+    """Unique sample times covering every keyframe, capped for file size."""
+    times: set[float] = {0.0, float(clip['duration'])}
+    for series in clip['curves'].values():
+        for t, _ in series:
+            if 0.0 <= t <= clip['duration'] + 1e-6:
+                times.add(float(t))
+    ordered = np.array(sorted(times), dtype=np.float64)
+    if len(ordered) <= max_samples:
+        return ordered
+    # Keep endpoints; thin the middle uniformly by index.
+    idx = np.unique(np.round(np.linspace(0, len(ordered) - 1, max_samples)).astype(int))
+    return ordered[idx]
 
 
 # --------------------------------------------------------------------------- #
@@ -494,6 +943,15 @@ _AUTO_GEAR_PARTS = (
     'GearDoorFront', 'GearDoorL', 'GearDoorR', 'GearNoseDoor',
     'GearLSupport1', 'GearLSupport2', 'GearRSupport1', 'GearRSupport2',
     'GearNoseSupport', 'GearNoseSupporter1', 'GearNoseSupporter2',
+    # Common TCA bay-door / door-empty variants (also discovered via GearUp clip).
+    'GearDoorFront1', 'GearDoorFront2', 'GearDoorFrontL', 'GearDoorFrontR',
+    'GearDoorL1', 'GearDoorL2', 'GearDoorR1', 'GearDoorR2',
+    'GearDoorLE', 'GearDoorRE', 'GearDoorNoseL', 'GearDoorNoseR',
+    'GearNoseDoor1', 'GearNoseDoorL', 'GearNoseDoorR',
+    'GearNoseDoorL1', 'GearNoseDoorL2', 'GearNoseDoorR1', 'GearNoseDoorR2',
+    'DoorEmpty1', 'FuselageDoor1',
+    'WLDoor1', 'WLDoor2', 'WRDoor1', 'WRDoor2',
+    'WingLDoor1', 'WingLDoor2', 'WingRDoor1', 'WingRDoor2',
 )
 
 
@@ -534,7 +992,51 @@ def auto_surface_defs(available: set[str]) -> list[dict]:
 
 
 def auto_gear_names(available: set[str]) -> set[str]:
-    return {p for p in _AUTO_GEAR_PARTS if p in available}
+    names = {p for p in _AUTO_GEAR_PARTS if p in available}
+    for n in available:
+        ln = n.lower()
+        if n in names:
+            continue
+        if 'geardoor' in ln or ('door' in ln and 'gear' in ln):
+            names.add(n)
+        elif n.startswith(('WLDoor', 'WRDoor', 'DoorEmpty', 'WingLDoor', 'WingRDoor',
+                           'BGearDoor', 'BGearNoseDoor')):
+            names.add(n)
+    return names
+
+
+def auto_gear_names_from_clip(available: set[str], clip: dict | None,
+                              processed: list[dict], full_paths: dict[int, str]) -> set[str]:
+    """Gear/door mesh names driven by the GearUp clip (legs + bay doors)."""
+    names = set(auto_gear_names(available))
+    # Cockpit-only props that some GearUp clips also key (not landing gear).
+    _SKIP = {'GearHandle', 'GearLever', 'GearLever1', 'GearLever2'}
+    if not clip:
+        return names - _SKIP
+
+    animated = clip['animated_paths']
+    for p in processed:
+        name = p['name']
+        if name in _SKIP:
+            continue
+        tpid = p.get('tpid')
+        if tpid is None:
+            continue
+        full = full_paths.get(tpid, name)
+        parts = full.split('/')
+        # Include if this mesh or any ancestor is animated by the clip.
+        matched = False
+        for i in range(len(parts)):
+            rel = '/'.join(parts[i:])
+            if rel in animated or parts[i] in animated:
+                matched = True
+                break
+        if matched:
+            # Skip nav/beacon lights that some clips hitch onto.
+            if 'navlight' in name.lower():
+                continue
+            names.add(name)
+    return names - _SKIP
 
 
 # Unity/TCA mods label canopy glass by material and/or part name; alpha is not
@@ -1035,7 +1537,7 @@ def import_mod(cfg: dict) -> int:
                     buckets[str(key)].append(tri_corners[keys == key].reshape(-1, 3))
         return buckets
 
-    def emit(parts, translate, out_path, buffer_prefix) -> list[str]:
+    def emit(parts, translate, out_path, buffer_prefix, animations=None) -> list[str]:
         buckets = build_buckets(parts, np.asarray(translate, dtype=np.float64))
         if not buckets:
             return []
@@ -1059,8 +1561,156 @@ def import_mod(cfg: dict) -> int:
             m.visual = trimesh.visual.TextureVisuals(
                 material=trimesh.visual.material.PBRMaterial(name=key))
             scene.add_geometry(m, node_name=f'0_{idx}_{key}', geom_name=f'{idx}_{key}')
-        _write_gltf(scene, out_path, buffer_prefix)
+        _write_gltf(scene, out_path, buffer_prefix, animations=animations)
         return sorted(buckets)
+
+    def emit_gear_animated(parts, translate, out_path, buffer_prefix, clip) -> tuple[list[str], bool]:
+        """Emit per-part gear meshes with baked GearUp clips (doors close late).
+
+        Rest pose = TCA clip t=0 (gear down). Clips are time-reversed so the sim's
+        F-22 convention holds: playback position 1 = extended, 0 = retracted.
+        """
+        translate = np.asarray(translate, dtype=np.float64)
+        t_info = clip['t_info']
+        _, _, full_paths = build_transform_path_index(bundle)
+        # Reuse clip's t_info paths when available.
+        full_paths = {tid: full_paths.get(tid, t_info[tid]['name']) for tid in t_info}
+
+        sample_times_u = gear_clip_sample_times(clip)
+        duration = float(clip['duration'])
+        # Precompute rest + animated world matrices (Unity space) per part.
+        rest_sample = sample_gear_clip(clip, 0.0)
+        rest_cache: dict = {}
+        rest_world: dict[int, tuple[np.ndarray, bool]] = {}
+        for p in parts:
+            tpid = p.get('tpid')
+            if tpid is None:
+                continue
+            rest_world[tpid] = world_matrix_animated(
+                tpid, t_info, rest_sample, full_paths, rest_cache)
+
+        anim_worlds: list[dict[int, tuple[np.ndarray, bool]]] = []
+        for tu in sample_times_u:
+            cache: dict = {}
+            sample = sample_gear_clip(clip, float(tu))
+            pose = {}
+            for p in parts:
+                tpid = p.get('tpid')
+                if tpid is None:
+                    continue
+                pose[tpid] = world_matrix_animated(
+                    tpid, t_info, sample, full_paths, cache)
+            anim_worlds.append(pose)
+
+        scene = trimesh.Scene()
+        animations = []
+        keys_out: list[str] = []
+        node_i = 0
+
+        def to_gltf_world(wu: np.ndarray) -> np.ndarray:
+            wg = _FLIP_X @ wu @ _FLIP_X
+            # Match mesh path: apply uniform scale on the transformed point, then
+            # ground translate. Encode as S @ wg with translation scaled.
+            out = np.eye(4, dtype=np.float64)
+            out[:3, :3] = wg[:3, :3] * scale
+            out[:3, 3] = wg[:3, 3] * scale
+            if rotation_matrix is not None:
+                r4 = np.eye(4, dtype=np.float64)
+                r4[:3, :3] = rotation_matrix
+                out = r4 @ out
+            out[:3, 3] = out[:3, 3] + translate
+            return out
+
+        for p in parts:
+            tpid = p.get('tpid')
+            # Build per-colour buckets for THIS part only (keep part identity).
+            part_buckets: dict[str, list[np.ndarray]] = defaultdict(list)
+            for si, face_v in enumerate(p['sub_faces']):
+                sub_mat = p['sub_mats'][si]
+                if sub_mat and any(s in sub_mat['name'] for s in skip_materials):
+                    continue
+                pal = palette_array(sub_mat)
+                if not colourable(p['name'], sub_mat, pal):
+                    continue
+                face_t = p['sub_face_t'][si]
+                tri_corners = p['world_v'][face_v] + translate
+                face_keys = face_colors(p['name'], sub_mat, face_t, p['uvs'], pal)
+                for key in np.unique(face_keys):
+                    part_buckets[str(key)].append(tri_corners[face_keys == key].reshape(-1, 3))
+            if not part_buckets:
+                continue
+
+            # Delta matrices over time (F-22 order: t=0 retracted / TCA end).
+            times_gltf = []
+            trs_list = []  # (t, q, s) per sample
+            if tpid is not None and tpid in rest_world:
+                r0_u, _ = rest_world[tpid]
+                r0 = to_gltf_world(r0_u)
+                try:
+                    r0_inv = np.linalg.inv(r0)
+                except np.linalg.LinAlgError:
+                    r0_inv = np.eye(4, dtype=np.float64)
+                for tu, pose in zip(sample_times_u, anim_worlds):
+                    rt_u, active = pose.get(tpid, (r0_u, True))
+                    rt = to_gltf_world(rt_u)
+                    # M maps rest mesh (already at r0) -> animated pose.
+                    m = rt @ r0_inv
+                    if not active:
+                        m = m.copy()
+                        m[:3, :3] *= 1e-4
+                    tvec, quat, scl = matrix_to_trs(m)
+                    # Reverse time: TCA gear-down (tu=0) -> glTF t=duration (extended).
+                    tg = duration - float(tu)
+                    times_gltf.append(tg)
+                    trs_list.append((tvec, quat, scl))
+                # Sort by ascending glTF time.
+                order = sorted(range(len(times_gltf)), key=lambda i: times_gltf[i])
+                times_gltf = [times_gltf[i] for i in order]
+                trs_list = [trs_list[i] for i in order]
+                # Quaternion continuity (avoid flips).
+                for i in range(1, len(trs_list)):
+                    if np.dot(trs_list[i][1], trs_list[i - 1][1]) < 0:
+                        trs_list[i] = (trs_list[i][0], -trs_list[i][1], trs_list[i][2])
+            else:
+                times_gltf = [0.0, duration]
+                trs_list = [
+                    (np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), np.ones(3)),
+                    (np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), np.ones(3)),
+                ]
+
+            safe = ''.join(c if c.isalnum() or c in '-_' else '_' for c in p['name'])
+            for bi, (key, tris) in enumerate(part_buckets.items()):
+                v = np.vstack(tris)
+                f = np.arange(len(v), dtype=np.int64).reshape(-1, 3)
+                mesh = trimesh.Trimesh(vertices=v, faces=f, process=False)
+                nrm = np.asarray(mesh.vertex_normals, dtype=np.float64)
+                bad = ~np.isfinite(nrm).all(axis=1)
+                if bad.any():
+                    nrm = nrm.copy()
+                    nrm[bad] = (0.0, 1.0, 0.0)
+                    mesh.vertex_normals = nrm
+                mesh.visual = trimesh.visual.TextureVisuals(
+                    material=trimesh.visual.material.PBRMaterial(name=key))
+                # Keep the colour token in the node name so _write_gltf can bind
+                # the literal '#rrggbb' / PaletteCategory material (F-22-style
+                # "{name}Action" clips still match via replace('Action','')).
+                node_name = f'0_{safe}_{key}' if len(part_buckets) == 1 else f'0_{safe}_{bi}_{key}'
+                scene.add_geometry(mesh, node_name=node_name, geom_name=f'{node_i}_{key}')
+                animations.append({
+                    'name': f'{node_name}Action',
+                    'node': node_name,
+                    'times': times_gltf,
+                    'translations': [trs[0] for trs in trs_list],
+                    'rotations': [trs[1] for trs in trs_list],
+                    'scales': [trs[2] for trs in trs_list],
+                })
+                keys_out.append(key)
+                node_i += 1
+
+        if not keys_out:
+            return [], False
+        _write_gltf(scene, out_path, buffer_prefix, animations=animations)
+        return sorted(set(keys_out)), True
 
     def emit_shadow(parts, translate, out_path, buffer_prefix) -> bool:
         """Flattened planform silhouette (aircraft-local y=0) as a single grey mesh."""
@@ -1105,16 +1755,23 @@ def import_mod(cfg: dict) -> int:
         return 0
 
     available = {p['name'] for p in processed}
+    gear_clip = discover_gear_up_clip(bundle, available) if flyable else None
+    if gear_clip:
+        print(f'Found gear clip "{gear_clip["name"]}" '
+              f'({gear_clip["duration"]:.2f}s, {len(gear_clip["bindings"])} bindings, '
+              f'overlap={gear_clip.get("overlap", 0)})')
     if not surface_defs and flyable.get('autoSurfaces', True) is not False:
         surface_defs = auto_surface_defs(available)
         if surface_defs:
             print(f'Auto-detected {len(surface_defs)} control surface(s): '
                   + ', '.join(sd['role'] for sd in surface_defs))
     if not gear_names and flyable.get('autoGear', True) is not False:
-        detected_gear = auto_gear_names(available)
+        _, _, full_paths_for_gear = build_transform_path_index(bundle)
+        detected_gear = auto_gear_names_from_clip(
+            available, gear_clip, processed, full_paths_for_gear)
         if detected_gear:
             gear_names = detected_gear
-            print(f'Auto-detected {len(gear_names)} gear part(s)')
+            print(f'Auto-detected {len(gear_names)} gear/door part(s)')
 
     surface_of_part: dict[str, int] = {}
     for si, sd in enumerate(surface_defs):
@@ -1140,12 +1797,22 @@ def import_mod(cfg: dict) -> int:
     print(f'Wrote {body_path} ({len(body_keys)} colours)')
 
     gear_manifest = None
+    gear_animated = False
     if gear_parts:
         gear_path = f'{prefix}_gear.gltf'
-        gear_keys = emit(gear_parts, ground_translate, gear_path, bp(gear_path))
-        if gear_keys:
-            gear_manifest = rel(gear_path)
-            print(f'Wrote {gear_path} ({len(gear_keys)} colours)')
+        if gear_clip:
+            gear_keys, gear_animated = emit_gear_animated(
+                gear_parts, ground_translate, gear_path, bp(gear_path), gear_clip)
+            if gear_keys:
+                gear_manifest = rel(gear_path)
+                print(f'Wrote {gear_path} ({len(gear_keys)} colours, '
+                      f'animated={gear_animated}, doors+legs from {gear_clip["name"]})')
+        if not gear_manifest:
+            gear_keys = emit(gear_parts, ground_translate, gear_path, bp(gear_path))
+            if gear_keys:
+                gear_manifest = rel(gear_path)
+                gear_animated = False
+                print(f'Wrote {gear_path} ({len(gear_keys)} colours, static)')
 
     def unit(v) -> np.ndarray:
         v = np.asarray(v, dtype=np.float64)
@@ -1442,6 +2109,7 @@ def import_mod(cfg: dict) -> int:
         'body': rel(body_path),
         'shadow': shadow_manifest,
         'gear': gear_manifest,
+        'gearAnimated': bool(gear_animated),
         'static': rel(out),
         'surfaces': surfaces_manifest,
         'fx': fx,
@@ -1473,7 +2141,7 @@ def _hex_to_factor(key: str):
     return [1.0, 1.0, 1.0, 1.0]
 
 
-def _write_gltf(scene: trimesh.Scene, out: str, buffer_prefix: str):
+def _write_gltf(scene: trimesh.Scene, out: str, buffer_prefix: str, animations=None):
     export = scene.export(file_type='gltf')
     gltf = json.loads(export['model.gltf'].decode('utf-8'))
 
@@ -1481,7 +2149,19 @@ def _write_gltf(scene: trimesh.Scene, out: str, buffer_prefix: str):
     for node in gltf.get('nodes', []):
         nm = node.get('name', '')
         if node.get('mesh') is not None and nm.startswith('0_'):
-            mesh_key[node['mesh']] = nm.split('_', 2)[2]
+            # Material colour is the trailing '#rrggbb' / PaletteCategory token.
+            parts = nm.split('_')
+            mesh_key[node['mesh']] = parts[-1] if parts[-1].startswith('#') or parts[-1].isupper() else (
+                nm.split('_', 2)[2] if nm.count('_') >= 2 else DEFAULT_MATERIAL
+            )
+            # Prefer explicit colour segment when present in name.
+            for seg in reversed(parts):
+                if seg.startswith('#') and len(seg) == 7:
+                    mesh_key[node['mesh']] = seg
+                    break
+                if seg in (GLASS_CATEGORY, FX_FIRE_MATERIAL, SHADOW_MATERIAL):
+                    mesh_key[node['mesh']] = seg
+                    break
 
     material_index: dict[str, int] = {}
     mats: list[dict] = []
@@ -1500,6 +2180,7 @@ def _write_gltf(scene: trimesh.Scene, out: str, buffer_prefix: str):
     flat_nodes = [{'name': n.get('name', ''), 'mesh': n['mesh']}
                   for n in gltf.get('nodes', []) if n.get('mesh') is not None]
     gltf['nodes'] = flat_nodes
+    node_index = {n['name']: i for i, n in enumerate(flat_nodes)}
 
     # LOD scene 0 holds every mesh node; scenes 1..5 are empty LOD levels.
     gltf['scenes'][0]['name'] = '0'
@@ -1513,10 +2194,83 @@ def _write_gltf(scene: trimesh.Scene, out: str, buffer_prefix: str):
     # Pair each buffer with its own exporter key via the existing uri. Do NOT
     # sort keys lexicographically: trimesh emits gltf_buffer_10.bin etc, which
     # would sort before gltf_buffer_2.bin and scramble buffer contents.
+    buffer_blobs: list[bytes] = []
     for i, buf in enumerate(gltf['buffers']):
-        with open(os.path.join(out_dir, f'{buffer_prefix}{i}.bin'), 'wb') as f:
-            f.write(export[buf['uri']])
+        blob = export[buf['uri']]
+        buffer_blobs.append(blob)
         buf['uri'] = f'{buffer_prefix}{i}.bin'
+
+    # Bake per-node TRS clips (LODHelper expects "{nodeName}Action").
+    if animations:
+        anim_blob = bytearray()
+        accessors = gltf.setdefault('accessors', [])
+        buffer_views = gltf.setdefault('bufferViews', [])
+        gltf_anims = []
+        buf_index = len(buffer_blobs)
+
+        def _append(arr: np.ndarray, type_name: str) -> int:
+            data = np.asarray(arr, dtype=np.float32).reshape(-1)
+            raw = data.tobytes()
+            # Align to 4 bytes.
+            while len(anim_blob) % 4:
+                anim_blob.append(0)
+            offset = len(anim_blob)
+            anim_blob.extend(raw)
+            bv_i = len(buffer_views)
+            buffer_views.append({
+                'buffer': buf_index,
+                'byteOffset': offset,
+                'byteLength': len(raw),
+            })
+            count = int(np.asarray(arr).reshape(-1, {'SCALAR': 1, 'VEC3': 3, 'VEC4': 4}[type_name]).shape[0])
+            shaped = np.asarray(arr, dtype=np.float32).reshape(count, -1)
+            acc = {
+                'bufferView': bv_i,
+                'componentType': 5126,
+                'count': count,
+                'type': type_name,
+                'min': [float(x) for x in shaped.min(axis=0)],
+                'max': [float(x) for x in shaped.max(axis=0)],
+            }
+            accessors.append(acc)
+            return len(accessors) - 1
+
+        for anim in animations:
+            node_i = node_index.get(anim['node'])
+            if node_i is None:
+                continue
+            times = np.asarray(anim['times'], dtype=np.float32)
+            # Ensure strictly increasing times for samplers.
+            if len(times) >= 2:
+                for i in range(1, len(times)):
+                    if times[i] <= times[i - 1]:
+                        times[i] = times[i - 1] + 1e-4
+            t_acc = _append(times, 'SCALAR')
+            channels = []
+            samplers = []
+
+            def _channel(path, values, type_name):
+                o_acc = _append(np.asarray(values, dtype=np.float32), type_name)
+                si = len(samplers)
+                samplers.append({'input': t_acc, 'output': o_acc, 'interpolation': 'LINEAR'})
+                channels.append({'sampler': si, 'target': {'node': node_i, 'path': path}})
+
+            _channel('translation', anim['translations'], 'VEC3')
+            _channel('rotation', anim['rotations'], 'VEC4')
+            _channel('scale', anim['scales'], 'VEC3')
+            gltf_anims.append({'name': anim['name'], 'channels': channels, 'samplers': samplers})
+
+        if gltf_anims:
+            gltf['animations'] = gltf_anims
+            buffer_blobs.append(bytes(anim_blob))
+            gltf.setdefault('buffers', []).append({
+                'byteLength': len(anim_blob),
+                'uri': f'{buffer_prefix}{buf_index}.bin',
+            })
+
+    for i, blob in enumerate(buffer_blobs):
+        with open(os.path.join(out_dir, f'{buffer_prefix}{i}.bin'), 'wb') as f:
+            f.write(blob)
 
     # Defensive guard: glTF is JSON, and browsers reject the non-standard `NaN`
     # /`Infinity` literals that Python's json.dump emits. Scrub any non-finite
