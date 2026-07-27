@@ -291,6 +291,7 @@ export class Game {
     private viewZoom: number = 1;
     /** F2 exterior view: numpad * toggles the camera to track the AI opponent. */
     private exteriorEnemyLock = false;
+    private cockpitPadlock = false;
     private aiChaseHeading = ExteriorViewHeading.BACK;
     private heldOrbitKeys = new Set<string>();
     private _orbitPivot = new THREE.Vector3();
@@ -979,6 +980,9 @@ export class Game {
             if ((this.view === PlayerViewState.TARGET_TO || this.view === PlayerViewState.TARGET_FROM) && !this.player.weaponsTarget) {
                 this.setCockpitFrontView();
             }
+            if (this.cockpitPadlock && (!this.player.weaponsTarget || this.view !== PlayerViewState.COCKPIT_FRONT)) {
+                this.setCockpitPadlock(false);
+            }
             this.updateOrbitFromKeys(delta);
             this.recordTelemetry(delta);
             this.scene.update(delta);
@@ -1017,11 +1021,12 @@ export class Game {
 
         if (this.state === GameState.PLAYER || this.state === GameState.SPAWN_MENU) {
             this.cameraUpdater.update(0);
-            if (this.view !== PlayerViewState.AI_CHASE
-                && (this.exteriorEnemyLock && this.isF2ExteriorView()
-                    || this.viewYaw !== 0 || this.viewPitch !== 0 || this.viewZoom !== 1)
-                || this.view === PlayerViewState.AI_CHASE
-                    && (this.viewYaw !== 0 || this.viewPitch !== 0 || this.viewZoom !== 1)) {
+            if (!this.cockpitPadlock
+                && (this.view !== PlayerViewState.AI_CHASE
+                    && (this.exteriorEnemyLock && this.isF2ExteriorView()
+                        || this.viewYaw !== 0 || this.viewPitch !== 0 || this.viewZoom !== 1)
+                    || this.view === PlayerViewState.AI_CHASE
+                        && (this.viewYaw !== 0 || this.viewPitch !== 0 || this.viewZoom !== 1))) {
                 this.orbitCameraAroundAircraft();
             }
             this.playerCamera.update();
@@ -1223,6 +1228,15 @@ export class Game {
         this.syncExteriorEnemyLockTarget();
     }
 
+    private setCockpitPadlock(enabled: boolean): void {
+        this.cockpitPadlock = enabled && !!this.player.weaponsTarget;
+        if (this.cockpitPadlock) {
+            this.resetOrbit();
+        }
+        (this.cameraUpdaters.get(PlayerViewState.COCKPIT_FRONT) as CockpitFrontCameraUpdater)
+            .setPadlock(this.cockpitPadlock);
+    }
+
     /** Tab: emit debris + hit smoke from the enemy plane for VFX debugging. */
     private debugEmitDebris(): void {
         if (!this.aiOpponent?.enabled) {
@@ -1313,6 +1327,9 @@ export class Game {
                     this.resetOrbit();
                     if (this.view !== PlayerViewState.COCKPIT_FRONT) {
                         this.setCockpitFrontView();
+                    } else if (this.player.weaponsTarget) {
+                        // Second F1 in cockpit toggles padlock on the current target.
+                        this.setCockpitPadlock(!this.cockpitPadlock);
                     }
                     break;
                 }
@@ -1359,6 +1376,11 @@ export class Game {
             } else if (event.code === 'NumpadMultiply' && this.isF2ExteriorView()) {
                 event.preventDefault();
                 this.toggleExteriorEnemyLock();
+            } else if (event.code === 'NumpadMultiply' && this.view === PlayerViewState.COCKPIT_FRONT) {
+                event.preventDefault();
+                if (this.player.weaponsTarget) {
+                    this.setCockpitPadlock(!this.cockpitPadlock);
+                }
             } else if (event.code in NUMPAD_ORBIT_DIR || event.code in NUMPAD_ZOOM_DIR) {
                 event.preventDefault();
                 this.heldOrbitKeys.add(event.code);
@@ -1515,6 +1537,8 @@ export class Game {
         this.view = PlayerViewState.COCKPIT_FRONT;
         this.player.exteriorView = false;
         this.cameraUpdater = this.getCameraUpdater(this.view);
+        // Entering cockpit always starts unlocked; toggle padlock with F1 / Numpad*.
+        this.setCockpitPadlock(false);
         for (let i = 0; i < this.cockpitEntities.length; i++) {
             this.cockpitEntities[i].enabled = true;
         }
@@ -1588,6 +1612,7 @@ export class Game {
         if (view !== PlayerViewState.EXTERIOR_BEHIND && view !== PlayerViewState.EXTERIOR_FRONT) {
             this.clearExteriorEnemyLock();
         }
+        this.setCockpitPadlock(false);
         this.view = view;
         this.player.exteriorView = true;
         this.cameraUpdater = this.getCameraUpdater(this.view);
@@ -1780,7 +1805,8 @@ export class Game {
             combatSpeed: 180,
             gunRange: 900,
             hardDeck: 200,
-            // CLASSIC-only knobs; Shaw uses its own Offensive/Neutral/Defensive matrix.
+            // CLASSIC-only knob; Shaw and Aggressive each run their own tactical
+            // matrix (Offensive/Neutral/Defensive, resp. Attack/Merge/Counter).
             alwaysEngage: model === AiPilotModels.CLASSIC,
             skill: AiSkillLevel.ACE,
             model,

@@ -12,7 +12,11 @@ import { Entity } from "../../entity";
 import { Scene, SceneLayers } from "../../scene";
 import { WeaponsTarget } from '../weaponsTarget';
 import { PlayerEntity } from "../player";
-import { computeGunPipperWorldPoint, GUN_AIM_DEFAULT_RANGE_M } from '../../../weapons/gunPipper';
+import {
+    computeGunPipperWorldPoint,
+    GUN_AIM_DEFAULT_RANGE_M,
+    GUN_MUZZLE_OFFSET,
+} from '../../../weapons/gunPipper';
 import { formatHeading, getOverlayLayout, getOverlayLogicalHeight, getOverlayTickStep, OverlayLayout, toFeet } from './overlayUtils';
 import { DisplayUnits } from './displayUnits';
 
@@ -101,7 +105,6 @@ export class HUDEntity implements Entity {
     private _v = new THREE.Vector3();
     private _w = new THREE.Vector3();
     private _aim = new THREE.Vector3();
-    private _targetVel = new THREE.Vector3();
     private _plane = new THREE.Plane();
 
     readonly tags: string[] = [];
@@ -196,30 +199,40 @@ export class HUDEntity implements Entity {
 
         const halfWidth = targetWidth / 2;
         const halfHeight = targetHeight / 2;
+        // Padlock: camera looks at the target, but the entire HUD stays glued to
+        // the aircraft combiner (boresight). Offset the whole HUD as one block
+        // so a high target leaves it at the bottom of the view.
+        const [hudX, hudY] = this.projectBoresight(halfWidth, halfHeight, camera);
+        const dx = hudX - halfWidth;
+        const dy = hudY - halfHeight;
         const ladderSpread = layoutScale > 1 ? Math.max(1.5, layoutScale / detailScale) : 1;
 
         const geomScale = layoutScale / detailScale;
 
-        this.renderPitchLadder(layout, halfWidth, halfHeight, painter, hudColor, hudSecondaryColor, fontSmall);
+        // Target box stays on the gazed-at target (screen centre while padlocked).
+        this.renderTarget(targetWidth, targetHeight, halfWidth, halfHeight, painter, camera, geomScale);
 
-        const altitudeX = halfWidth + Math.ceil((LADDER_HALF_WIDTH + 6) * ladderSpread);
-        const altitudeY = halfHeight;
+        // Everything below is airframe-fixed and moves with (dx, dy).
+        this.renderPitchLadder(layout, hudX, hudY, painter, hudColor, hudSecondaryColor, fontSmall);
+
+        const altitudeX = hudX + Math.ceil((LADDER_HALF_WIDTH + 6) * ladderSpread);
+        const altitudeY = hudY;
         if (this.actor.hudFocusMode === HUDFocusMode.DISABLED) {
             this.renderAltitude(layout, tickStep, altitudeX, altitudeY, targetWidth, painter, hudColor, font, fontSmall);
         } else {
             this.renderAltitudeFocusMode(altitudeX, altitudeY, painter, hudColor, font);
         }
 
-        const headingX = halfWidth;
-        const headingY = halfHeight - layoutScale * (LADDER_HALF_HEIGHT + 2);
+        const headingX = hudX;
+        const headingY = hudY - layoutScale * (LADDER_HALF_HEIGHT + 2);
         if (this.actor.hudFocusMode !== HUDFocusMode.FULL) {
             this.renderHeading(layout, headingX, headingY, painter, hudColor, font);
         } else {
             this.renderHeadingFocusMode(headingX, headingY, painter, hudColor, font);
         }
 
-        const airSpeedX = halfWidth - Math.floor((LADDER_HALF_WIDTH + 6) * ladderSpread);
-        const airSpeedY = halfHeight;
+        const airSpeedX = hudX - Math.floor((LADDER_HALF_WIDTH + 6) * ladderSpread);
+        const airSpeedY = hudY;
         if (this.actor.hudFocusMode === HUDFocusMode.DISABLED) {
             this.renderAirSpeed(layout, tickStep, airSpeedX, airSpeedY, painter, hudColor, font, fontSmall);
         } else {
@@ -239,18 +252,18 @@ export class HUDEntity implements Entity {
         const stickArm = Math.max(8, Math.round(11 * geomScale));
         const stickGap = Math.round(10 * geomScale);
         const stickLabelMargin = (fontSmall.charWidth + fontSmall.charSpacing) * 4 + 6;
-        const stickCenterX = Math.min(
-            altitudeX + stickLabelMargin + stickGap + stickArm,
-            targetWidth - stickArm - 2,
-        );
-        const stickCenterY = halfHeight;
+        // Keep stick glued to the altitude tape — do not clamp to the screen edge
+        // or the HUD stops moving as one rigid airframe block.
+        const stickCenterX = altitudeX + stickLabelMargin + stickGap + stickArm;
+        const stickCenterY = hudY;
         this.renderStickIndicator(stickCenterX, stickCenterY, stickArm, geomScale, painter, hudColor, hudSecondaryColor, hudLimitColor, fontSmall);
 
-        this.renderTarget(targetWidth, targetHeight, halfWidth, halfHeight, painter, camera, geomScale);
-        this.renderBoresight(halfWidth, halfHeight, painter, geomScale);
-        this.renderGunReticle(halfWidth, halfHeight, painter, geomScale, hudColor, hudWarnColor, font);
-        this.renderGunAimIndicator(targetWidth, targetHeight, halfWidth, halfHeight, painter, camera, geomScale, hudColor);
-        this.renderFlightPathMarker(targetWidth, targetHeight, halfWidth, halfHeight, painter, camera, geomScale);
+        this.renderGunReticle(dx, dy, targetHeight, painter, geomScale, hudColor, hudWarnColor, font);
+        // FPM / gun pipper live on the combiner glass: project in the nose frame, then
+        // apply the same padlock HUD offset as the rest of the symbology.
+        this.renderGunAimIndicator(targetWidth, targetHeight, halfWidth, halfHeight, dx, dy, painter, camera, geomScale, hudColor);
+        this.renderBoresight(hudX, hudY, painter, geomScale, hudColor);
+        this.renderFlightPathMarker(targetWidth, targetHeight, halfWidth, halfHeight, dx, dy, painter, camera, geomScale);
         this.renderStallWarning(layout, airSpeedX, airSpeedY, painter, hudColor, hudWarnColor, font);
 
         if (this.actor.hudFocusMode === HUDFocusMode.DISABLED) {
@@ -258,25 +271,86 @@ export class HUDEntity implements Entity {
             this.renderVerticalVelocityIndicator(layout, tickStep, altitudeX, altitudeY, painter, hudColor, hudWarnColor);
         }
 
-        this.renderAltitudeDebug(targetWidth, layoutScale, painter, hudSecondaryColor, fontSmall);
+        this.renderAltitudeDebug(targetWidth, layoutScale, dx, dy, painter, hudSecondaryColor, fontSmall);
+    }
+
+    /**
+     * Screen position of the aircraft nose / HUD combiner in the current view.
+     * Screen-centre when looking along the nose; shifts with padlock so a high
+     * target leaves the whole HUD at the bottom of the view.
+     */
+    private projectBoresight(halfWidth: number, halfHeight: number, camera: THREE.Camera): [number, number] {
+        camera.updateMatrixWorld();
+        camera.getWorldDirection(this._v);
+        this._plane.setFromNormalAndCoplanarPoint(this._v, camera.position);
+        // Project a point well ahead along the nose for a stable NDC sample.
+        this._w.copy(camera.position)
+            .addScaledVector(this.actor.getDisplayWorldDirection(this._v), 1000);
+        if (this._plane.distanceToPoint(this._w) <= 0) {
+            return [halfWidth, halfHeight];
+        }
+        this._w.project(camera);
+        return [
+            Math.round((this._w.x * halfWidth) + halfWidth),
+            Math.round(-(this._w.y * halfHeight) + halfHeight),
+        ];
+    }
+
+    /**
+     * Project a world point as it appears on the airframe HUD glass: nose-camera
+     * projection, then the padlock HUD offset (dx, dy).
+     */
+    private projectOnHudGlass(
+        worldPoint: THREE.Vector3,
+        camera: THREE.PerspectiveCamera,
+        halfWidth: number,
+        halfHeight: number,
+        dx: number,
+        dy: number,
+    ): { x: number, y: number } | null {
+        const savedQuat = camera.quaternion.clone();
+        const savedUp = camera.up.clone();
+
+        camera.up.copy(this.actor.getDisplayWorldUp(this._v));
+        camera.quaternion.copy(this.actor.getDisplayQuaternion());
+        camera.rotateOnAxis(UP, Math.PI);
+        camera.updateMatrixWorld(true);
+
+        camera.getWorldDirection(this._v);
+        this._plane.setFromNormalAndCoplanarPoint(this._v, camera.position);
+        let result: { x: number, y: number } | null = null;
+        if (this._plane.distanceToPoint(worldPoint) > 0) {
+            this._w.copy(worldPoint).project(camera);
+            result = {
+                x: Math.round((this._w.x * halfWidth) + halfWidth + dx),
+                y: Math.round(-(this._w.y * halfHeight) + halfHeight + dy),
+            };
+        }
+
+        camera.quaternion.copy(savedQuat);
+        camera.up.copy(savedUp);
+        camera.updateMatrixWorld(true);
+        return result;
     }
 
     private renderAltitudeDebug(
         targetWidth: number,
         layoutScale: number,
+        dx: number,
+        dy: number,
         painter: CanvasPainter,
         hudColor: string,
         font: Font,
     ) {
         const margin = Math.max(4, Math.round(4 * layoutScale));
         const lineHeight = font.charHeight + font.charSpacing;
-        const x = targetWidth - margin;
+        const x = targetWidth - margin + dx;
         const altitudeFeet = toFeet(this.altitudeMeters);
 
-        painter.text(font, x, margin, `${this.altitudeMeters.toFixed(1)}M`, hudColor, TextAlignment.RIGHT);
-        painter.text(font, x, margin + lineHeight, `${altitudeFeet.toFixed(0)}FT`, hudColor, TextAlignment.RIGHT);
-        painter.text(font, x, margin + lineHeight * 2, `${this.engineThrustKn.toFixed(1)}KN`, hudColor, TextAlignment.RIGHT);
-        painter.text(font, x, margin + lineHeight * 3, `${this.renderFps.toFixed(0)}FPS`, hudColor, TextAlignment.RIGHT);
+        painter.text(font, x, margin + dy, `${this.altitudeMeters.toFixed(1)}M`, hudColor, TextAlignment.RIGHT);
+        painter.text(font, x, margin + dy + lineHeight, `${altitudeFeet.toFixed(0)}FT`, hudColor, TextAlignment.RIGHT);
+        painter.text(font, x, margin + dy + lineHeight * 2, `${this.engineThrustKn.toFixed(1)}KN`, hudColor, TextAlignment.RIGHT);
+        painter.text(font, x, margin + dy + lineHeight * 3, `${this.renderFps.toFixed(0)}FPS`, hudColor, TextAlignment.RIGHT);
     }
 
     private renderFlightDataIndicators(
@@ -650,40 +724,30 @@ export class HUDEntity implements Entity {
         }
     }
 
-    /** Gun pipper brackets around the boresight plus an ammo/health readout. */
-    private renderGunReticle(halfWidth: number, halfHeight: number, painter: CanvasPainter, geomScale: number, hudColor: string, hudWarnColor: string, font: Font) {
+    /** Gun ammo/hull readout when cannon is armed. */
+    private renderGunReticle(
+        dx: number, dy: number, targetHeight: number,
+        painter: CanvasPainter, geomScale: number, hudColor: string, hudWarnColor: string, font: Font,
+    ) {
         if (!this.hasGun) {
             return;
         }
-        const u = geomScale;
-        const r = Math.round(7 * u);
-        // A square "pipper" bracket around the boresight to frame the gun aim.
-        painter.batch()
-            .hLine(halfWidth - r, halfWidth - r + 3 * u, halfHeight - r)
-            .hLine(halfWidth + r - 3 * u, halfWidth + r, halfHeight - r)
-            .hLine(halfWidth - r, halfWidth - r + 3 * u, halfHeight + r)
-            .hLine(halfWidth + r - 3 * u, halfWidth + r, halfHeight + r)
-            .vLine(halfWidth - r, halfHeight - r, halfHeight - r + 3 * u)
-            .vLine(halfWidth - r, halfHeight + r - 3 * u, halfHeight + r)
-            .vLine(halfWidth + r, halfHeight - r, halfHeight - r + 3 * u)
-            .vLine(halfWidth + r, halfHeight + r - 3 * u, halfHeight + r)
-            .commit();
 
         const lineHeight = font.charHeight + font.charSpacing;
-        const x = Math.max(4, Math.round(4 * geomScale));
-        const y = halfHeight * 2 - lineHeight * 2 - 2;
+        const x = Math.max(4, Math.round(4 * geomScale)) + dx;
+        const y = targetHeight - lineHeight * 2 - 2 + dy;
         const hpPct = Math.round(this.healthFraction * 100);
         painter.text(font, x, y, `GUN ${this.gunAmmo}`, this.gunAmmo > 0 ? hudColor : hudWarnColor, TextAlignment.LEFT);
         painter.text(font, x, y + lineHeight, `HULL ${hpPct}%`, hpPct <= 30 ? hudWarnColor : hudColor, TextAlignment.LEFT);
     }
 
     /**
-     * Lead-computing LCOS gun pipper. With a locked target the diamond overlays
-     * the target box when the gun solution is good; without a lock it shows
-     * bullet impact at {@link GUN_AIM_DEFAULT_RANGE_M}.
+     * Gun pipper: circle where rounds are at the current target range, with a
+     * single line from the HUD boresight to the pipper.
      */
     private renderGunAimIndicator(
         width: number, height: number, halfWidth: number, halfHeight: number,
+        dx: number, dy: number,
         painter: CanvasPainter, camera: THREE.Camera, geomScale: number, hudColor: string,
     ) {
         if (!this.hasGun) {
@@ -694,68 +758,79 @@ export class HUDEntity implements Entity {
         const quat = this.actor.getDisplayQuaternion();
         const vel = this.actor.getDisplayVelocity();
 
-        // Muzzle ≈ aircraft origin; rounds inherit shooter velocity + muzzle along nose.
+        // Same muzzle + velocity model as Gun.tryFire / combat sim.
         this._v.copy(FORWARD).applyQuaternion(quat);
+        this._aim.copy(GUN_MUZZLE_OFFSET).applyQuaternion(quat).add(pos);
 
         let targetPos: THREE.Vector3 | undefined;
-        let targetVel: THREE.Vector3 | undefined;
         if (this.weaponsTarget) {
-            this._aim.copy(this.weaponsTarget.position).add(this.weaponsTarget.localCenter);
-            targetPos = this._aim;
-            if (this.weaponsTarget.readVelocity) {
-                targetVel = this.weaponsTarget.readVelocity(this._targetVel);
-            }
+            // Scratch target into `_w`, then overwrite with pipper point.
+            this._w.copy(this.weaponsTarget.position).add(this.weaponsTarget.localCenter);
+            targetPos = this._w;
         }
 
         computeGunPipperWorldPoint(
-            this._w, pos, this._v, vel, GUN_MUZZLE_VELOCITY_MPS,
-            targetPos, targetVel, GUN_AIM_DEFAULT_RANGE_M,
+            this._w, this._aim, this._v, vel, GUN_MUZZLE_VELOCITY_MPS,
+            targetPos, GUN_AIM_DEFAULT_RANGE_M,
         );
 
-        camera.getWorldDirection(this._v);
-        this._plane.setFromNormalAndCoplanarPoint(this._v, camera.position);
-        if (this._plane.distanceToPoint(this._w) <= 0) {
+        const projected = this.projectOnHudGlass(
+            this._w, camera as THREE.PerspectiveCamera, halfWidth, halfHeight, dx, dy,
+        );
+        if (!projected) {
+            return;
+        }
+        const pipperX = projected.x;
+        const pipperY = projected.y;
+        if (pipperX < 0 || pipperX >= width || pipperY < 0 || pipperY >= height) {
             return;
         }
 
-        this._w.project(camera);
-        const x = Math.round((this._w.x * halfWidth) + halfWidth);
-        const y = Math.round(-(this._w.y * halfHeight) + halfHeight);
-        if (x < 0 || x >= width || y < 0 || y >= height) {
-            return;
-        }
-
-        const u = geomScale;
-        const r = Math.max(2, Math.round(4 * u));
+        const boreX = Math.round(halfWidth + dx);
+        const boreY = Math.round(halfHeight + dy);
         painter.setColor(hudColor);
-        // Diamond pipper + center tick — distinct from boresight and flight-path marker.
         painter.batch()
-            .line(x, y - r, x + r, y)
-            .line(x + r, y, x, y + r)
-            .line(x, y + r, x - r, y)
-            .line(x - r, y, x, y - r)
-            .hLine(x - u, x + u, y)
-            .vLine(x, y - u, y + u)
+            .line(boreX, boreY, pipperX, pipperY)
+            .commit();
+
+        const r = Math.max(3, Math.round(5 * geomScale));
+        painter.circle(pipperX, pipperY, r);
+        painter.batch()
+            .hLine(pipperX - 1, pipperX + 1, pipperY)
+            .vLine(pipperX, pipperY - 1, pipperY + 1)
             .commit();
     }
 
-    private renderBoresight(halfWidth: number, halfHeight: number, painter: CanvasPainter, geomScale: number) {
+    /** HUD boresight cross at the airframe combiner (gun axis / nozzle aim point). */
+    private renderBoresight(hudX: number, hudY: number, painter: CanvasPainter, geomScale: number, hudColor: string) {
+        painter.setColor(hudColor);
         const u = geomScale;
+        const cx = Math.round(hudX);
+        const cy = Math.round(hudY);
+        const gap = Math.max(1, Math.round(u));
+        const arm = Math.max(4, Math.round(5 * u));
         painter.batch()
-            .hLine(halfWidth - 5 * u - 5 * u, halfWidth - 5 * u, halfHeight)
-            .hLine(halfWidth + 5 * u, halfWidth + 5 * u + 5 * u, halfHeight)
-            .vLine(halfWidth, halfHeight - 3 * u - 3 * u, halfHeight - 3 * u)
-            .vLine(halfWidth, halfHeight + 3 * u, halfHeight + 3 * u + 3 * u)
+            .hLine(cx - arm - gap, cx - gap, cy)
+            .hLine(cx + gap, cx + arm + gap, cy)
+            .vLine(cx, cy - arm - gap, cy - gap)
+            .vLine(cx, cy + gap, cy + arm + gap)
             .commit();
     }
 
-    private renderFlightPathMarker(width: number, height: number, halfWidth: number, halfHeight: number, painter: CanvasPainter, camera: THREE.Camera, geomScale: number) {
+    private renderFlightPathMarker(
+        width: number, height: number, halfWidth: number, halfHeight: number,
+        dx: number, dy: number,
+        painter: CanvasPainter, camera: THREE.Camera, geomScale: number,
+    ) {
         const u = geomScale;
-        this._v.copy(camera.position)
-            .add(this.velocityDirection)
-            .project(camera);
-        const x = (this._v.x * halfWidth) + halfWidth;
-        const y = -(this._v.y * halfHeight) + halfHeight;
+        this._aim.copy(camera.position).add(this.velocityDirection);
+        const projected = this.projectOnHudGlass(
+            this._aim, camera as THREE.PerspectiveCamera, halfWidth, halfHeight, dx, dy,
+        );
+        if (!projected) {
+            return;
+        }
+        const { x, y } = projected;
         if (0 <= x && x < width &&
             0 <= y && y < height) {
             painter.batch()
