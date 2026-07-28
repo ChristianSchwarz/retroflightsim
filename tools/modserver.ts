@@ -541,6 +541,7 @@ if (LIVE_RELOAD) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
         res.flushHeaders();
         liveReloadClients.push(res);
         req.on('close', () => {
@@ -561,6 +562,10 @@ if (LIVE_RELOAD) {
         }
 
         const html = fs.readFileSync(indexPath, 'utf8');
+        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+        res.setHeader('Cache-Control', 'no-store');
         if (!html.includes('</body>')) {
             res.type('html').send(html);
             return;
@@ -675,6 +680,10 @@ app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Resp
 app.use(express.static(DIST_DIR, {
     index: LIVE_RELOAD ? false : 'index.html',
     setHeaders(res, filePath) {
+        // Required for SharedArrayBuffer (combat-sim state mirror).
+        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
         if (filePath.endsWith('.js') || filePath.endsWith('.html')) {
             res.setHeader('Cache-Control', 'no-store');
         }
