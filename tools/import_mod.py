@@ -1711,7 +1711,11 @@ def import_mod(cfg: dict) -> int:
                     rt = to_gltf_world(rt_u)
                     # M maps rest mesh (already at r0) -> animated pose.
                     m = rt @ r0_inv
-                    if not active:
+                    # Legs/struts use m_IsActive to disappear when stowed; bay doors
+                    # must stay visible in the closed pose (body usually has no
+                    # closed-door panels of its own in these flat imports).
+                    is_door = 'door' in p['name'].lower()
+                    if not active and not is_door:
                         m = m.copy()
                         m[:3, :3] *= 1e-4
                     tvec, quat, scl = matrix_to_trs(m)
