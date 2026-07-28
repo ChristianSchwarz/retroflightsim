@@ -53,6 +53,7 @@ import atexit
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import sys
@@ -349,11 +350,52 @@ def build_transform_path_index(bundle: 'Bundle') -> tuple[dict, dict, dict]:
     return t_info, path_index, full_paths
 
 
-def discover_gear_up_clip(bundle: 'Bundle', available_names: set[str] | None = None) -> dict | None:
+def _normalize_aircraft_token(s: str) -> str:
+    """Alphanumeric lowercase token for matching clip names to aircraft ids."""
+    return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
+
+
+def _gear_clip_name_affinity(clip_name: str, hints: list[str] | None) -> int:
+    """Longest common prefix between clip stem (sans GearUp) and aircraft hints.
+
+    Multi-plane packs share leaf names like GearDoorL across airframes, so leaf
+    overlap alone often picks the wrong GearUp clip (e.g. MiggerGearUp for an
+    F-16). Clip names usually embed the airframe (F-16CGearUp); F-16A still
+    matches F-16CGearUp via the shared ``f16`` prefix.
+    """
+    if not hints:
+        return 0
+    stem = re.sub(r'gearup$', '', _normalize_aircraft_token(clip_name), flags=re.I)
+    if not stem:
+        return 0
+    best = 0
+    for hint in hints:
+        h = _normalize_aircraft_token(hint)
+        if not h:
+            continue
+        n = 0
+        for a, b in zip(stem, h):
+            if a != b:
+                break
+            n += 1
+        # Also allow hint shorter than stem (``f16c`` vs ``f16c50oadf``).
+        if stem.startswith(h) or h.startswith(stem):
+            n = max(n, min(len(stem), len(h)))
+        best = max(best, n)
+    return best if best >= 3 else 0
+
+
+def discover_gear_up_clip(
+        bundle: 'Bundle',
+        available_names: set[str] | None = None,
+        name_hints: list[str] | None = None,
+        aircraft_roots: set[str] | None = None,
+) -> dict | None:
     """Find and decode a TCA GearUp AnimationClip from the bundle.
 
-    When several clips exist (multi-plane packs), prefer the one whose animated
-    leaf names overlap most with `available_names` (the meshes being exported).
+    When several clips exist (multi-plane packs), prefer (1) clip-name affinity
+    to the aircraft being imported, then (2) animated leaf overlap with the
+    meshes (and their transform ancestors) under that aircraft.
     """
     clip_objs = []
     for o in bundle.env.objects:
@@ -374,7 +416,19 @@ def discover_gear_up_clip(bundle: 'Bundle', available_names: set[str] | None = N
 
     clip_objs.sort(key=lambda x: -score_name(x[0]))
 
-    t_info, path_index, _full_paths = build_transform_path_index(bundle)
+    t_info, path_index, full_paths = build_transform_path_index(bundle)
+
+    # Mesh leaf names miss hinge empties (BGearDoorL). Expand with ancestors of
+    # every available leaf so door-parent bindings count toward overlap.
+    expanded_names = set(available_names or [])
+    for path in full_paths.values():
+        parts = path.split('/') if path else []
+        if not parts:
+            continue
+        if aircraft_roots and parts[0] not in aircraft_roots:
+            continue
+        if parts[-1] in (available_names or ()):
+            expanded_names.update(parts)
 
     def decode_one(clip_obj) -> dict | None:
         tt = clip_obj.read_typetree()
@@ -482,6 +536,10 @@ def discover_gear_up_clip(bundle: 'Bundle', available_names: set[str] | None = N
             hits = path_index.get(path_hash) or []
             if not hits:
                 return None
+            if aircraft_roots:
+                preferred = [h for h in hits if h[0].split('/')[0] in aircraft_roots]
+                if preferred:
+                    hits = preferred
             hits_sorted = sorted(hits, key=lambda h: (-h[0].count('/'), -len(h[0])))
             return hits_sorted[0][0]
 
@@ -515,8 +573,8 @@ def discover_gear_up_clip(bundle: 'Bundle', available_names: set[str] | None = N
             curve_idx += dim
 
         overlap = 0
-        if available_names:
-            overlap = len(animated_leaves & available_names)
+        if expanded_names:
+            overlap = len(animated_leaves & expanded_names)
 
         return {
             'name': tt.get('m_Name', 'GearUp'),
@@ -526,6 +584,8 @@ def discover_gear_up_clip(bundle: 'Bundle', available_names: set[str] | None = N
             'animated_paths': animated_paths,
             'animated_leaves': animated_leaves,
             'overlap': overlap,
+            'name_affinity': _gear_clip_name_affinity(
+                tt.get('m_Name', 'GearUp'), name_hints),
             't_info': t_info,
             'path_index': path_index,
         }
@@ -537,9 +597,21 @@ def discover_gear_up_clip(bundle: 'Bundle', available_names: set[str] | None = N
         decoded = decode_one(obj)
         if decoded is None:
             continue
-        if best is None or decoded['overlap'] > best['overlap'] or (
-                decoded['overlap'] == best['overlap']
-                and score_name(decoded['name']) > score_name(best['name'])):
+        if best is None:
+            best = decoded
+            continue
+        # Name affinity beats raw leaf overlap in multi-plane packs.
+        key = (
+            decoded.get('name_affinity', 0),
+            decoded['overlap'],
+            score_name(decoded['name']),
+        )
+        best_key = (
+            best.get('name_affinity', 0),
+            best['overlap'],
+            score_name(best['name']),
+        )
+        if key > best_key:
             best = decoded
     return best
 
@@ -644,19 +716,21 @@ def world_matrix_animated(tpid: int, t_info: dict, sample: dict[str, dict],
     return cache[tpid]
 
 
-def gear_clip_sample_times(clip: dict, max_samples: int = 48) -> np.ndarray:
-    """Unique sample times covering every keyframe, capped for file size."""
-    times: set[float] = {0.0, float(clip['duration'])}
-    for series in clip['curves'].values():
-        for t, _ in series:
-            if 0.0 <= t <= clip['duration'] + 1e-6:
-                times.add(float(t))
-    ordered = np.array(sorted(times), dtype=np.float64)
-    if len(ordered) <= max_samples:
-        return ordered
-    # Keep endpoints; thin the middle uniformly by index.
-    idx = np.unique(np.round(np.linspace(0, len(ordered) - 1, max_samples)).astype(int))
-    return ordered[idx]
+def gear_clip_sample_times(clip: dict, max_samples: int = 96) -> np.ndarray:
+    """Uniform sample times across the clip for stable TRS baking.
+
+    glTF LINEAR interpolates translation/rotation/scale independently. Sampling
+    only at sparse Unity key times makes hinged doors leave their arc (looks
+    like the door rotates on the wrong axis). A dense uniform grid keeps the
+    baked world deltas close to rigid hinge motion.
+    """
+    duration = float(clip['duration'])
+    if duration <= 1e-8:
+        return np.array([0.0], dtype=np.float64)
+    # Prefer ~30 Hz; clamp to max_samples for long clips.
+    n = int(math.ceil(duration * 30.0)) + 1
+    n = max(2, min(n, max_samples))
+    return np.linspace(0.0, duration, n, dtype=np.float64)
 
 
 # --------------------------------------------------------------------------- #
@@ -1731,6 +1805,11 @@ def import_mod(cfg: dict) -> int:
                 for i in range(1, len(trs_list)):
                     if np.dot(trs_list[i][1], trs_list[i - 1][1]) < 0:
                         trs_list[i] = (trs_list[i][0], -trs_list[i][1], trs_list[i][2])
+                # Renormalise after continuity fix.
+                trs_list = [
+                    (tvec, (q / max(np.linalg.norm(q), 1e-12)), scl)
+                    for tvec, q, scl in trs_list
+                ]
             else:
                 times_gltf = [0.0, duration]
                 trs_list = [
@@ -1815,11 +1894,35 @@ def import_mod(cfg: dict) -> int:
         return 0
 
     available = {p['name'] for p in processed}
-    gear_clip = discover_gear_up_clip(bundle, available) if flyable else None
+    _, _, full_paths_for_roots = build_transform_path_index(bundle)
+    aircraft_roots: set[str] = set()
+    for p in processed:
+        tpid = p.get('tpid')
+        if not tpid or tpid not in full_paths_for_roots:
+            continue
+        root = full_paths_for_roots[tpid].split('/')[0]
+        if root:
+            aircraft_roots.add(root)
+    name_hints = [
+        h for h in (
+            cfg.get('canonicalName'),
+            cfg.get('displayName'),
+            cfg.get('name'),
+            cfg.get('id'),
+            *sorted(aircraft_roots),
+        ) if h
+    ]
+    gear_clip = discover_gear_up_clip(
+        bundle,
+        available,
+        name_hints=name_hints,
+        aircraft_roots=aircraft_roots or None,
+    ) if flyable else None
     if gear_clip:
         print(f'Found gear clip "{gear_clip["name"]}" '
               f'({gear_clip["duration"]:.2f}s, {len(gear_clip["bindings"])} bindings, '
-              f'overlap={gear_clip.get("overlap", 0)})')
+              f'overlap={gear_clip.get("overlap", 0)}, '
+              f'affinity={gear_clip.get("name_affinity", 0)})')
     if not surface_defs and flyable.get('autoSurfaces', True) is not False:
         surface_defs = auto_surface_defs(available)
         if surface_defs:
