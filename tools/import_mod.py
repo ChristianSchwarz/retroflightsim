@@ -72,7 +72,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GLASS_CATEGORY = 'GLASS'
 DEFAULT_MATERIAL = '#909094'  # neutral grey fallback
 # PaletteCategory used for a generated flyable-aircraft shadow silhouette.
-SHADOW_MATERIAL = 'VEHICLE_PLANE_GREY'
+SHADOW_MATERIAL = 'SCENERY_TREE_SHADOW'
 # PaletteCategory the sim throttle-drives as the afterburner nozzle glow (see
 # PlayerEntity.collectAfterburnerPaneMaterials). Faces tagged with this material
 # name light up with the engine automatically -- no per-aircraft wiring needed.
@@ -1062,8 +1062,18 @@ _AUTO_SURFACE_RULES: list[tuple[tuple[str, ...], str, str, int, float]] = [
     (('FlapR', 'FlapRight'), 'flapRight', 'flaps', -1, 0.5),
     (('SlatsL', 'SlatL', 'SlatLeft'), 'slatLeft', 'slats', 1, 0.35),
     (('SlatsR', 'SlatR', 'SlatRight'), 'slatRight', 'slats', 1, 0.35),
-    (('SpeedBrakeL',), 'speedbrakeLeft', 'flaps', 1, 0.3),
-    (('SpeedBrakeR',), 'speedbrakeRight', 'flaps', 1, 0.3),
+    # TCA workshop naming varies widely (SpeedBrake vs Speedbrake, T/S/LL…).
+    (('SpeedBrakeL', 'SpeedbrakeL', 'AirBrakeL', 'AirbrakeL', 'SpoilerL'),
+     'speedbrakeLeft', 'airbrake', 1, 0.45),
+    (('SpeedBrakeR', 'SpeedbrakeR', 'AirBrakeR', 'AirbrakeR', 'SpoilerR'),
+     'speedbrakeRight', 'airbrake', 1, 0.45),
+    (('SpeedBrakeLL', 'SpeedbrakeLL'), 'speedbrakeLL', 'airbrake', 1, 0.45),
+    (('SpeedBrakeLR', 'SpeedbrakeLR'), 'speedbrakeLR', 'airbrake', 1, 0.45),
+    (('SpeedBrakeTL', 'SpeedbrakeTL'), 'speedbrakeTL', 'airbrake', 1, 0.45),
+    (('SpeedBrakeTR', 'SpeedbrakeTR'), 'speedbrakeTR', 'airbrake', 1, 0.45),
+    (('SpeedBrakeT', 'SpeedbrakeT', 'SpeedBrakeS', 'SpeedbrakeS',
+      'SpeedBrake', 'Speedbrake', 'AirBrake', 'Airbrake', 'Spoiler'),
+     'speedbrake', 'airbrake', 1, 0.55),
 ]
 
 _AUTO_GEAR_PARTS = (
@@ -1083,6 +1093,184 @@ _AUTO_GEAR_PARTS = (
     'WLDoor1', 'WLDoor2', 'WRDoor1', 'WRDoor2',
     'WingLDoor1', 'WingLDoor2', 'WingRDoor1', 'WingRDoor2',
 )
+
+
+def _strip_json_trailing_commas(text: str) -> str:
+    return re.sub(r',(\s*[}\]])', r'\1', text)
+
+
+def _parse_aircraft2_animated_parts(text: str) -> list[dict]:
+    """Best-effort AnimatedParts array from a TCA Aircraft2 JSON file."""
+    cleaned = _strip_json_trailing_commas(text)
+    try:
+        data = json.loads(cleaned)
+        ap = data.get('AnimatedParts') or data.get('Animated Parts') or []
+        if isinstance(ap, list):
+            return [e for e in ap if isinstance(e, dict)]
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r'"AnimatedParts"\s*:\s*(\[.*?\])\s*,\s*\n', text, re.S)
+    if not m:
+        return []
+    try:
+        ap = json.loads(_strip_json_trailing_commas(m.group(1)))
+    except json.JSONDecodeError:
+        return []
+    return [e for e in ap if isinstance(e, dict)] if isinstance(ap, list) else []
+
+
+def load_aircraft2_animated_parts(bundle_path: str, hints: list[str]) -> list[dict]:
+    """Read AnimatedParts for this aircraft from a TCA mod zip's Aircraft2 JSON.
+
+    TCA maps procedural surfaces (including airbrakes) here — e.g.
+    ``AngleByBrake`` on ``Part: BAirbrakeL``. Name heuristics alone miss the
+    workshop naming (SpeedbrakeT / SpeedbrakeLL / …).
+    """
+    if not bundle_path or not str(bundle_path).lower().endswith('.zip'):
+        return []
+    if not os.path.isfile(bundle_path):
+        return []
+    hint_tokens = {_normalize_aircraft_token(h) for h in hints if h}
+    hint_tokens = {t for t in hint_tokens if len(t) >= 3}
+    best: list[dict] | None = None
+    best_score = -1
+    try:
+        with zipfile.ZipFile(bundle_path) as z:
+            for name in z.namelist():
+                norm = name.replace('\\', '/')
+                if '/Aircraft2/' not in norm or not norm.lower().endswith('.json'):
+                    continue
+                if '/campaign/' in norm.lower():
+                    continue
+                try:
+                    text = z.read(name).decode('utf-8', errors='ignore')
+                except Exception:
+                    continue
+                # Score by aircraft Name / DisplayName / filename vs import hints.
+                nm = re.search(r'"Name"\s*:\s*"([^"]+)"', text)
+                dn = re.search(r'"DisplayName"\s*:\s*"([^"]+)"', text)
+                candidates = [
+                    nm.group(1) if nm else '',
+                    dn.group(1) if dn else '',
+                    os.path.splitext(os.path.basename(norm))[0],
+                ]
+                score = 0
+                for c in candidates:
+                    tok = _normalize_aircraft_token(c)
+                    if not tok:
+                        continue
+                    for h in hint_tokens:
+                        n = 0
+                        for a, b in zip(tok, h):
+                            if a != b:
+                                break
+                            n += 1
+                        if tok.startswith(h) or h.startswith(tok):
+                            n = max(n, min(len(tok), len(h)))
+                        score = max(score, n)
+                if score < 3 and hint_tokens:
+                    continue
+                parts = _parse_aircraft2_animated_parts(text)
+                if not parts:
+                    continue
+                if score > best_score:
+                    best_score = score
+                    best = parts
+                    print(f'Aircraft2 AnimatedParts from "{norm}" '
+                          f'(score={score}, n={len(parts)})')
+    except zipfile.BadZipFile:
+        return []
+    return best or []
+
+
+def _animated_part_control(entry: dict) -> str | None:
+    """Map a TCA AnimatedParts entry to a retroflightsim ControlAxis."""
+    if entry.get('AngleByBrake') is not None:
+        return 'airbrake'
+    if entry.get('FlapInfluence') is not None:
+        return 'flaps'
+    if entry.get('SlatInfluence') is not None or entry.get('AngleBySlats') is not None:
+        return 'slats'
+    if entry.get('AngleByPitch') is not None:
+        return 'pitch'
+    if entry.get('AngleByRoll') is not None:
+        return 'roll'
+    if entry.get('AngleByYaw') is not None:
+        return 'yaw'
+    return None
+
+
+def _curve_range_sign(curve) -> tuple[float, int]:
+    """Max |degrees| → (rangeRad, sign) from a TCA AngleBy* keyframe list."""
+    if not isinstance(curve, list) or not curve:
+        return 0.45, 1
+    best_deg = 0.0
+    for key in curve:
+        try:
+            deg = float(key.get('Degrees', 0))
+        except (TypeError, ValueError):
+            continue
+        if abs(deg) >= abs(best_deg):
+            best_deg = deg
+    if abs(best_deg) < 1e-6:
+        return 0.45, 1
+    return abs(math.radians(best_deg)), (1 if best_deg >= 0 else -1)
+
+
+def _mesh_name_for_animated_part(entry: dict, available: set[str]) -> str | None:
+    """Resolve the exported mesh name for an AnimatedParts entry."""
+    name = str(entry.get('Name') or '')
+    part = str(entry.get('Part') or '')
+    for candidate in (name, part):
+        if candidate in available:
+            return candidate
+    if part.startswith('B') and part[1:] in available:
+        return part[1:]
+    if name.startswith('B') and name[1:] in available:
+        return name[1:]
+    return None
+
+
+def surface_defs_from_animated_parts(
+        animated: list[dict], available: set[str]) -> list[dict]:
+    """Build flyable surface entries from TCA Aircraft2 AnimatedParts."""
+    surfaces: list[dict] = []
+    used_parts: set[str] = set()
+    used_roles: set[str] = set()
+    for entry in animated:
+        control = _animated_part_control(entry)
+        if control is None:
+            continue
+        mesh = _mesh_name_for_animated_part(entry, available)
+        if mesh is None or mesh in used_parts:
+            continue
+        hinge = str(entry.get('Part') or '') or None
+        role_base = str(entry.get('Name') or mesh)
+        role = ''.join(c if c.isalnum() or c in '-_' else '_' for c in role_base)
+        role = role[:40] or f'{control}_{len(surfaces)}'
+        if role in used_roles:
+            role = f'{role}_{len(surfaces)}'
+        # Prefer AngleByBrake / AngleBy* curve for range; FlapInfluence falls back.
+        curve = (entry.get('AngleByBrake') or entry.get('AngleByPitch')
+                 or entry.get('AngleByRoll') or entry.get('AngleByYaw')
+                 or entry.get('AngleBySlats'))
+        if curve:
+            range_rad, sign = _curve_range_sign(curve)
+        else:
+            range_rad, sign = (0.5 if control == 'flaps' else 0.45), 1
+        sd: dict = {
+            'role': role,
+            'parts': [mesh],
+            'control': control,
+            'sign': sign,
+            'rangeRad': range_rad,
+        }
+        if hinge:
+            sd['hingePart'] = hinge
+        surfaces.append(sd)
+        used_parts.add(mesh)
+        used_roles.add(role)
+    return surfaces
 
 
 def auto_surface_defs(available: set[str]) -> list[dict]:
@@ -1119,6 +1307,26 @@ def auto_surface_defs(available: set[str]) -> list[dict]:
                 'rangeRad': 0.45,
             })
     return surfaces
+
+
+def merge_surface_defs(primary: list[dict], fallback: list[dict]) -> list[dict]:
+    """Prefer Aircraft2-derived surfaces; fill missing roles/parts from name rules."""
+    out = list(primary)
+    used_parts = {pn for sd in out for pn in sd.get('parts', [])}
+    used_roles = {sd.get('role') for sd in out}
+    for sd in fallback:
+        parts = [p for p in sd.get('parts', []) if p not in used_parts]
+        if not parts:
+            continue
+        role = sd.get('role')
+        if role in used_roles:
+            continue
+        merged = dict(sd)
+        merged['parts'] = parts
+        out.append(merged)
+        used_parts.update(parts)
+        used_roles.add(role)
+    return out
 
 
 def auto_gear_names(available: set[str]) -> set[str]:
@@ -1852,7 +2060,7 @@ def import_mod(cfg: dict) -> int:
         return sorted(set(keys_out)), True
 
     def emit_shadow(parts, translate, out_path, buffer_prefix) -> bool:
-        """Flattened planform silhouette (aircraft-local y=0) as a single grey mesh."""
+        """Flattened planform silhouette (aircraft-local y=0) as a black-dithered shadow mesh."""
         tris = []
         translate = np.asarray(translate, dtype=np.float64)
         for p in parts:
@@ -1924,10 +2132,24 @@ def import_mod(cfg: dict) -> int:
               f'overlap={gear_clip.get("overlap", 0)}, '
               f'affinity={gear_clip.get("name_affinity", 0)})')
     if not surface_defs and flyable.get('autoSurfaces', True) is not False:
-        surface_defs = auto_surface_defs(available)
+        animated_parts = load_aircraft2_animated_parts(
+            bundle_path,
+            [
+                cfg.get('canonicalName'),
+                cfg.get('displayName'),
+                cfg.get('name'),
+                cfg.get('id'),
+                *sorted(aircraft_roots),
+            ],
+        )
+        from_json = surface_defs_from_animated_parts(animated_parts, available)
+        from_names = auto_surface_defs(available)
+        surface_defs = merge_surface_defs(from_json, from_names)
         if surface_defs:
-            print(f'Auto-detected {len(surface_defs)} control surface(s): '
-                  + ', '.join(sd['role'] for sd in surface_defs))
+            brakes = sum(1 for s in surface_defs if s.get('control') == 'airbrake')
+            print(f'Auto-detected {len(surface_defs)} control surface(s)'
+                  + (f' ({brakes} airbrake)' if brakes else '')
+                  + ': ' + ', '.join(sd['role'] for sd in surface_defs))
     if not gear_names and flyable.get('autoGear', True) is not False:
         _, _, full_paths_for_gear = build_transform_path_index(bundle)
         detected_gear = auto_gear_names_from_clip(
