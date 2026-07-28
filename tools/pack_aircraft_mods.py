@@ -44,15 +44,25 @@ def gltf_buffer_uris(gltf_rel: str, gltf_path: Path) -> list[str]:
     return uris
 
 
-def collect_manifest_paths(manifest: dict) -> list[str]:
-    paths = [manifest['body'], manifest['shadow']]
+def collect_manifest_paths(manifest: dict) -> tuple[list[str], set[str]]:
+    """Return (required_or_listed paths, optional paths that may be absent).
+
+    Ramp `static` models are optional: some imports write a manifest before the
+    static glTF is emitted, or the static emit can be empty. Packing must not
+    fail the whole build over a missing static.
+    """
+    paths: list[str] = [manifest['body']]
+    optional: set[str] = set()
+    if manifest.get('shadow'):
+        paths.append(manifest['shadow'])
     if manifest.get('gear'):
         paths.append(manifest['gear'])
     if manifest.get('static'):
         paths.append(manifest['static'])
+        optional.add(pack_relative(manifest['static']))
     for surface in manifest.get('surfaces', []):
         paths.append(surface['path'])
-    return paths
+    return paths, optional
 
 
 def collect_files(manifest_path: Path) -> tuple[set[str], dict, str]:
@@ -62,11 +72,13 @@ def collect_files(manifest_path: Path) -> tuple[set[str], dict, str]:
         manifest = json.load(f)
 
     files: set[str] = set()
-    pending = [pack_relative(p) for p in collect_manifest_paths(manifest)]
+    listed, optional = collect_manifest_paths(manifest)
+    pending = [pack_relative(p) for p in listed]
 
     static_gltf = f'{mod_id}_static.gltf'
     if (base_dir / static_gltf).exists() and static_gltf not in pending:
         pending.append(static_gltf)
+        optional.add(static_gltf)
 
     while pending:
         rel = pending.pop()
@@ -74,6 +86,9 @@ def collect_files(manifest_path: Path) -> tuple[set[str], dict, str]:
             continue
         asset_path = base_dir / rel
         if not asset_path.exists():
+            if rel in optional or rel.endswith('_static.gltf'):
+                print(f'WARNING: missing optional asset for {manifest_path.name}: {rel}; skipping')
+                continue
             raise FileNotFoundError(f'Missing asset for {manifest_path.name}: {rel}')
         files.add(rel)
         if rel.endswith('.gltf'):
@@ -87,17 +102,22 @@ def collect_files(manifest_path: Path) -> tuple[set[str], dict, str]:
 def rewrite_manifest(manifest: dict, mod_id: str, files: set[str]) -> dict:
     out = dict(manifest)
     out['body'] = pack_relative(manifest['body'])
-    out['shadow'] = pack_relative(manifest['shadow'])
-    if manifest.get('gear'):
+    out['shadow'] = pack_relative(manifest['shadow']) if manifest.get('shadow') else None
+    if manifest.get('gear') and pack_relative(manifest['gear']) in files:
         out['gear'] = pack_relative(manifest['gear'])
+    else:
+        out['gear'] = None
     static_rel = f'{mod_id}_static.gltf'
     if static_rel in files:
         out['static'] = static_rel
-    elif manifest.get('static'):
+    elif manifest.get('static') and pack_relative(manifest['static']) in files:
         out['static'] = pack_relative(manifest['static'])
+    else:
+        out['static'] = None
     out['surfaces'] = [
         {**surface, 'path': pack_relative(surface['path'])}
         for surface in manifest.get('surfaces', [])
+        if pack_relative(surface['path']) in files
     ]
     return out
 

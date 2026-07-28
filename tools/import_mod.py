@@ -386,22 +386,47 @@ def discover_gear_up_clip(bundle: 'Bundle', available_names: set[str] | None = N
             duration = float(settings.get('m_StopTime') or 0.0)
         clip_data = ((muscle.get('m_Clip') or {}).get('data')) or {}
         streamed = clip_data.get('m_StreamedClip') or {}
+        dense = clip_data.get('m_DenseClip') or {}
+        constant = clip_data.get('m_ConstantClip') or {}
         data = streamed.get('data') or []
-        curve_count = int(streamed.get('curveCount') or 0)
-        if not data or curve_count <= 0:
+        streamed_count = int(streamed.get('curveCount') or 0)
+        dense_count = int(dense.get('m_CurveCount') or 0)
+        constant_data = list(constant.get('data') or [])
+        constant_count = len(constant_data)
+        # Binding curve indices span streamed, then dense, then constant
+        # (AssetStudio / Unity ClipMuscleConstant layout).
+        total_count = streamed_count + dense_count + constant_count
+        if total_count <= 0:
+            return None
+        if streamed_count > 0 and not data:
             return None
 
-        frames = _decode_streamed_clip(data, curve_count)
-        finite = [f for f in frames if math.isfinite(f['time']) and f['time'] >= 0.0]
-        if not finite:
-            return None
-        if duration <= 1e-6:
+        finite: list[dict] = []
+        if streamed_count > 0:
+            frames = _decode_streamed_clip(data, streamed_count)
+            finite = [f for f in frames if math.isfinite(f['time']) and f['time'] >= 0.0]
+            if not finite and dense_count <= 0 and constant_count <= 0:
+                return None
+        if duration <= 1e-6 and finite:
             duration = max(f['time'] for f in finite)
 
         deltas = muscle.get('m_ValueArrayDelta') or []
+
+        def _delta_start(i: int, fallback: float = 0.0) -> float:
+            return float((deltas[i] if i < len(deltas) else {}).get('m_Start', fallback))
+
+        def _delta_stop(i: int, fallback: float) -> float:
+            return float((deltas[i] if i < len(deltas) else {}).get('m_Stop', fallback))
+
+        def _append_key(series: list[tuple[float, float]], t: float, val: float) -> None:
+            if series and abs(series[-1][0] - t) < 1e-6:
+                series[-1] = (t, val)
+            else:
+                series.append((t, val))
+
         curves: dict[int, list[tuple[float, float]]] = {
-            i: [(0.0, float((deltas[i] if i < len(deltas) else {}).get('m_Start', 0.0)))]
-            for i in range(curve_count)
+            i: [(0.0, _delta_start(i))]
+            for i in range(streamed_count)
         }
         for fr in finite:
             t = float(fr['time'])
@@ -409,21 +434,49 @@ def discover_gear_up_clip(bundle: 'Bundle', available_names: set[str] | None = N
                 continue
             for k in fr['keys']:
                 idx = int(k['index'])
-                if idx < 0 or idx >= curve_count:
+                if idx < 0 or idx >= streamed_count:
                     continue
-                val = float(k['value'])
-                series = curves[idx]
-                if series and abs(series[-1][0] - t) < 1e-6:
-                    series[-1] = (t, val)
-                else:
-                    series.append((t, val))
+                _append_key(curves[idx], t, float(k['value']))
 
-        for idx, series in curves.items():
-            if not series:
-                continue
-            if series[-1][0] < duration - 1e-6:
-                stop = float((deltas[idx] if idx < len(deltas) else {}).get('m_Stop', series[-1][1]))
-                series.append((duration, stop))
+        for idx in range(streamed_count):
+            series = curves[idx]
+            if series and series[-1][0] < duration - 1e-6:
+                series.append((duration, _delta_stop(idx, series[-1][1])))
+
+        # Dense curves: regularly sampled block after streamed indices.
+        sample_rate = float(dense.get('m_SampleRate') or 0.0)
+        begin_time = float(dense.get('m_BeginTime') or 0.0)
+        frame_count = int(dense.get('m_FrameCount') or 0)
+        samples = dense.get('m_SampleArray') or []
+        if dense_count > 0 and frame_count > 0 and sample_rate > 1e-6:
+            for c in range(dense_count):
+                idx = streamed_count + c
+                curves[idx] = [(0.0, _delta_start(idx))]
+            need = frame_count * dense_count
+            if len(samples) >= need:
+                for frame_i in range(frame_count):
+                    t = begin_time + frame_i / sample_rate
+                    if t > duration + 1e-4:
+                        continue
+                    base = frame_i * dense_count
+                    for c in range(dense_count):
+                        idx = streamed_count + c
+                        _append_key(curves[idx], t, float(samples[base + c]))
+            for c in range(dense_count):
+                idx = streamed_count + c
+                series = curves[idx]
+                if series and series[-1][0] < duration - 1e-6:
+                    series.append((duration, _delta_stop(idx, series[-1][1])))
+
+        # Constant curves: single value for the whole clip, after dense.
+        for c, raw in enumerate(constant_data):
+            idx = streamed_count + dense_count + c
+            val = float(raw)
+            start = _delta_start(idx, val)
+            stop = _delta_stop(idx, val)
+            curves[idx] = [(0.0, start)]
+            if duration > 1e-6:
+                curves[idx].append((duration, stop))
 
         def resolve_path(path_hash: int) -> str | None:
             hits = path_index.get(path_hash) or []
@@ -502,6 +555,9 @@ def sample_gear_clip(clip: dict, t: float) -> dict[str, dict]:
         slot = out.setdefault(path, {})
         base = b['curve_index']
         attr = b['attribute']
+        dim = int(b.get('dim') or 1)
+        if any((base + i) not in curves for i in range(dim)):
+            continue
         if attr == _ATTR_POSITION:
             slot['position'] = np.array([
                 _lerp_keyframes(curves[base], t),
@@ -2094,6 +2150,13 @@ def import_mod(cfg: dict) -> int:
             ground_rest_height_m = -min(p[1] for p in derived)
             print(f'Gear contact points: {derived}')
 
+    # Emit the ramp static model before writing the manifest so a crashed or
+    # empty static export cannot leave a dangling static path in the pack list.
+    static_keys = emit(processed, ground_translate, out, buffer_prefix)
+    static_manifest = rel(out) if static_keys else None
+    if static_keys:
+        print(f'Wrote {out} ({len(static_keys)} colours)')
+
     manifest = {
         'id': cfg.get('id', stem),
         'name': cfg.get('displayName', cfg.get('name', stem)),
@@ -2110,7 +2173,7 @@ def import_mod(cfg: dict) -> int:
         'shadow': shadow_manifest,
         'gear': gear_manifest,
         'gearAnimated': bool(gear_animated),
-        'static': rel(out),
+        'static': static_manifest,
         'surfaces': surfaces_manifest,
         'fx': fx,
         'cockpitOffset': flyable.get('cockpitOffset', [0.0, 1.0, 4.0]),
@@ -2123,10 +2186,6 @@ def import_mod(cfg: dict) -> int:
     with open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, indent=2)
     print(f'Wrote {manifest_path}')
-
-    static_keys = emit(processed, ground_translate, out, buffer_prefix)
-    if static_keys:
-        print(f'Wrote {out} ({len(static_keys)} colours)')
 
     print(f'Parts: {len(processed)} (body {len(body_parts)}, '
           f'gear {len(gear_parts)}, surfaces {len(surfaces_manifest)})')
@@ -2141,6 +2200,36 @@ def _hex_to_factor(key: str):
     return [1.0, 1.0, 1.0, 1.0]
 
 
+def _material_key_from_node_name(nm: str) -> str:
+    """Recover the material token embedded in an exported node name.
+
+    Node names are `0_{idx}_{key}` (body/surfaces/shadow) or
+    `0_{part}_{key}` / `0_{part}_{i}_{key}` (animated gear). `key` may be a
+    literal `#rrggbb` or a PaletteCategory that itself contains underscores
+    (e.g. `VEHICLE_PLANE_GREY`, `FX_FIRE`) -- never take only the last `_`
+    segment.
+    """
+    if not nm.startswith('0_'):
+        return DEFAULT_MATERIAL
+    # Literal colour wins when present.
+    for seg in nm.split('_'):
+        if len(seg) == 7 and seg[0] == '#':
+            try:
+                int(seg[1:], 16)
+                return seg
+            except ValueError:
+                pass
+    # Known PaletteCategory names (may contain underscores).
+    for cat in (SHADOW_MATERIAL, FX_FIRE_MATERIAL, GLASS_CATEGORY):
+        if nm == cat or nm.endswith('_' + cat):
+            return cat
+    # Classic `0_{idx}_{key}` / `0_{part}_{key}`: everything after the second '_'.
+    parts = nm.split('_', 2)
+    if len(parts) >= 3 and parts[2]:
+        return parts[2]
+    return DEFAULT_MATERIAL
+
+
 def _write_gltf(scene: trimesh.Scene, out: str, buffer_prefix: str, animations=None):
     export = scene.export(file_type='gltf')
     gltf = json.loads(export['model.gltf'].decode('utf-8'))
@@ -2149,19 +2238,7 @@ def _write_gltf(scene: trimesh.Scene, out: str, buffer_prefix: str, animations=N
     for node in gltf.get('nodes', []):
         nm = node.get('name', '')
         if node.get('mesh') is not None and nm.startswith('0_'):
-            # Material colour is the trailing '#rrggbb' / PaletteCategory token.
-            parts = nm.split('_')
-            mesh_key[node['mesh']] = parts[-1] if parts[-1].startswith('#') or parts[-1].isupper() else (
-                nm.split('_', 2)[2] if nm.count('_') >= 2 else DEFAULT_MATERIAL
-            )
-            # Prefer explicit colour segment when present in name.
-            for seg in reversed(parts):
-                if seg.startswith('#') and len(seg) == 7:
-                    mesh_key[node['mesh']] = seg
-                    break
-                if seg in (GLASS_CATEGORY, FX_FIRE_MATERIAL, SHADOW_MATERIAL):
-                    mesh_key[node['mesh']] = seg
-                    break
+            mesh_key[node['mesh']] = _material_key_from_node_name(nm)
 
     material_index: dict[str, int] = {}
     mats: list[dict] = []
