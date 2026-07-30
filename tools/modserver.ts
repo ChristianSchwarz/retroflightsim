@@ -1,7 +1,8 @@
 // Local dev server for retroflightsim.
 //
 // Serves the built `dist/` folder statically and adds the F10 upload endpoint:
-//   POST /api/import-mod   (multipart form-data, field "mod" = a Unity mod .zip)
+//   POST /api/preview-mod  (scan a mod .zip and list aircraft + liveries)
+//   POST /api/import-mod   (import selected aircraft from a preview token)
 //
 // Multi-plane mod packs are split by Unity livery material: each aircraft becomes
 // its own .aircraft.pack so liveries stay separate in the spawn menu.
@@ -78,6 +79,33 @@ interface PlaneImportPlan {
     spawnOffset?: number;
     spawnRotation?: number;
     dotColors?: [number, number, number];
+}
+
+interface AircraftImportChoice {
+    key: string;
+    canonicalName: string;
+    displayName: string;
+    category?: string;
+    description?: string;
+    liveries: Array<{ material: string; label: string; confidence: number }>;
+    defaultMaterial: string;
+}
+
+interface ImportSelection {
+    key: string;
+    material: string;
+    enabled: boolean;
+}
+
+interface ModPreview {
+    token: string;
+    baseSlug: string;
+    originalName: string;
+    zipPath: string;
+    embedded: Partial<ImportConfig> | null;
+    catalog: ModCatalog | null;
+    discovered: DiscoveredPlane[];
+    choices: AircraftImportChoice[];
 }
 
 interface ImportedAircraft {
@@ -337,28 +365,25 @@ function scoreCatalogMatch(plane: DiscoveredPlane, aircraft: CatalogAircraft): n
     return score;
 }
 
-function buildPlanesFromCatalog(
+function buildAllLiveryPlans(
     discovered: DiscoveredPlane[],
     catalog: ModCatalog | null,
     baseSlug: string,
 ): PlaneImportPlan[] {
     const filtered = discovered.filter(p => !materialLooksLikeNoise(p.material));
     if (!catalog) {
-        return filtered.map((plane) => {
-            const idSlug = slugify(plane.material);
-            return {
-                modId: uniqueModId(`${baseSlug}_${idSlug}`),
-                idSlug,
-                name: plane.name,
-                displayName: plane.name,
-                material: plane.material,
-                sourceMaterial: plane.material,
-                confidence: 0.5,
-            };
-        });
+        return filtered.map((plane) => ({
+            modId: uniqueModId(`${baseSlug}_${slugify(plane.material)}`),
+            idSlug: slugify(plane.material),
+            name: plane.name,
+            displayName: `${plane.name} (${plane.material})`,
+            material: plane.material,
+            sourceMaterial: plane.material,
+            confidence: 0.5,
+        })).sort((a, b) => a.displayName.localeCompare(b.displayName));
     }
 
-    const bestByAircraft = new Map<string, { plane: DiscoveredPlane; score: number; aircraft: CatalogAircraft }>();
+    const plans: PlaneImportPlan[] = [];
     for (const plane of filtered) {
         let best: { score: number; aircraft: CatalogAircraft } | null = null;
         for (const aircraft of catalog.aircraft) {
@@ -367,22 +392,29 @@ function buildPlanesFromCatalog(
                 best = { score, aircraft };
             }
         }
-        if (!best || best.score < 2) continue;
-        const key = normalizeName(best.aircraft.canonicalName);
-        const prev = bestByAircraft.get(key);
-        if (!prev || best.score > prev.score) {
-            bestByAircraft.set(key, { plane, score: best.score, aircraft: best.aircraft });
-        }
-    }
 
-    const plans: PlaneImportPlan[] = [];
-    for (const { plane, score, aircraft } of bestByAircraft.values()) {
+        if (!best || best.score < 2) {
+            plans.push({
+                modId: uniqueModId(`${baseSlug}_${slugify(plane.material)}`),
+                idSlug: slugify(plane.material),
+                name: plane.name,
+                displayName: `${plane.name} (${plane.material})`,
+                material: plane.material,
+                sourceMaterial: plane.material,
+                confidence: Number((Math.min(1, (best?.score ?? 0) / 12)).toFixed(3)),
+            });
+            continue;
+        }
+
+        const { score, aircraft } = best;
         const idSlug = slugify(aircraft.canonicalName);
+        const matSlug = slugify(plane.material);
+        const display = aircraft.displayName || aircraft.canonicalName;
         plans.push({
-            modId: uniqueModId(`${baseSlug}_${idSlug}`),
+            modId: uniqueModId(`${baseSlug}_${idSlug}_${matSlug}`),
             idSlug,
             name: aircraft.canonicalName,
-            displayName: aircraft.displayName,
+            displayName: `${display} (${plane.material})`,
             material: plane.material,
             category: aircraft.category,
             description: aircraft.description,
@@ -393,7 +425,215 @@ function buildPlanesFromCatalog(
             dotColors: aircraft.dotColors,
         });
     }
+    return plans.sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+/** @deprecated Use buildAllLiveryPlans — kept as alias for one-livery-per-type callers. */
+function buildPlanesFromCatalog(
+    discovered: DiscoveredPlane[],
+    catalog: ModCatalog | null,
+    baseSlug: string,
+): PlaneImportPlan[] {
+    return buildAllLiveryPlans(discovered, catalog, baseSlug);
+}
+
+function buildAircraftChoices(
+    discovered: DiscoveredPlane[],
+    catalog: ModCatalog | null,
+): AircraftImportChoice[] {
+    const filtered = discovered.filter(p => !materialLooksLikeNoise(p.material));
+    if (!catalog) {
+        return filtered.map((plane) => ({
+            key: `mat:${slugify(plane.material)}`,
+            canonicalName: plane.name,
+            displayName: plane.name,
+            liveries: [{
+                material: plane.material,
+                label: plane.material,
+                confidence: 0.5,
+            }],
+            defaultMaterial: plane.material,
+        })).sort((a, b) => a.displayName.localeCompare(b.displayName));
+    }
+
+    const byAircraft = new Map<string, {
+        aircraft: CatalogAircraft;
+        liveries: Map<string, { score: number }>;
+    }>();
+
+    for (const plane of filtered) {
+        let best: { score: number; aircraft: CatalogAircraft } | null = null;
+        for (const aircraft of catalog.aircraft) {
+            const score = scoreCatalogMatch(plane, aircraft);
+            if (!best || score > best.score) {
+                best = { score, aircraft };
+            }
+        }
+        if (!best || best.score < 2) {
+            const key = `mat:${slugify(plane.material)}`;
+            byAircraft.set(key, {
+                aircraft: {
+                    canonicalName: plane.name,
+                    displayName: plane.name,
+                },
+                liveries: new Map([[plane.material, { score: best?.score ?? 0 }]]),
+            });
+            continue;
+        }
+        const key = normalizeName(best.aircraft.canonicalName);
+        let entry = byAircraft.get(key);
+        if (!entry) {
+            entry = { aircraft: best.aircraft, liveries: new Map() };
+            byAircraft.set(key, entry);
+        }
+        const prev = entry.liveries.get(plane.material);
+        if (!prev || best.score > prev.score) {
+            entry.liveries.set(plane.material, { score: best.score });
+        }
+    }
+
+    const choices: AircraftImportChoice[] = [];
+    for (const [key, { aircraft, liveries }] of byAircraft) {
+        const sorted = [...liveries.entries()]
+            .sort((a, b) => b[1].score - a[1].score)
+            .map(([material, { score }]) => ({
+                material,
+                label: material,
+                confidence: Number((Math.min(1, score / 12)).toFixed(3)),
+            }));
+        choices.push({
+            key,
+            canonicalName: aircraft.canonicalName,
+            displayName: aircraft.displayName || aircraft.canonicalName,
+            category: aircraft.category,
+            description: aircraft.description,
+            liveries: sorted,
+            defaultMaterial: sorted[0].material,
+        });
+    }
+    return choices.sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+function buildPlanesFromSelections(
+    choices: AircraftImportChoice[],
+    selections: ImportSelection[],
+    catalog: ModCatalog | null,
+    baseSlug: string,
+): PlaneImportPlan[] {
+    const choiceByKey = new Map(choices.map(c => [c.key, c]));
+    const enabled = selections.filter(s => s.enabled);
+    const enabledByCanon = new Map<string, number>();
+    for (const sel of enabled) {
+        const choice = choiceByKey.get(sel.key);
+        if (!choice) continue;
+        const canon = normalizeName(choice.canonicalName);
+        enabledByCanon.set(canon, (enabledByCanon.get(canon) ?? 0) + 1);
+    }
+
+    const plans: PlaneImportPlan[] = [];
+    for (const sel of enabled) {
+        const choice = choiceByKey.get(sel.key);
+        if (!choice) continue;
+        const livery = choice.liveries.find(l => l.material === sel.material);
+        if (!livery) continue;
+
+        const aircraft = catalog?.aircraft.find(
+            a => normalizeName(a.canonicalName) === normalizeName(choice.canonicalName),
+        );
+        const idSlug = slugify(choice.canonicalName);
+        const matSlug = slugify(sel.material);
+        const canon = normalizeName(choice.canonicalName);
+        const variantImport = (enabledByCanon.get(canon) ?? 0) > 1 || choice.liveries.length > 1;
+        const modIdBase = variantImport ? `${baseSlug}_${idSlug}_${matSlug}` : `${baseSlug}_${idSlug}`;
+        const liverySuffix = choice.liveries.length > 1 ? ` (${livery.label})` : '';
+
+        plans.push({
+            modId: uniqueModId(modIdBase),
+            idSlug,
+            name: choice.canonicalName,
+            displayName: `${choice.displayName}${liverySuffix}`,
+            material: sel.material,
+            category: aircraft?.category ?? choice.category,
+            description: aircraft?.description ?? choice.description,
+            sourceMaterial: sel.material,
+            confidence: livery.confidence,
+            spawnOffset: aircraft?.spawnOffset,
+            spawnRotation: aircraft?.spawnRotation,
+            dotColors: aircraft?.dotColors,
+        });
+    }
     return plans;
+}
+
+function previewPathForToken(token: string): string {
+    return path.join(UPLOADS_DIR, `${token}.preview.json`);
+}
+
+function loadPreview(token: string): ModPreview | null {
+    const previewPath = previewPathForToken(token);
+    if (!fs.existsSync(previewPath)) {
+        return null;
+    }
+    try {
+        return JSON.parse(fs.readFileSync(previewPath, 'utf-8')) as ModPreview;
+    } catch {
+        return null;
+    }
+}
+
+function savePreview(preview: ModPreview): void {
+    fs.writeFileSync(previewPathForToken(preview.token), JSON.stringify(preview, null, 2));
+}
+
+async function executeImport(
+    preview: ModPreview,
+    planes: PlaneImportPlan[],
+    log: string[],
+): Promise<ImportedAircraft[]> {
+    if (planes.length === 0) {
+        throw new Error('No aircraft selected for import.');
+    }
+
+    const stamp = preview.token.split('-').pop() ?? String(Date.now());
+    const configs = planes.map((plane) => buildPlaneConfig(
+        preview.zipPath,
+        plane,
+        preview.embedded,
+        preview.catalog,
+    ));
+    const batchPath = path.join(UPLOADS_DIR, `${preview.baseSlug}-${stamp}.batch.json`);
+    await importPlaneConfigsBatch(configs, batchPath, log);
+
+    const modIds = planes.map((plane) => plane.modId);
+    const pack = await runPython([
+        'tools/pack_aircraft_mods.py',
+        '--imports-only',
+        '--only',
+        ...modIds,
+    ]);
+    log.push(`\n$ python tools/pack_aircraft_mods.py\n${pack.stdout}${pack.stderr}`);
+    if (pack.code !== 0) {
+        throw new Error('pack_aircraft_mods.py failed');
+    }
+
+    const imported: ImportedAircraft[] = [];
+    for (const plane of planes) {
+        const manifestPath = path.join(IMPORTS_DIR, `${plane.modId}.aircraft.json`);
+        const packPath = path.join(DIST_DIR, 'assets', `${plane.modId}.aircraft.pack`);
+        if (!fs.existsSync(manifestPath) || !fs.existsSync(packPath)) {
+            continue;
+        }
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as { name?: string };
+        imported.push({
+            id: plane.modId,
+            name: manifest.name || plane.displayName || plane.name,
+            packUrl: `assets/${plane.modId}.aircraft.pack`,
+        });
+    }
+    if (imported.length === 0) {
+        throw new Error('Import produced no flyable aircraft (the mod may not be a supported plane bundle).');
+    }
+    return imported;
 }
 
 interface PythonResult {
@@ -647,14 +887,14 @@ if (LIVE_RELOAD) {
 }
 
 app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, server: 'modserver' });
+    res.json({ ok: true, server: 'modserver', previewMod: true });
 });
 
 app.get('/api/aircraft-packs', (_req: Request, res: Response) => {
     res.json(listAircraftPacks());
 });
 
-app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Response) => {
+app.post('/api/preview-mod', upload.single('mod'), async (req: Request, res: Response) => {
     if (!req.file) {
         return res.status(400).json({ ok: false, error: 'No file uploaded (expected field "mod").' });
     }
@@ -663,91 +903,175 @@ app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Resp
     const baseSlug = slugify(originalName);
 
     fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-    fs.mkdirSync(IMPORTS_DIR, { recursive: true });
     const stamp = Date.now();
-    const zipPath = path.join(UPLOADS_DIR, `${baseSlug}-${stamp}.zip`);
+    const token = `${baseSlug}-${stamp}`;
+    const zipPath = path.join(UPLOADS_DIR, `${token}.zip`);
     fs.writeFileSync(zipPath, req.file.buffer);
 
     const zipFiles = unzipModBuffer(req.file.buffer);
     const embedded = findEmbeddedConfig(zipFiles);
     const catalog = extractModCatalog(zipFiles);
-    const log: string[] = [];
-    const imported: ImportedAircraft[] = [];
 
     try {
-        let planes: PlaneImportPlan[];
-
         if (embedded?.includeMaterials?.length) {
-            const idSlug = slugify(embedded.name ?? baseSlug);
+            const name = embedded.name ?? prettyName(originalName);
+            const choices: AircraftImportChoice[] = [{
+                key: slugify(name),
+                canonicalName: name,
+                displayName: name,
+                liveries: [{
+                    material: embedded.includeMaterials[0],
+                    label: embedded.includeMaterials[0],
+                    confidence: 1,
+                }],
+                defaultMaterial: embedded.includeMaterials[0],
+            }];
+            const preview: ModPreview = {
+                token,
+                baseSlug,
+                originalName,
+                zipPath,
+                embedded,
+                catalog,
+                discovered: [],
+                choices,
+            };
+            savePreview(preview);
+            return res.json({
+                ok: true,
+                token,
+                modName: catalog?.modName ?? prettyName(originalName),
+                liveryCount: 1,
+            });
+        }
+
+        const discovered = await discoverPlanes(zipPath);
+        const choices = buildAircraftChoices(discovered, catalog);
+        if (choices.length === 0) {
+            return res.status(400).json({
+                ok: false,
+                error: 'No flyable aircraft liveries found in this mod.',
+            });
+        }
+
+        const plans = buildAllLiveryPlans(discovered, catalog, baseSlug);
+        const preview: ModPreview = {
+            token,
+            baseSlug,
+            originalName,
+            zipPath,
+            embedded,
+            catalog,
+            discovered,
+            choices,
+        };
+        savePreview(preview);
+
+        return res.json({
+            ok: true,
+            token,
+            modName: catalog?.modName ?? prettyName(originalName),
+            liveryCount: plans.length,
+        });
+    } catch (err) {
+        return res.status(500).json({ ok: false, error: (err as Error).message });
+    }
+});
+
+const importUpload = multer({ storage: multer.memoryStorage() }).fields([{ name: 'mod', maxCount: 1 }]);
+
+app.post('/api/import-mod', importUpload, async (req: Request, res: Response) => {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    fs.mkdirSync(IMPORTS_DIR, { recursive: true });
+
+    const files = req.files as { mod?: Express.Multer.File[] } | undefined;
+    const uploaded = files?.mod?.[0];
+    const token = typeof req.body?.token === 'string' ? req.body.token : undefined;
+    const log: string[] = [];
+
+    try {
+        let preview: ModPreview | null = null;
+        if (token) {
+            preview = loadPreview(token);
+            if (!preview) {
+                return res.status(400).json({ ok: false, error: 'Import preview expired or not found. Upload the mod again.' });
+            }
+        } else if (uploaded) {
+            const originalName = uploaded.originalname || 'mod.zip';
+            const baseSlug = slugify(originalName);
+            const stamp = Date.now();
+            const newToken = `${baseSlug}-${stamp}`;
+            const zipPath = path.join(UPLOADS_DIR, `${newToken}.zip`);
+            fs.writeFileSync(zipPath, uploaded.buffer);
+            const zipFiles = unzipModBuffer(uploaded.buffer);
+            const embedded = findEmbeddedConfig(zipFiles);
+            const catalog = extractModCatalog(zipFiles);
+            let discovered: DiscoveredPlane[] = [];
+            let choices: AircraftImportChoice[] = [];
+            if (embedded?.includeMaterials?.length) {
+                const name = embedded.name ?? prettyName(originalName);
+                choices = [{
+                    key: slugify(name),
+                    canonicalName: name,
+                    displayName: name,
+                    liveries: [{
+                        material: embedded.includeMaterials[0],
+                        label: embedded.includeMaterials[0],
+                        confidence: 1,
+                    }],
+                    defaultMaterial: embedded.includeMaterials[0],
+                }];
+            } else {
+                discovered = await discoverPlanes(zipPath);
+                log.push(`$ python tools/import_mod.py --bundle ... --discover\n${JSON.stringify(discovered, null, 2)}\n`);
+                choices = buildAircraftChoices(discovered, catalog);
+            }
+            preview = {
+                token: newToken,
+                baseSlug,
+                originalName,
+                zipPath,
+                embedded,
+                catalog,
+                discovered,
+                choices,
+            };
+        } else {
+            return res.status(400).json({ ok: false, error: 'Upload a mod or provide a preview token.' });
+        }
+
+        let planes: PlaneImportPlan[];
+        const selectionsRaw = req.body?.selections;
+        if (typeof selectionsRaw === 'string' && selectionsRaw.length > 0) {
+            const selections = JSON.parse(selectionsRaw) as ImportSelection[];
+            planes = buildPlanesFromSelections(preview.choices, selections, preview.catalog, preview.baseSlug);
+            log.push(`[import] ${planes.length} aircraft selected`);
+        } else if (preview.embedded?.includeMaterials?.length) {
+            const idSlug = slugify(preview.embedded.name ?? preview.baseSlug);
             planes = [{
-                modId: uniqueModId(baseSlug),
+                modId: uniqueModId(preview.baseSlug),
                 idSlug,
-                name: embedded.name ?? prettyName(originalName),
-                displayName: embedded.name ?? prettyName(originalName),
+                name: preview.embedded.name ?? prettyName(preview.originalName),
+                displayName: preview.embedded.name ?? prettyName(preview.originalName),
                 material: null,
                 confidence: 1,
             }];
         } else {
-            const discovered = await discoverPlanes(zipPath);
-            log.push(`$ python tools/import_mod.py --bundle ... --discover\n${JSON.stringify(discovered, null, 2)}\n`);
-            if (catalog) {
-                log.push(`[catalog] ${catalog.aircraft.length} aircraft entries from mod metadata`);
-            }
-            planes = buildPlanesFromCatalog(discovered, catalog, baseSlug);
-            if (planes.length > 1) {
-                log.push(`[import] ${planes.length} aircraft queued (collection import)`);
-            }
+            planes = buildAllLiveryPlans(preview.discovered, preview.catalog, preview.baseSlug);
+            log.push(`[import] ${planes.length} liveries queued`);
             if (planes.length === 0) {
-                // Fallback: still allow import if matching fails.
                 planes = [{
-                    modId: uniqueModId(baseSlug),
-                    idSlug: baseSlug,
-                    name: prettyName(originalName),
-                    displayName: prettyName(originalName),
+                    modId: uniqueModId(preview.baseSlug),
+                    idSlug: preview.baseSlug,
+                    name: prettyName(preview.originalName),
+                    displayName: prettyName(preview.originalName),
                     material: null,
                     confidence: 0,
                 }];
             }
         }
 
-        const configs = planes.map((plane) => buildPlaneConfig(zipPath, plane, embedded, catalog));
-        const batchPath = path.join(UPLOADS_DIR, `${baseSlug}-${stamp}.batch.json`);
-        await importPlaneConfigsBatch(configs, batchPath, log);
-
-        const modIds = planes.map((plane) => plane.modId);
-        const pack = await runPython([
-            'tools/pack_aircraft_mods.py',
-            '--imports-only',
-            '--only',
-            ...modIds,
-        ]);
-        log.push(`\n$ python tools/pack_aircraft_mods.py\n${pack.stdout}${pack.stderr}`);
-        if (pack.code !== 0) {
-            return res.status(500).json({ ok: false, error: 'pack_aircraft_mods.py failed', log: log.join('\n') });
-        }
-
-        for (const plane of planes) {
-            const manifestPath = path.join(IMPORTS_DIR, `${plane.modId}.aircraft.json`);
-            const packPath = path.join(DIST_DIR, 'assets', `${plane.modId}.aircraft.pack`);
-            if (!fs.existsSync(manifestPath) || !fs.existsSync(packPath)) {
-                continue;
-            }
-            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as { name?: string };
-            imported.push({
-                id: plane.modId,
-                name: manifest.name || plane.displayName || plane.name,
-                packUrl: `assets/${plane.modId}.aircraft.pack`,
-            });
-        }
-
-        if (imported.length === 0) {
-            return res.status(500).json({
-                ok: false,
-                error: 'Import produced no flyable aircraft (the mod may not be a supported plane bundle).',
-                log: log.join('\n'),
-            });
-        }
-
+        const imported = await executeImport(preview, planes, log);
         return res.json({ ok: true, imported, log: log.join('\n') });
     } catch (err) {
         return res.status(500).json({ ok: false, error: (err as Error).message, log: log.join('\n') });
@@ -770,7 +1094,7 @@ app.use(express.static(DIST_DIR, {
 app.listen(PORT, () => {
     console.log(`retroflightsim dev server running at http://localhost:${PORT}`);
     console.log(`Serving ${DIST_DIR}`);
-    console.log('Mod import endpoint: POST /api/import-mod (F10 in-app upload)');
+    console.log('Mod import endpoint: POST /api/preview-mod, POST /api/import-mod (F10 in-app upload)');
     if (LIVE_RELOAD) {
         watchBundleForReload();
     }
