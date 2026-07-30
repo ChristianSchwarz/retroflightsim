@@ -8,7 +8,7 @@ Others simply rely on per-material flat `_Color` values.
 
 This tool recovers those real per-polygon colours by, for each mesh face:
   1. an explicit per-material override colour (config `materialColors`), else
-  2. an afterburner nozzle interior -> the 'FX_FIRE' PaletteCategory, else
+  2. an afterburner nozzle interior -> a dark literal '#rrggbb' (rest pose), else
   3. glass -> the configured glass colour (usually 'GLASS'), else
   4. an emissive "light" (bright emission over a dark base) -> its literal colour, else
   5. a palette-swatch sample at the face's UV centroid, else
@@ -16,8 +16,8 @@ This tool recovers those real per-polygon colours by, for each mesh face:
 Faces are grouped by colour and written to a glTF with one mesh/material per
 distinct colour. Each material is named '#rrggbb' so the sim renders that
 literal colour (see ModelManager.rawColorFor). A material name may also be a
-PaletteCategory (e.g. 'GLASS' for glass, 'FX_FIRE' for the throttle-driven
-afterburner nozzle glow) to let the sim tint/drive it.
+PaletteCategory (e.g. 'GLASS' for glass). Afterburner *glow* is procedural at
+fx.nozzles; nozzle-interior meshes export as dark metal, not FX_FIRE.
 
 Transparent materials (low alpha) are auto-detected as glass; you can also
 force parts to glass by name, and control the glass colour.
@@ -67,15 +67,36 @@ import trimesh
 import UnityPy
 from PIL import Image
 
+from tca_mapping import (
+    animated_part_control,
+    auto_gear_names,
+    auto_surface_defs,
+    classify_material,
+    is_attachment_empty,
+    is_cockpit_part,
+    is_discover_skip_part,
+    is_engine_part,
+    is_fuselage_part,
+    is_glass_part,
+    is_livery_material,
+    is_nozzle_mesh,
+    is_nozzle_part,
+    is_body_hint_part,
+    merge_config_overrides,
+    point_in_expanded_bounds,
+    should_skip_gear_clip_part,
+    skip_part_substrings,
+)
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 GLASS_CATEGORY = 'GLASS'
 DEFAULT_MATERIAL = '#909094'  # neutral grey fallback
 # PaletteCategory used for a generated flyable-aircraft shadow silhouette.
 SHADOW_MATERIAL = 'SCENERY_TREE_SHADOW'
-# PaletteCategory the sim throttle-drives as the afterburner nozzle glow (see
-# PlayerEntity.collectAfterburnerPaneMaterials). Faces tagged with this material
-# name light up with the engine automatically -- no per-aircraft wiring needed.
+# Dark metal for nozzle-interior mesh geometry (TCA rest pose is black).
+DEFAULT_NOZZLE_COLOR = '#1a1a1a'
+# Kept for material-name parsing in legacy glTF node names.
 FX_FIRE_MATERIAL = 'FX_FIRE'
 
 # Emissive "light" detection: a material is treated as a self-lit lamp only when
@@ -95,9 +116,8 @@ _FLIP_X = np.diag([-1.0, 1.0, 1.0, 1.0])
 
 # A texture no larger than this (px) is treated as a flat palette-swatch atlas.
 DEFAULT_SWATCH_MAX = 64
-
-# Materials whose meshes are never visible geometry.
-DEFAULT_SKIP_MATERIALS = ('Collider', 'ShadowDepthOffset', 'Shadow')
+# Large bitmap liveries are downsampled to this max edge before per-face sampling.
+DEFAULT_BITMAP_SAMPLE_MAX = 512
 
 
 # --------------------------------------------------------------------------- #
@@ -793,6 +813,52 @@ def rgba01_to_hex(c) -> str:
     return '#%02x%02x%02x' % (r, g, b)
 
 
+def decode_texture_array(tex: dict) -> np.ndarray | None:
+    """Decode a lazy Texture2D entry on first use; cache in ``tex['array']``."""
+    cached = tex.get('array')
+    if cached is not None:
+        return cached
+    src = tex.get('_src')
+    if src is None:
+        return None
+    try:
+        decoded = np.array(src.read().image.convert('RGB'))
+    except Exception:
+        decoded = None
+    tex['array'] = decoded
+    tex.pop('_src', None)
+    return decoded
+
+
+def texture_sample_array(
+        tex: dict,
+        swatch_max: int,
+        bitmap_livery: bool = False,
+        bitmap_sample_max: int = DEFAULT_BITMAP_SAMPLE_MAX,
+) -> np.ndarray | None:
+    """Return an RGB array suitable for palette sampling, or None."""
+    arr = decode_texture_array(tex)
+    if arr is None:
+        return None
+    w, h = int(tex['w']), int(tex['h'])
+    if w <= swatch_max and h <= swatch_max:
+        return arr
+    if not bitmap_livery:
+        return None
+    edge = max(w, h)
+    if edge <= bitmap_sample_max:
+        return arr
+    scale = bitmap_sample_max / edge
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    img = Image.fromarray(arr.astype(np.uint8))
+    img = img.resize((nw, nh), Image.Resampling.BILINEAR)
+    return np.array(img)
+
+
+_BUNDLE_PATH_CACHE: dict[str, str] = {}
+
+
 def resolve_bundle_path(path: str) -> str:
     """Accept a raw Unity asset bundle, a folder, or a mod .zip.
 
@@ -802,6 +868,12 @@ def resolve_bundle_path(path: str) -> str:
     into a temp dir (cleaned up on exit) and returns its path."""
     if not path.lower().endswith('.zip'):
         return path
+
+    abs_path = os.path.abspath(path)
+    cache_key = f'{abs_path}:{os.path.getmtime(abs_path)}:{os.path.getsize(abs_path)}'
+    cached = _BUNDLE_PATH_CACHE.get(cache_key)
+    if cached is not None and os.path.isfile(cached):
+        return cached
 
     tmp = tempfile.mkdtemp(prefix='rfs_mod_')
     atexit.register(shutil.rmtree, tmp, ignore_errors=True)
@@ -823,6 +895,7 @@ def resolve_bundle_path(path: str) -> str:
             shutil.copyfileobj(src, dst)
         print(f'Extracted asset bundle "{chosen.filename}" from {os.path.basename(path)}',
               file=sys.stderr)
+        _BUNDLE_PATH_CACHE[cache_key] = out
         return out
 
 
@@ -830,7 +903,9 @@ class Bundle:
     """Parsed view over a Unity asset bundle."""
 
     def __init__(self, path: str):
-        self.env = UnityPy.load(resolve_bundle_path(path))
+        self.source_path = path
+        self.resolved_path = resolve_bundle_path(path)
+        self.env = UnityPy.load(self.resolved_path)
         self.by_path = {o.path_id: o for o in self.env.objects}
         self.transforms = {}
         self.mesh_filters = {}
@@ -868,7 +943,7 @@ class Bundle:
         # TinyDiffuse exposes emission via _EmissionColor (bright for lights,
         # black otherwise). NozzleInteriorMat instead uses _Emissive; that mesh
         # is handled by nozzle detection, so lights only look at _EmissionColor.
-        emission = colors.get('_EmissionColor') or {}
+        emission = colors.get('_EmissionColor') or colors.get('_Emissive') or {}
         return {
             'name': tt.get('m_Name', ''),
             'main_tex': main_tex,
@@ -879,13 +954,15 @@ class Bundle:
 
     @staticmethod
     def _read_texture(o) -> dict:
-        t = o.read()
-        info = {'name': t.m_Name, 'w': int(t.m_Width), 'h': int(t.m_Height), 'array': None}
-        try:
-            info['array'] = np.array(t.image.convert('RGB'))
-        except Exception:
-            pass
-        return info
+        # Keep metadata only; decode RGB on first palette/livery sample.
+        tt = o.read_typetree()
+        return {
+            'name': tt.get('m_Name', ''),
+            'w': int(tt.get('m_Width', 0)),
+            'h': int(tt.get('m_Height', 0)),
+            'array': None,
+            '_src': o,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -931,51 +1008,19 @@ def _renderer_material_names(bundle: Bundle, go):
 
 
 # Substrings that identify exterior airframe meshes when discovering liveries.
-_BODY_PART_HINTS = (
-    'Fuselage', 'Wing', 'Nose', 'Elevator', 'Rudder', 'Aileron',
-    'Tail', 'Fin', 'Stabilizer', 'Slat', 'Flap', 'Intake', 'Nozzle',
-    'SpeedBrake', 'Body', 'Hull',
-)
-
-_DISCOVER_SKIP_NAME_PARTS = (
-    'Collider', 'Shadow', 'Stick', 'Gauge', 'Needle', 'Pylon', 'Weapon',
-    'Cockpit', 'Seat', 'Mirror', 'Empty', 'FX', 'Light', 'Bolt', 'AIM',
-    'Gun', 'Tank', 'Launcher',
-)
+# (Defined in tools/tca_mapping.json partCategories.bodyHint.)
 
 
-def _discover_skip_part(name: str) -> bool:
-    return any(s in name for s in _DISCOVER_SKIP_NAME_PARTS)
-
-
-def _is_body_part(name: str) -> bool:
-    return any(h in name for h in _BODY_PART_HINTS)
-
-
-def _is_fuselage_part(name: str) -> bool:
-    return 'Fuselage' in name or name in ('Body', 'Hull', 'Fuse')
-
-
-def _livery_material_name(name: str, skip_materials: tuple) -> bool:
-    if any(s in name for s in skip_materials):
-        return False
-    low = name.lower()
-    if 'glass' in low or 'canopy' in low or 'windscreen' in low or 'collider' in low:
-        return False
-    if any(s in low for s in ('missile', 'weapon', 'pylon', 'bomb', 'rocket', 'pod')):
-        return False
-    return True
-
-
-def discover_livery_materials(bundle_path: str) -> list[dict]:
+def discover_livery_materials(bundle_path: str, bundle: Bundle | None = None) -> list[dict]:
     """Find distinct flyable aircraft liveries in a multi-plane Unity bundle.
 
     Multi-plane packs (e.g. Tiny Combat Arena collections) reuse the same mesh
     part names across aircraft; only the Unity *material* (livery) differs.
     Returns one entry per livery material, suitable for ``includeMaterials``.
     """
-    bundle = Bundle(bundle_path)
-    skip_materials = DEFAULT_SKIP_MATERIALS
+    if bundle is None:
+        bundle = Bundle(bundle_path)
+    tca = merge_config_overrides({})
     body_parts: dict[str, set[str]] = defaultdict(set)
     fuselage_mats: set[str] = set()
     mesh_hits: dict[str, int] = defaultdict(int)
@@ -985,7 +1030,7 @@ def discover_livery_materials(bundle_path: str) -> list[dict]:
             continue
         go = o.read()
         name = go.m_Name
-        if _discover_skip_part(name):
+        if is_discover_skip_part(name, tca):
             continue
         mat_pids: list[int] = []
         has_mesh = False
@@ -1006,14 +1051,14 @@ def discover_livery_materials(bundle_path: str) -> list[dict]:
             if mat is None:
                 continue
             mat_name = mat.get('name', '')
-            if not _livery_material_name(mat_name, skip_materials):
+            if not is_livery_material(mat_name, tca):
                 continue
             if mat.get('alpha', 1.0) < 0.9:
                 continue
             mesh_hits[mat_name] += 1
-            if _is_body_part(name):
+            if is_body_hint_part(name, tca):
                 body_parts[mat_name].add(name)
-            if _is_fuselage_part(name):
+            if is_fuselage_part(name, tca):
                 fuselage_mats.add(mat_name)
 
     candidates = sorted(fuselage_mats) if fuselage_mats else sorted(
@@ -1040,6 +1085,28 @@ def discover_livery_materials(bundle_path: str) -> list[dict]:
     return out
 
 
+def count_livery_materials(bundle: Bundle, tca=None) -> int:
+    """Distinct opaque livery material names in a bundle (collection detection)."""
+    tca = tca or merge_config_overrides({})
+    mats: set[str] = set()
+    for mat in bundle.materials.values():
+        name = mat.get('name', '')
+        if is_livery_material(name, tca) and mat.get('alpha', 1.0) >= 0.9:
+            mats.add(name)
+    return len(mats)
+
+
+# Bundles with more than this many liveries are treated as multi-aircraft
+# collection packs (e.g. Global Skies). Global spatial rescue would otherwise
+# re-admit every co-located aircraft's glass/cockpit/nozzle meshes.
+COLLECTION_LIVERY_THRESHOLD = 5
+
+
+def _set_flat_normals(mesh: trimesh.Trimesh) -> None:
+    """Flat-shaded export: skip trimesh/scipy weighted normal computation."""
+    mesh.vertex_normals = np.tile([0.0, 1.0, 0.0], (len(mesh.vertices), 1))
+
+
 # --------------------------------------------------------------------------- #
 # Import
 # --------------------------------------------------------------------------- #
@@ -1049,50 +1116,6 @@ def _should_include(name: str, include_exact, skip_parts, skip_exact) -> bool:
     if name in include_exact:
         return True
     return not any(part in name for part in skip_parts)
-
-
-# Tiny Combat Arena / workshop mods reuse these GameObject names across aircraft.
-# When flyable.surfaces is omitted (generic F10 import), match them automatically.
-_AUTO_SURFACE_RULES: list[tuple[tuple[str, ...], str, str, int, float]] = [
-    (('ElevatorLeft', 'ElevatorL'), 'elevatorLeft', 'pitch', 1, 0.42),
-    (('ElevatorRight', 'ElevatorR'), 'elevatorRight', 'pitch', 1, 0.42),
-    (('AileronL', 'AileronLeft'), 'aileronLeft', 'roll', 1, 0.4),
-    (('AileronR', 'AileronRight'), 'aileronRight', 'roll', -1, 0.4),
-    (('FlapL', 'FlapLeft'), 'flapLeft', 'flaps', -1, 0.5),
-    (('FlapR', 'FlapRight'), 'flapRight', 'flaps', -1, 0.5),
-    (('SlatsL', 'SlatL', 'SlatLeft'), 'slatLeft', 'slats', 1, 0.35),
-    (('SlatsR', 'SlatR', 'SlatRight'), 'slatRight', 'slats', 1, 0.35),
-    # TCA workshop naming varies widely (SpeedBrake vs Speedbrake, T/S/LL…).
-    (('SpeedBrakeL', 'SpeedbrakeL', 'AirBrakeL', 'AirbrakeL', 'SpoilerL'),
-     'speedbrakeLeft', 'airbrake', 1, 0.45),
-    (('SpeedBrakeR', 'SpeedbrakeR', 'AirBrakeR', 'AirbrakeR', 'SpoilerR'),
-     'speedbrakeRight', 'airbrake', 1, 0.45),
-    (('SpeedBrakeLL', 'SpeedbrakeLL'), 'speedbrakeLL', 'airbrake', 1, 0.45),
-    (('SpeedBrakeLR', 'SpeedbrakeLR'), 'speedbrakeLR', 'airbrake', 1, 0.45),
-    (('SpeedBrakeTL', 'SpeedbrakeTL'), 'speedbrakeTL', 'airbrake', 1, 0.45),
-    (('SpeedBrakeTR', 'SpeedbrakeTR'), 'speedbrakeTR', 'airbrake', 1, 0.45),
-    (('SpeedBrakeT', 'SpeedbrakeT', 'SpeedBrakeS', 'SpeedbrakeS',
-      'SpeedBrake', 'Speedbrake', 'AirBrake', 'Airbrake', 'Spoiler'),
-     'speedbrake', 'airbrake', 1, 0.55),
-]
-
-_AUTO_GEAR_PARTS = (
-    'GearNoseWheel', 'GearMainWheelL', 'GearMainWheelR',
-    'GearNoseStrut', 'GearMainStrutL', 'GearMainStrutR',
-    'GearNoseBase', 'GearNoseBase2', 'GearMainBaseL', 'GearMainBaseR',
-    'GearDoorFront', 'GearDoorL', 'GearDoorR', 'GearNoseDoor',
-    'GearLSupport1', 'GearLSupport2', 'GearRSupport1', 'GearRSupport2',
-    'GearNoseSupport', 'GearNoseSupporter1', 'GearNoseSupporter2',
-    # Common TCA bay-door / door-empty variants (also discovered via GearUp clip).
-    'GearDoorFront1', 'GearDoorFront2', 'GearDoorFrontL', 'GearDoorFrontR',
-    'GearDoorL1', 'GearDoorL2', 'GearDoorR1', 'GearDoorR2',
-    'GearDoorLE', 'GearDoorRE', 'GearDoorNoseL', 'GearDoorNoseR',
-    'GearNoseDoor1', 'GearNoseDoorL', 'GearNoseDoorR',
-    'GearNoseDoorL1', 'GearNoseDoorL2', 'GearNoseDoorR1', 'GearNoseDoorR2',
-    'DoorEmpty1', 'FuselageDoor1',
-    'WLDoor1', 'WLDoor2', 'WRDoor1', 'WRDoor2',
-    'WingLDoor1', 'WingLDoor2', 'WingRDoor1', 'WingRDoor2',
-)
 
 
 def _strip_json_trailing_commas(text: str) -> str:
@@ -1119,6 +1142,9 @@ def _parse_aircraft2_animated_parts(text: str) -> list[dict]:
     return [e for e in ap if isinstance(e, dict)] if isinstance(ap, list) else []
 
 
+_AIRCRAFT2_PARTS_CACHE: dict[str, list[tuple[str, list[str], list[dict]]]] = {}
+
+
 def load_aircraft2_animated_parts(bundle_path: str, hints: list[str]) -> list[dict]:
     """Read AnimatedParts for this aircraft from a TCA mod zip's Aircraft2 JSON.
 
@@ -1130,10 +1156,46 @@ def load_aircraft2_animated_parts(bundle_path: str, hints: list[str]) -> list[di
         return []
     if not os.path.isfile(bundle_path):
         return []
+    cache_key = f'{os.path.abspath(bundle_path)}:{os.path.getmtime(bundle_path)}'
+    if cache_key not in _AIRCRAFT2_PARTS_CACHE:
+        _AIRCRAFT2_PARTS_CACHE[cache_key] = _scan_aircraft2_animated_parts(bundle_path)
     hint_tokens = {_normalize_aircraft_token(h) for h in hints if h}
     hint_tokens = {t for t in hint_tokens if len(t) >= 3}
     best: list[dict] | None = None
     best_score = -1
+    for norm, candidates, parts in _AIRCRAFT2_PARTS_CACHE[cache_key]:
+        score = _aircraft2_hint_score(candidates, hint_tokens)
+        if score < 3 and hint_tokens:
+            continue
+        if score > best_score:
+            best_score = score
+            best = parts
+            print(f'Aircraft2 AnimatedParts from "{norm}" '
+                  f'(score={score}, n={len(parts)})')
+    return best or []
+
+
+def _aircraft2_hint_score(candidates: list[str], hint_tokens: set[str]) -> int:
+    score = 0
+    for c in candidates:
+        tok = _normalize_aircraft_token(c)
+        if not tok:
+            continue
+        for h in hint_tokens:
+            n = 0
+            for a, b in zip(tok, h):
+                if a != b:
+                    break
+                n += 1
+            if tok.startswith(h) or h.startswith(tok):
+                n = max(n, min(len(tok), len(h)))
+            score = max(score, n)
+    return score
+
+
+def _scan_aircraft2_animated_parts(bundle_path: str) -> list[tuple[str, list[str], list[dict]]]:
+    """Return [(zipEntry, nameCandidates, AnimatedParts), ...] for Aircraft2 JSON."""
+    out: list[tuple[str, list[str], list[dict]]] = []
     try:
         with zipfile.ZipFile(bundle_path) as z:
             for name in z.namelist():
@@ -1146,7 +1208,6 @@ def load_aircraft2_animated_parts(bundle_path: str, hints: list[str]) -> list[di
                     text = z.read(name).decode('utf-8', errors='ignore')
                 except Exception:
                     continue
-                # Score by aircraft Name / DisplayName / filename vs import hints.
                 nm = re.search(r'"Name"\s*:\s*"([^"]+)"', text)
                 dn = re.search(r'"DisplayName"\s*:\s*"([^"]+)"', text)
                 candidates = [
@@ -1154,50 +1215,14 @@ def load_aircraft2_animated_parts(bundle_path: str, hints: list[str]) -> list[di
                     dn.group(1) if dn else '',
                     os.path.splitext(os.path.basename(norm))[0],
                 ]
-                score = 0
-                for c in candidates:
-                    tok = _normalize_aircraft_token(c)
-                    if not tok:
-                        continue
-                    for h in hint_tokens:
-                        n = 0
-                        for a, b in zip(tok, h):
-                            if a != b:
-                                break
-                            n += 1
-                        if tok.startswith(h) or h.startswith(tok):
-                            n = max(n, min(len(tok), len(h)))
-                        score = max(score, n)
-                if score < 3 and hint_tokens:
-                    continue
                 parts = _parse_aircraft2_animated_parts(text)
-                if not parts:
-                    continue
-                if score > best_score:
-                    best_score = score
-                    best = parts
-                    print(f'Aircraft2 AnimatedParts from "{norm}" '
-                          f'(score={score}, n={len(parts)})')
+                if parts:
+                    out.append((norm, candidates, parts))
     except zipfile.BadZipFile:
         return []
-    return best or []
-
-
-def _animated_part_control(entry: dict) -> str | None:
-    """Map a TCA AnimatedParts entry to a retroflightsim ControlAxis."""
-    if entry.get('AngleByBrake') is not None:
-        return 'airbrake'
-    if entry.get('FlapInfluence') is not None:
-        return 'flaps'
-    if entry.get('SlatInfluence') is not None or entry.get('AngleBySlats') is not None:
-        return 'slats'
-    if entry.get('AngleByPitch') is not None:
-        return 'pitch'
-    if entry.get('AngleByRoll') is not None:
-        return 'roll'
-    if entry.get('AngleByYaw') is not None:
-        return 'yaw'
-    return None
+    except Exception:
+        return []
+    return out
 
 
 def _curve_range_sign(curve) -> tuple[float, int]:
@@ -1217,6 +1242,28 @@ def _curve_range_sign(curve) -> tuple[float, int]:
     return abs(math.radians(best_deg)), (1 if best_deg >= 0 else -1)
 
 
+def _rotation_axis_hint(entry: dict) -> tuple[str | None, int]:
+    """TCA ``RotationAxis`` → (hingeAxis letter, sign) for our hinge convention.
+
+    ``hinge_frame_from_part`` forces the chosen bone axis so its dominant world
+    component is positive (+X / +Y). TCA often uses the opposite sense on the
+    mirrored side (e.g. SpeedbrakeLL ``[-1,0,0]`` vs TL ``[1,0,0]``). Fold that
+    into ``sign`` so left/right petals open symmetrically instead of twisting
+    the tail (which reads as the airframe rolling).
+    """
+    axis = entry.get('RotationAxis')
+    if not isinstance(axis, (list, tuple)) or len(axis) < 3:
+        return None, 1
+    try:
+        comps = [float(axis[0]), float(axis[1]), float(axis[2])]
+    except (TypeError, ValueError):
+        return None, 1
+    idx = max(range(3), key=lambda i: abs(comps[i]))
+    if abs(comps[idx]) < 1e-6:
+        return None, 1
+    return 'xyz'[idx], (1 if comps[idx] >= 0.0 else -1)
+
+
 def _mesh_name_for_animated_part(entry: dict, available: set[str]) -> str | None:
     """Resolve the exported mesh name for an AnimatedParts entry."""
     name = str(entry.get('Name') or '')
@@ -1232,13 +1279,14 @@ def _mesh_name_for_animated_part(entry: dict, available: set[str]) -> str | None
 
 
 def surface_defs_from_animated_parts(
-        animated: list[dict], available: set[str]) -> list[dict]:
+        animated: list[dict], available: set[str],
+        tca=None) -> list[dict]:
     """Build flyable surface entries from TCA Aircraft2 AnimatedParts."""
     surfaces: list[dict] = []
     used_parts: set[str] = set()
     used_roles: set[str] = set()
     for entry in animated:
-        control = _animated_part_control(entry)
+        control = animated_part_control(entry, tca)
         if control is None:
             continue
         mesh = _mesh_name_for_animated_part(entry, available)
@@ -1254,58 +1302,25 @@ def surface_defs_from_animated_parts(
         curve = (entry.get('AngleByBrake') or entry.get('AngleByPitch')
                  or entry.get('AngleByRoll') or entry.get('AngleByYaw')
                  or entry.get('AngleBySlats'))
+        hinge_axis, axis_sign = _rotation_axis_hint(entry)
         if curve:
-            range_rad, sign = _curve_range_sign(curve)
+            range_rad, curve_sign = _curve_range_sign(curve)
         else:
-            range_rad, sign = (0.5 if control == 'flaps' else 0.45), 1
+            range_rad, curve_sign = (0.5 if control == 'flaps' else 0.45), 1
         sd: dict = {
             'role': role,
             'parts': [mesh],
             'control': control,
-            'sign': sign,
+            'sign': axis_sign * curve_sign,
             'rangeRad': range_rad,
         }
         if hinge:
             sd['hingePart'] = hinge
+        if hinge_axis:
+            sd['hingeAxis'] = hinge_axis
         surfaces.append(sd)
         used_parts.add(mesh)
         used_roles.add(role)
-    return surfaces
-
-
-def auto_surface_defs(available: set[str]) -> list[dict]:
-    """Build flyable surface entries from standard TCA part names."""
-    surfaces: list[dict] = []
-    used_roles: set[str] = set()
-    used_parts: set[str] = set()
-    for part_names, role, control, sign, range_rad in _AUTO_SURFACE_RULES:
-        if role in used_roles:
-            continue
-        part = next((pn for pn in part_names if pn in available and pn not in used_parts), None)
-        if part is None:
-            continue
-        surfaces.append({
-            'role': role,
-            'parts': [part],
-            'control': control,
-            'sign': sign,
-            'rangeRad': range_rad,
-        })
-        used_roles.add(role)
-        used_parts.add(part)
-
-    # Some mods split the rudder into left/right meshes instead of one "Rudder".
-    if 'rudder' not in used_roles:
-        rudder_parts = [p for p in ('Rudder', 'RudderLeft', 'RudderRight')
-                        if p in available and p not in used_parts]
-        if rudder_parts:
-            surfaces.append({
-                'role': 'rudder',
-                'parts': rudder_parts,
-                'control': 'yaw',
-                'sign': 1,
-                'rangeRad': 0.45,
-            })
     return surfaces
 
 
@@ -1329,33 +1344,18 @@ def merge_surface_defs(primary: list[dict], fallback: list[dict]) -> list[dict]:
     return out
 
 
-def auto_gear_names(available: set[str]) -> set[str]:
-    names = {p for p in _AUTO_GEAR_PARTS if p in available}
-    for n in available:
-        ln = n.lower()
-        if n in names:
-            continue
-        if 'geardoor' in ln or ('door' in ln and 'gear' in ln):
-            names.add(n)
-        elif n.startswith(('WLDoor', 'WRDoor', 'DoorEmpty', 'WingLDoor', 'WingRDoor',
-                           'BGearDoor', 'BGearNoseDoor')):
-            names.add(n)
-    return names
-
-
 def auto_gear_names_from_clip(available: set[str], clip: dict | None,
-                              processed: list[dict], full_paths: dict[int, str]) -> set[str]:
+                              processed: list[dict], full_paths: dict[int, str],
+                              tca=None) -> set[str]:
     """Gear/door mesh names driven by the GearUp clip (legs + bay doors)."""
-    names = set(auto_gear_names(available))
-    # Cockpit-only props that some GearUp clips also key (not landing gear).
-    _SKIP = {'GearHandle', 'GearLever', 'GearLever1', 'GearLever2'}
+    names = set(auto_gear_names(available, tca))
     if not clip:
-        return names - _SKIP
+        return {n for n in names if not should_skip_gear_clip_part(n, tca)}
 
     animated = clip['animated_paths']
     for p in processed:
         name = p['name']
-        if name in _SKIP:
+        if should_skip_gear_clip_part(name, tca):
             continue
         tpid = p.get('tpid')
         if tpid is None:
@@ -1370,43 +1370,8 @@ def auto_gear_names_from_clip(available: set[str], clip: dict | None,
                 matched = True
                 break
         if matched:
-            # Skip nav/beacon lights that some clips hitch onto.
-            if 'navlight' in name.lower():
-                continue
             names.add(name)
-    return names - _SKIP
-
-
-# Unity/TCA mods label canopy glass by material and/or part name; alpha is not
-# always below the auto-glass threshold (e.g. the shared "Glass" material is 1.0).
-_GLASS_MATERIAL_NAMES = frozenset({
-    'Glass', 'Canopy', 'Glass HUD', 'CanopyGlass', 'Windscreen', 'CanopyBack',
-})
-_GLASS_PART_NAME_PARTS = (
-    'CanopyGlass', 'CanopyFront', 'CanopyBack', 'Windscreen', 'CanopyEject',
-)
-
-# TCA's shared "NozzleInteriorMat" is its own single-material mesh that glows
-# with the afterburner. Detect it by shared-material name or, when that material
-# is an unbundled external GUID reference, by the mesh name.
-_NOZZLE_MATERIAL_NAMES = frozenset({'NozzleInterior', 'NozzleInteriorMat'})
-_NOZZLE_PART_NAME_PARTS = ('NozzleInterior', 'AfterburnerInterior', 'BurnerInterior')
-
-# In multi-plane bundles the shared nozzle-interior meshes are often pooled under
-# a transform root separate from the selected plane, so they cannot be rescued.
-# Each plane still carries its OWN engine/exhaust parts (livery material), which
-# ARE correctly isolated -- use their mesh names to derive nozzle exit points.
-# Bare "Tail" is excluded (that is the vertical fin); "TailInner" is the exhaust.
-_ENGINE_PART_NAME_PARTS = (
-    'Engine', 'Nozzle', 'Exhaust', 'Burner', 'Jetpipe', 'Tailpipe',
-    'Afterburner', 'TailInner',
-)
-
-# Shared "ColliderMat"/"ShadowDepthOffset" materials are referenced by GUID and
-# are usually NOT bundled with a workshop mod, so their material *name* cannot be
-# resolved. Fall back to these mesh-name substrings so colliders and authored
-# shadow meshes are still dropped (the sim generates its own shadow silhouette).
-_DEFAULT_SKIP_NAME_PARTS = ('Collider', 'Shadow')
+    return {n for n in names if not should_skip_gear_clip_part(n, tca)}
 
 
 def transform_root(tpid: int, transforms) -> int:
@@ -1529,11 +1494,12 @@ def derive_gear_points(
     return points
 
 
-def import_mod(cfg: dict) -> int:
+def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     bundle_path = cfg['bundle']
     out = cfg['out']
     if not os.path.isabs(out):
         out = os.path.join(PROJECT_ROOT, out)
+    tca = merge_config_overrides(cfg)
     buffer_prefix = cfg.get('bufferPrefix') or (
         os.path.splitext(os.path.basename(out))[0] + '_buffer_')
     ground_distance = float(cfg.get('groundDistance', 2.0))
@@ -1542,14 +1508,15 @@ def import_mod(cfg: dict) -> int:
     scale = float(cfg.get('scale', 1.0))
     rotation_euler = cfg.get('rotationEuler')  # [x, y, z] degrees, or None
     swatch_max = int(cfg.get('swatchMax', DEFAULT_SWATCH_MAX))
+    bitmap_livery = bool(cfg.get('bitmapLivery', True))
+    bitmap_sample_max = int(cfg.get('bitmapSampleMax', DEFAULT_BITMAP_SAMPLE_MAX))
     glass_color = cfg.get('glassColor', '#d1f7ff')
-    glass_parts = tuple(cfg.get('glassParts', []))
     glass_auto_alpha = bool(cfg.get('glassAutoAlpha', True))
     glass_alpha_max = float(cfg.get('glassAlphaMax', 0.9))
-    # Afterburner nozzle interiors -> FX_FIRE (sim throttle-drives the glow).
+    # Afterburner nozzle interiors: export as dark metal, not FX_FIRE (the sim
+    # renders FX_FIRE with orange/yellow ordered dither for plume FX).
     nozzle_auto = bool(cfg.get('nozzleAuto', True))
-    nozzle_parts = tuple(cfg.get('nozzleParts', []))
-    nozzle_materials = tuple(cfg.get('nozzleMaterials', []))
+    nozzle_color = str(cfg.get('nozzleColor', DEFAULT_NOZZLE_COLOR))
     # Emissive "lights": a bright _EmissionColor over a dark base colour is
     # exported as its literal bright colour. An optional allow-list restricts
     # which material names may glow (empty = any qualifying material).
@@ -1565,9 +1532,9 @@ def import_mod(cfg: dict) -> int:
     # Always apply the collider/shadow name fallbacks so unbundled shared
     # materials cannot let those meshes leak in; includeExact still rescues any
     # legitimate part that happens to match.
-    skip_parts = tuple(cfg.get('skipNameParts', [])) + _DEFAULT_SKIP_NAME_PARTS
+    skip_parts = skip_part_substrings(tca)
     skip_exact = set(cfg.get('skipExact', []))
-    skip_materials = tuple(cfg.get('skipMaterials', DEFAULT_SKIP_MATERIALS))
+    skip_materials = tuple(cfg.get('skipMaterials', tca.skip_material_substrings))
     # A single Unity bundle may pack several aircraft that share part names
     # (e.g. many 'WingR'/'Cockpit'); they are separable only by material. When
     # set, only meshes whose renderer uses one of these materials are exported,
@@ -1578,7 +1545,7 @@ def import_mod(cfg: dict) -> int:
     # in, they z-fight and the model looks broken. When true, only the first
     # mesh per unique GameObject name is kept, yielding one clean copy.
     dedupe_parts = bool(cfg.get('dedupeParts', False))
-    seen_names: set[str] = set()
+    seen_names: set[tuple[str, int]] = set()
     # Optional greyscale remap. Some liveries bake heavy panel/camo shading into
     # their swatch texture, so sampling yields a high-contrast mix of near-black
     # and white faces. In a flat-shaded renderer the near-black regions read as
@@ -1619,15 +1586,26 @@ def import_mod(cfg: dict) -> int:
 
     rotation_matrix = euler_matrix(rotation_euler) if rotation_euler else None
 
-    bundle = Bundle(bundle_path)
+    if bundle is None:
+        bundle = Bundle(bundle_path)
+    elif os.path.abspath(bundle.source_path) != os.path.abspath(bundle_path):
+        bundle = Bundle(bundle_path)
+
+    if 'collectionPack' in cfg:
+        collection_bundle = bool(cfg['collectionPack'])
+    else:
+        collection_bundle = count_livery_materials(bundle, tca) > COLLECTION_LIVERY_THRESHOLD
+    if collection_bundle and include_materials:
+        print('Multi-aircraft collection bundle: global spatial part rescue disabled.',
+              file=sys.stderr)
 
     def is_glass(name: str, mat: dict | None) -> bool:
-        if any(p in name for p in glass_parts):
+        if is_glass_part(name, tca):
             return True
-        if any(p in name for p in _GLASS_PART_NAME_PARTS):
-            return True
-        if mat is not None and mat.get('name', '') in _GLASS_MATERIAL_NAMES:
-            return True
+        if mat is not None:
+            cls = classify_material(mat.get('name', ''), tca)
+            if cls is not None and cls.palette_category == GLASS_CATEGORY:
+                return True
         if glass_auto_alpha and mat is not None and mat['alpha'] < glass_alpha_max:
             return True
         return False
@@ -1637,16 +1615,20 @@ def import_mod(cfg: dict) -> int:
         or a matching mesh name when that material is an unbundled GUID ref)."""
         if not nozzle_auto:
             return False
-        if any(p in name for p in nozzle_parts):
-            return True
-        if any(p in name for p in _NOZZLE_PART_NAME_PARTS):
+        if is_nozzle_part(name, tca):
             return True
         if mat is None:
             return False
-        mat_name = mat.get('name', '')
-        if mat_name in _NOZZLE_MATERIAL_NAMES:
-            return True
-        return any(p in mat_name for p in nozzle_materials)
+        cls = classify_material(mat.get('name', ''), tca)
+        return cls is not None and cls.palette_category == FX_FIRE_MATERIAL
+
+    def nozzle_hex(mat: dict | None) -> str:
+        """Rest-pose nozzle colour: dark material _Color when present, else config."""
+        if mat is not None and mat.get('color'):
+            c = mat['color']
+            if max(c.get('r', 0.0), c.get('g', 0.0), c.get('b', 0.0)) <= EMISSION_BASE_MAX:
+                return rgba01_to_hex(c)
+        return nozzle_color
 
     def emissive_hex(mat: dict | None) -> str | None:
         """Bright emissive 'light' colour ('#rrggbb') for a material, else None.
@@ -1675,10 +1657,10 @@ def import_mod(cfg: dict) -> int:
         # 1. Explicit per-material override wins.
         if mat is not None and mat['name'] in material_colors:
             res = np.full(len(face_t), material_colors[mat['name']])
-        # 2. Afterburner nozzle interior -> FX_FIRE. The sim throttle-drives this
-        # material, so it must be one uniform category (never palette-sampled).
+        # 2. Afterburner nozzle interior -> dark metal (not FX_FIRE: that category
+        # is ordered-dither orange/yellow plume FX in the sim renderer).
         elif is_nozzle(name, mat):
-            return np.full(len(face_t), FX_FIRE_MATERIAL)
+            return np.full(len(face_t), nozzle_hex(mat))
         # 3. Glass: a PaletteCategory glass colour (e.g. 'GLASS') always renders
         # as one uniform material so the sim can tint/dither it; a literal
         # '#rrggbb' still samples per-poly tint when the glass has a swatch.
@@ -1700,17 +1682,18 @@ def import_mod(cfg: dict) -> int:
             res = np.full(len(face_t), rgba01_to_hex(mat['color']))
         else:
             res = np.full(len(face_t), DEFAULT_MATERIAL)
+        if is_nozzle(name, mat):
+            return res
         return grayify(res)
 
     def palette_array(mat: dict):
         if mat is None or not mat['main_tex']:
             return None
         tex = bundle.textures.get(mat['main_tex'])
-        if tex is None or tex['array'] is None:
+        if tex is None:
             return None
-        if tex['w'] <= swatch_max and tex['h'] <= swatch_max:
-            return tex['array']
-        return None
+        return texture_sample_array(
+            tex, swatch_max, bitmap_livery, bitmap_sample_max)
 
     world_cache: dict[int, np.ndarray] = {}
 
@@ -1732,21 +1715,92 @@ def import_mod(cfg: dict) -> int:
     # path those parts are dropped by includeMaterials. We first find the
     # transform-hierarchy root(s) of the livery-matched parts, then optionally
     # re-admit same-root parts:
-    #   - glass-only (rescueGlassUnderRoot), or
+    #   - glass/canopy (rescueGlassUnderRoot / rescueGlassGlobal), or
+    #   - cockpit interior (rescueCockpit), or
+    #   - nozzle interiors (rescueNozzleUnderRoot / rescueNozzleGlobal), or
     #   - any non-skipped material (rescueMaterialsUnderRoot).
-    # This keeps key per-plane details while avoiding cross-plane bleed.
+    # rescueNozzleGlobal / rescueGlassGlobal re-admit off-root pooled meshes when
+    # they lie near the livery-matched hull bounds (common in multi-plane bundles).
+    # Disabled for collection packs where every aircraft shares the same origin.
+    global_rescue_default = bool(include_materials) and not collection_bundle
     rescue_glass = bool(cfg.get('rescueGlassUnderRoot', False)) and bool(include_materials)
+    rescue_glass_global = bool(cfg.get(
+        'rescueGlassGlobal',
+        global_rescue_default,
+    )) and bool(include_materials)
+    rescue_cockpit = bool(cfg.get(
+        'rescueCockpit',
+        bool(include_materials),
+    )) and bool(include_materials)
+    rescue_cockpit_global = bool(cfg.get(
+        'rescueCockpitGlobal',
+        global_rescue_default,
+    )) and bool(include_materials)
+    rescue_nozzle = bool(cfg.get(
+        'rescueNozzleUnderRoot',
+        bool(include_materials),
+    )) and bool(include_materials)
+    rescue_nozzle_global = bool(cfg.get(
+        'rescueNozzleGlobal',
+        global_rescue_default,
+    )) and bool(include_materials)
     rescue_materials = bool(cfg.get('rescueMaterialsUnderRoot', False)) and bool(include_materials)
 
     def _root_of(tpid: int) -> int:
         return transform_root(tpid, bundle.transforms)
 
+    def _transform_origin(tpid: int) -> np.ndarray:
+        wm = world_matrix(tpid, bundle.transforms, world_cache)
+        wm = _FLIP_X @ wm @ _FLIP_X
+        origin = (wm @ np.array([0.0, 0.0, 0.0, 1.0]))[:3] * scale
+        if rotation_matrix is not None:
+            origin = origin @ rotation_matrix.T
+        return origin
+
+    def _transform_forward(tpid: int) -> np.ndarray:
+        wm = world_matrix(tpid, bundle.transforms, world_cache)
+        wm = _FLIP_X @ wm @ _FLIP_X
+        forward = (wm @ np.array([0.0, 0.0, 1.0, 0.0]))[:3]
+        n = float(np.linalg.norm(forward))
+        if n < 1e-9:
+            forward = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            forward = forward / n
+        if rotation_matrix is not None:
+            forward = forward @ rotation_matrix.T
+        return forward
+
     def _has_glass_mat(pids) -> bool:
         return any(bundle.materials.get(pid, {}).get('alpha', 1.0) < glass_alpha_max
                    for pid in pids)
 
+    def _mat_names_for_pids(pids) -> tuple[str, ...]:
+        return tuple(bundle.materials.get(pid, {}).get('name', '') for pid in pids)
+
+    def _is_nozzle_mesh(name: str, pids) -> bool:
+        return is_nozzle_mesh(name, _mat_names_for_pids(pids), tca)
+
+    def _is_glass_mesh(name: str, pids) -> bool:
+        if is_glass_part(name, tca):
+            return True
+        if _has_glass_mat(pids):
+            return True
+        for pid in pids:
+            cls = classify_material(
+                bundle.materials.get(pid, {}).get('name', ''), tca)
+            if cls is not None and cls.palette_category == GLASS_CATEGORY:
+                return True
+        return False
+
+    def _is_cockpit_mesh(name: str) -> bool:
+        return is_cockpit_part(name, tca)
+
     matched_roots: set[int] = set()
-    if rescue_glass:
+    plane_bounds: tuple[np.ndarray, np.ndarray] | None = None
+    if include_materials and (rescue_glass or rescue_nozzle or rescue_materials
+                              or rescue_cockpit):
+        livery_mins = None
+        livery_maxs = None
         for o in bundle.env.objects:
             if o.type.name != 'GameObject':
                 continue
@@ -1762,10 +1816,49 @@ def import_mod(cfg: dict) -> int:
                 elif co.type.name == 'MeshRenderer':
                     tt = co.read_typetree()
                     mat_pids = [m['m_PathID'] for m in tt.get('m_Materials', [])]
-            if tpid is not None and any(
+            if tpid is None:
+                continue
+            if not any(
                     bundle.materials.get(pid, {}).get('name', '') in include_materials
                     for pid in mat_pids):
-                matched_roots.add(_root_of(tpid))
+                continue
+            matched_roots.add(_root_of(tpid))
+            origin = _transform_origin(tpid)
+            if livery_mins is None:
+                livery_mins = origin.copy()
+                livery_maxs = origin.copy()
+            else:
+                livery_mins = np.minimum(livery_mins, origin)
+                livery_maxs = np.maximum(livery_maxs, origin)
+        if livery_mins is not None:
+            plane_bounds = (livery_mins, livery_maxs)
+
+    def _near_plane_bounds(transform_pid: int) -> bool:
+        if plane_bounds is None:
+            return False
+        lo, hi = plane_bounds
+        return point_in_expanded_bounds(_transform_origin(transform_pid), lo, hi)
+
+    def _nozzle_rescued(name: str, pids, transform_pid: int) -> bool:
+        if not rescue_nozzle or not _is_nozzle_mesh(name, pids):
+            return False
+        if _root_of(transform_pid) in matched_roots:
+            return True
+        return rescue_nozzle_global and _near_plane_bounds(transform_pid)
+
+    def _glass_rescued(name: str, pids, transform_pid: int) -> bool:
+        if not rescue_glass or not _is_glass_mesh(name, pids):
+            return False
+        if _root_of(transform_pid) in matched_roots:
+            return True
+        return rescue_glass_global and _near_plane_bounds(transform_pid)
+
+    def _cockpit_rescued(name: str, transform_pid: int) -> bool:
+        if not rescue_cockpit or not _is_cockpit_mesh(name):
+            return False
+        if _root_of(transform_pid) in matched_roots:
+            return True
+        return rescue_cockpit_global and _near_plane_bounds(transform_pid)
 
     processed: list[dict] = []
     ground_contact_y = None
@@ -1808,10 +1901,17 @@ def import_mod(cfg: dict) -> int:
         same_root = _root_of(transform_pid) in matched_roots
         rescued = (
             not has_livery
-            and same_root
             and (
-                (rescue_glass and _has_glass_mat(mat_pids))
-                or rescue_materials
+                _nozzle_rescued(name, mat_pids, transform_pid)
+                or _glass_rescued(name, mat_pids, transform_pid)
+                or _cockpit_rescued(name, transform_pid)
+                or (
+                    same_root
+                    and (
+                        (rescue_glass and _is_glass_mesh(name, mat_pids))
+                        or rescue_materials
+                    )
+                )
             )
         )
         if include_materials and not has_livery and not rescued:
@@ -1821,9 +1921,10 @@ def import_mod(cfg: dict) -> int:
                for pid in mat_pids):
             continue
         if dedupe_parts:
-            if name in seen_names:
+            dedupe_key = (name, _root_of(transform_pid))
+            if dedupe_key in seen_names:
                 continue
-            seen_names.add(name)
+            seen_names.add(dedupe_key)
 
         verts, uvs, sub_faces, sub_face_t = mesh_geometry(mesh, mat_pids)
         if len(verts) == 0 or not sub_faces:
@@ -1884,18 +1985,7 @@ def import_mod(cfg: dict) -> int:
             v = np.vstack(tris)
             f = np.arange(len(v), dtype=np.int64).reshape(-1, 3)
             m = trimesh.Trimesh(vertices=v, faces=f, process=False)
-            # Degenerate (zero-area) faces yield zero-length normals that trimesh
-            # normalises to NaN. Those NaNs land in the NORMAL accessor's min/max,
-            # and Python's json.dump happily writes the literal `NaN` -- which is
-            # invalid JSON, so the browser's JSON.parse (and thus GLTFLoader)
-            # rejects the entire file and the mesh silently fails to load. Replace
-            # any non-finite normal with a safe up-vector before export.
-            n = np.asarray(m.vertex_normals, dtype=np.float64)
-            bad = ~np.isfinite(n).all(axis=1)
-            if bad.any():
-                n = n.copy()
-                n[bad] = (0.0, 1.0, 0.0)
-                m.vertex_normals = n
+            _set_flat_normals(m)
             m.visual = trimesh.visual.TextureVisuals(
                 material=trimesh.visual.material.PBRMaterial(name=key))
             scene.add_geometry(m, node_name=f'0_{idx}_{key}', geom_name=f'{idx}_{key}')
@@ -2030,12 +2120,7 @@ def import_mod(cfg: dict) -> int:
                 v = np.vstack(tris)
                 f = np.arange(len(v), dtype=np.int64).reshape(-1, 3)
                 mesh = trimesh.Trimesh(vertices=v, faces=f, process=False)
-                nrm = np.asarray(mesh.vertex_normals, dtype=np.float64)
-                bad = ~np.isfinite(nrm).all(axis=1)
-                if bad.any():
-                    nrm = nrm.copy()
-                    nrm[bad] = (0.0, 1.0, 0.0)
-                    mesh.vertex_normals = nrm
+                _set_flat_normals(mesh)
                 mesh.visual = trimesh.visual.TextureVisuals(
                     material=trimesh.visual.material.PBRMaterial(name=key))
                 # Keep the colour token in the node name so _write_gltf can bind
@@ -2076,7 +2161,7 @@ def import_mod(cfg: dict) -> int:
         v = np.vstack(tris)
         f = np.arange(len(v), dtype=np.int64).reshape(-1, 3)
         m = trimesh.Trimesh(vertices=v, faces=f, process=False)
-        m.vertex_normals = np.tile([0.0, 1.0, 0.0], (len(v), 1))
+        _set_flat_normals(m)
         m.visual = trimesh.visual.TextureVisuals(
             material=trimesh.visual.material.PBRMaterial(name=SHADOW_MATERIAL))
         scene = trimesh.Scene()
@@ -2142,8 +2227,8 @@ def import_mod(cfg: dict) -> int:
                 *sorted(aircraft_roots),
             ],
         )
-        from_json = surface_defs_from_animated_parts(animated_parts, available)
-        from_names = auto_surface_defs(available)
+        from_json = surface_defs_from_animated_parts(animated_parts, available, tca)
+        from_names = auto_surface_defs(available, tca)
         surface_defs = merge_surface_defs(from_json, from_names)
         if surface_defs:
             brakes = sum(1 for s in surface_defs if s.get('control') == 'airbrake')
@@ -2153,7 +2238,7 @@ def import_mod(cfg: dict) -> int:
     if not gear_names and flyable.get('autoGear', True) is not False:
         _, _, full_paths_for_gear = build_transform_path_index(bundle)
         detected_gear = auto_gear_names_from_clip(
-            available, gear_clip, processed, full_paths_for_gear)
+            available, gear_clip, processed, full_paths_for_gear, tca)
         if detected_gear:
             gear_names = detected_gear
             print(f'Auto-detected {len(gear_names)} gear/door part(s)')
@@ -2236,7 +2321,7 @@ def import_mod(cfg: dict) -> int:
                 print(f'WARNING: hingePart "{hinge_part}" for surface "{role}" not found; '
                       'falling back to geometry pivot.')
         elif sd.get('autoHinge', True) and sd.get('parts'):
-            bone_prefix = cfg.get('hingeBonePrefix', 'B')
+            bone_prefix = cfg.get('hingeBonePrefix', tca.hinge_bone_prefix)
             hinge_part = bone_prefix + sd['parts'][0]
             hinge_frame = hinge_frame_from_part(
                 bundle, hinge_part, world_cache, scale, ground_offset_y,
@@ -2378,7 +2463,23 @@ def import_mod(cfg: dict) -> int:
         groups = {i: [c] for i, c in enumerate(clusters)}
         return _points_from_groups(groups)
 
-    def nozzle_exhaust_points(parts, translate) -> tuple[list, float | None]:
+    def _part_on_plane(p: dict) -> bool:
+        if not include_materials or not matched_roots:
+            return True
+        tpid = p.get('tpid')
+        if tpid is None:
+            return True
+        return _root_of(tpid) in matched_roots
+
+    def _has_livery_submat(p: dict) -> bool:
+        if not include_materials:
+            return False
+        for sm in p.get('sub_mats') or []:
+            if sm and sm.get('name', '') in include_materials:
+                return True
+        return False
+
+    def nozzle_exhaust_points(parts, translate) -> tuple[list, float | None, str | None]:
         """Afterburner exhaust-cone origins (+ representative radius) in the body's
         aircraft-local frame, so the sim can auto-place throttle-driven plumes.
 
@@ -2386,30 +2487,40 @@ def import_mod(cfg: dict) -> int:
         own engine/exhaust parts by name (robust for multi-plane bundles whose
         shared nozzle meshes are pooled under another root); (3) an aft-slab
         geometric estimate. Same frame as the emitted body (ground_translate)."""
-        offset = [p.copy() for p in parts]
+        offset = [p.copy() for p in parts if _part_on_plane(p)]
         for p in offset:
             p['world_v'] = p['world_v'] + translate
 
         nozzle_groups: dict[str, list] = {}
-        engine_groups: dict[str, list] = {}
+        engine_livery: dict[str, list] = {}
+        engine_other: dict[str, list] = {}
         for p in offset:
-            if is_nozzle(p['name'], None) or any(is_nozzle(p['name'], sm) for sm in p['sub_mats']):
+            sub_mats = p.get('sub_mats') or []
+            if is_nozzle(p['name'], None) or any(is_nozzle(p['name'], sm) for sm in sub_mats):
                 nozzle_groups.setdefault(p['name'], []).append(p['world_v'])
-            elif any(tok in p['name'] for tok in _ENGINE_PART_NAME_PARTS):
-                engine_groups.setdefault(p['name'], []).append(p['world_v'])
+            elif is_engine_part(p['name'], tca):
+                bucket = engine_livery if _has_livery_submat(p) else engine_other
+                bucket.setdefault(p['name'], []).append(p['world_v'])
 
-        for source in (nozzle_groups, engine_groups):
+        for label, source in (
+            ('nozzle-interior', nozzle_groups),
+            ('engine-part', engine_livery),
+            ('engine-part', engine_other),
+        ):
             if source:
                 points, radii = _points_from_groups(source)
                 points, radii = _consolidate_nozzles(points, radii)
                 if points:
                     radius = float(np.median(radii)) if radii else None
-                    return points, radius
+                    return points, radius, label
 
-        points, radii = _derive_from_body(parts, translate)
+        scoped = [p for p in parts if _part_on_plane(p)]
+        points, radii = _derive_from_body(scoped, translate)
         points, radii = _consolidate_nozzles(points, radii)
         radius = float(np.median(radii)) if radii else None
-        return points, radius
+        if points:
+            return points, radius, 'body-slab'
+        return [], None, None
 
     def wingtip_trail_origins(parts, translate) -> list | None:
         """Wingtip vortex trail origins at the outermost lateral body vertices."""
@@ -2443,15 +2554,58 @@ def import_mod(cfg: dict) -> int:
             [round(-outward, 4), round(float(ref[1]), 4), round(float(ref[2]), 4)],
         ]
 
+    attachments: list[dict] = []
+    gt = np.asarray(ground_translate)
+    for o in bundle.env.objects:
+        if o.type.name != 'GameObject':
+            continue
+        go = o.read()
+        name = go.m_Name
+        if not is_attachment_empty(name, tca):
+            continue
+        tpid = None
+        has_mesh = False
+        for comp in go.m_Component:
+            co = bundle.by_path.get(comp.component.path_id)
+            if co is None:
+                continue
+            if co.type.name == 'Transform':
+                tpid = comp.component.path_id
+            elif co.type.name == 'MeshFilter':
+                has_mesh = True
+        if tpid is None or has_mesh:
+            continue
+        if include_materials and matched_roots and _root_of(tpid) not in matched_roots:
+            if not _near_plane_bounds(tpid):
+                continue
+        pos = _transform_origin(tpid) + gt
+        fwd = _transform_forward(tpid)
+        attachments.append({
+            'name': name,
+            'position': [round(float(pos[i]), 4) for i in range(3)],
+            'forward': [round(float(fwd[i]), 4) for i in range(3)],
+        })
+    if attachments:
+        print(f'Attachment empties: {len(attachments)}')
+
+    cockpit_offset = list(flyable.get('cockpitOffset', [0.0, 1.0, 4.0]))
+    for att in attachments:
+        ln = att['name'].lower()
+        if any(tok in ln for tok in ('pilot', 'cockpitcam', 'cockpit_cam', 'viewpoint')):
+            cockpit_offset = att['position']
+            print(f'Cockpit offset from {att["name"]}: {cockpit_offset}')
+            break
+
     fx = dict(flyable.get('fx') or {})
     if fx.get('nozzles') is None:
-        auto_nozzles, auto_radius = nozzle_exhaust_points(
+        auto_nozzles, auto_radius, nozzle_src = nozzle_exhaust_points(
             body_parts, np.asarray(ground_translate))
         if auto_nozzles:
             fx['nozzles'] = auto_nozzles
             if auto_radius is not None and fx.get('nozzleRadius') is None:
                 fx['nozzleRadius'] = round(max(0.15, min(auto_radius, 1.5)), 4)
-            print(f'Afterburner nozzles: {auto_nozzles} (r={fx.get("nozzleRadius")})')
+            print(f'Afterburner nozzles ({nozzle_src}): {auto_nozzles} '
+                  f'(r={fx.get("nozzleRadius")})')
         else:
             fx.setdefault('nozzles', None)
     fx.setdefault('nozzles', None)
@@ -2505,7 +2659,8 @@ def import_mod(cfg: dict) -> int:
         'static': static_manifest,
         'surfaces': surfaces_manifest,
         'fx': fx,
-        'cockpitOffset': flyable.get('cockpitOffset', [0.0, 1.0, 4.0]),
+        'attachments': attachments or None,
+        'cockpitOffset': cockpit_offset,
         'spawn': flyable.get('spawn', {}),
         'groundOffsetY': round(float(ground_offset_y), 4),
         'groundRestHeightM': round(float(ground_rest_height_m), 4),
@@ -2700,9 +2855,41 @@ def load_config(path: str) -> dict:
         return json.load(f)
 
 
+def import_batch(batch_path: str) -> int:
+    """Import multiple aircraft configs in one process, loading each bundle once."""
+    with open(batch_path, encoding='utf-8') as f:
+        data = json.load(f)
+    configs = data if isinstance(data, list) else data.get('configs', [])
+    if not configs:
+        raise SystemExit('batch file has no configs')
+
+    bundles: dict[str, Bundle] = {}
+    rc = 0
+    for i, cfg in enumerate(configs):
+        bundle_path = cfg.get('bundle')
+        if not bundle_path:
+            print(f'ERROR: config[{i}] missing bundle', file=sys.stderr)
+            rc = 1
+            continue
+        label = cfg.get('displayName') or cfg.get('name') or cfg.get('id') or str(i + 1)
+        print(f'Importing {i + 1}/{len(configs)}: {label}', file=sys.stderr, flush=True)
+        key = os.path.abspath(bundle_path)
+        if key not in bundles:
+            print(f'Loading bundle ({len(bundles) + 1}) from {os.path.basename(bundle_path)}',
+                  file=sys.stderr)
+            bundles[key] = Bundle(bundle_path)
+        try:
+            import_mod(cfg, bundle=bundles[key])
+        except SystemExit as exc:
+            print(f'ERROR importing config[{i}]: {exc}', file=sys.stderr)
+            rc = 1
+    return rc
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='Import a Unity asset-bundle mod into a retroflightsim glTF.')
     ap.add_argument('--config', help='JSON config file (see tools/mods/mod.json).')
+    ap.add_argument('--batch', help='JSON file with a "configs" array for multi-plane import.')
     ap.add_argument('--bundle', help='Path to a mod .zip, a Unity asset bundle file, or a folder.')
     ap.add_argument('--out', help='Output .gltf path (relative to project root).')
     ap.add_argument('--ground', type=float, help='Distance from origin to ground (default 2.0).')
@@ -2713,6 +2900,9 @@ def main(argv=None) -> int:
     ap.add_argument('--discover', action='store_true',
                     help='List distinct aircraft liveries (JSON) and exit.')
     args = ap.parse_args(argv)
+
+    if args.batch:
+        return import_batch(args.batch)
 
     cfg: dict = load_config(args.config) if args.config else {}
     if args.bundle:

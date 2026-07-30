@@ -166,12 +166,21 @@ def main() -> int:
     ap = argparse.ArgumentParser(description='Pack flyable aircraft mods for dist.')
     ap.add_argument('--imports-only', action='store_true',
                     help='Only pack manifests under tools/mods/imports/.')
+    ap.add_argument('--only', nargs='*', metavar='MOD_ID',
+                    help='Only pack manifests with these mod ids.')
     args = ap.parse_args()
 
     if args.imports_only:
         manifests = sorted(IMPORTS_DIR.glob('*.aircraft.json')) if IMPORTS_DIR.exists() else []
     else:
         manifests = find_manifests()
+
+    if args.only:
+        only = set(args.only)
+        manifests = [
+            manifest_path for manifest_path in manifests
+            if manifest_path.name[:-len('.aircraft.json')] in only
+        ]
 
     if not manifests:
         print('No aircraft manifests found')

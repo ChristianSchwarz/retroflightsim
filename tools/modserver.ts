@@ -29,6 +29,13 @@ interface ImportConfig {
     includeMaterials?: string[];
     dedupeParts?: boolean;
     rescueGlassUnderRoot?: boolean;
+    rescueGlassGlobal?: boolean;
+    rescueCockpit?: boolean;
+    rescueNozzleUnderRoot?: boolean;
+    rescueNozzleGlobal?: boolean;
+    rescueMaterialsUnderRoot?: boolean;
+    skipClutter?: boolean;
+    bitmapLivery?: boolean;
     grayscale?: boolean | { lo: number; hi: number };
     flyable?: Record<string, unknown>;
     [key: string]: unknown;
@@ -47,6 +54,9 @@ interface CatalogAircraft {
     category?: string;
     description?: string;
     modelPath?: string;
+    spawnOffset?: number;
+    spawnRotation?: number;
+    dotColors?: [number, number, number];
 }
 
 interface ModCatalog {
@@ -65,6 +75,9 @@ interface PlaneImportPlan {
     description?: string;
     sourceMaterial?: string;
     confidence?: number;
+    spawnOffset?: number;
+    spawnRotation?: number;
+    dotColors?: [number, number, number];
 }
 
 interface ImportedAircraft {
@@ -123,9 +136,12 @@ function manifestPathForId(id: string): string | null {
     return null;
 }
 
-function findEmbeddedConfig(zipBuffer: Buffer): Partial<ImportConfig> | null {
+function unzipModBuffer(zipBuffer: Buffer): Record<string, Uint8Array> {
+    return unzipSync(new Uint8Array(zipBuffer));
+}
+
+function findEmbeddedConfig(files: Record<string, Uint8Array>): Partial<ImportConfig> | null {
     try {
-        const files = unzipSync(new Uint8Array(zipBuffer));
         for (const entry of Object.keys(files)) {
             if (path.basename(entry).toLowerCase() === 'retroflight.json') {
                 const text = Buffer.from(files[entry]).toString('utf-8');
@@ -187,9 +203,8 @@ function zipEntryByName(files: Record<string, Uint8Array>, matcher: (normalized:
     return null;
 }
 
-function extractModCatalog(zipBuffer: Buffer): ModCatalog | null {
+function extractModCatalog(files: Record<string, Uint8Array>): ModCatalog | null {
     try {
-        const files = unzipSync(new Uint8Array(zipBuffer));
         const modEntry = zipEntryByName(files, name => name.endsWith('/mod.json') || name === 'mod.json');
         const flyablesEntry = zipEntryByName(files, name => name.endsWith('/data/flyables.json'));
         if (!flyablesEntry) return null;
@@ -240,7 +255,22 @@ function extractModCatalog(zipBuffer: Buffer): ModCatalog | null {
                 || (typeof a2?.TargetType === 'string' ? a2.TargetType : undefined);
             const description = (typeof db?.Description === 'string' ? db.Description : undefined);
             const modelPath = (typeof a2?.ModelPath === 'string' ? a2.ModelPath : undefined);
-            aircraft.push({ canonicalName, displayName, category, description, modelPath });
+            const spawnOffset = typeof a2?.SpawnOffset === 'number' ? a2.SpawnOffset : undefined;
+            const spawnRotation = typeof a2?.SpawnRotation === 'number' ? a2.SpawnRotation : undefined;
+            const dotRaw = a2?.DotColors;
+            const dotColors = Array.isArray(dotRaw) && dotRaw.length >= 3
+                ? [Number(dotRaw[0]), Number(dotRaw[1]), Number(dotRaw[2])] as [number, number, number]
+                : undefined;
+            aircraft.push({
+                canonicalName,
+                displayName,
+                category,
+                description,
+                modelPath,
+                spawnOffset,
+                spawnRotation,
+                dotColors,
+            });
         }
 
         if (!aircraft.length) return null;
@@ -358,6 +388,9 @@ function buildPlanesFromCatalog(
             description: aircraft.description,
             sourceMaterial: plane.material,
             confidence: Number((Math.min(1, score / 12)).toFixed(3)),
+            spawnOffset: aircraft.spawnOffset,
+            spawnRotation: aircraft.spawnRotation,
+            dotColors: aircraft.dotColors,
         });
     }
     return plans;
@@ -399,6 +432,20 @@ async function discoverPlanes(bundlePath: string): Promise<DiscoveredPlane[]> {
     }
 }
 
+function buildSpawnFromPlan(plane: PlaneImportPlan): Record<string, unknown> | undefined {
+    const spawn: Record<string, unknown> = {};
+    if (plane.spawnOffset !== undefined) {
+        spawn.offset = plane.spawnOffset;
+    }
+    if (plane.spawnRotation !== undefined) {
+        spawn.rotation = plane.spawnRotation;
+    }
+    if (plane.dotColors !== undefined) {
+        spawn.dotColors = plane.dotColors;
+    }
+    return Object.keys(spawn).length > 0 ? spawn : undefined;
+}
+
 function buildPlaneConfig(
     bundlePath: string,
     plane: PlaneImportPlan,
@@ -406,6 +453,7 @@ function buildPlaneConfig(
     catalog: ModCatalog | null,
 ): ImportConfig {
     const multiPlane = plane.material !== null;
+    const collectionPack = (catalog?.aircraft.length ?? 0) > 5;
     const base: ImportConfig = embedded
         ? { ...embedded, bundle: bundlePath }
         : {
@@ -413,10 +461,20 @@ function buildPlaneConfig(
             groundDistance: 2.0,
             scale: 1.0,
             swatchMax: 64,
+            bitmapLivery: true,
             glassColor: 'GLASS',
             glassAutoAlpha: true,
             skipMaterials: ['Collider', 'ShadowDepthOffset', 'Shadow'],
         };
+
+    const catalogSpawn = buildSpawnFromPlan(plane);
+    const flyable: Record<string, unknown> = {
+        ...(base.flyable ?? {}),
+        outPrefix: `${IMPORTS_PREFIX}/${plane.modId}`,
+    };
+    if (catalogSpawn) {
+        flyable.spawn = { ...((base.flyable?.spawn as Record<string, unknown>) ?? {}), ...catalogSpawn };
+    }
 
     return {
         ...base,
@@ -435,11 +493,19 @@ function buildPlaneConfig(
         },
         bundle: bundlePath,
         out: `${IMPORTS_PREFIX}/${plane.modId}_static.gltf`,
-        flyable: { ...(base.flyable ?? {}), outPrefix: `${IMPORTS_PREFIX}/${plane.modId}` },
+        flyable,
         ...(multiPlane ? {
+            collectionPack,
             includeMaterials: [plane.material!],
             dedupeParts: true,
+            skipClutter: false,
+            bitmapLivery: true,
             rescueGlassUnderRoot: true,
+            rescueGlassGlobal: !collectionPack,
+            rescueCockpit: true,
+            rescueCockpitGlobal: !collectionPack,
+            rescueNozzleUnderRoot: true,
+            rescueNozzleGlobal: !collectionPack,
             rescueMaterialsUnderRoot: true,
         } : {}),
     };
@@ -483,11 +549,16 @@ function listAircraftPacks(): ImportedAircraft[] {
     return [...deduped.values()].map(v => v.entry).sort((a, b) => a.name.localeCompare(b.name));
 }
 
-async function importPlaneConfig(configPath: string, log: string[]): Promise<void> {
-    const imp = await runPython(['tools/import_mod.py', '--config', configPath]);
-    log.push(`$ python tools/import_mod.py --config ${path.basename(configPath)}\n${imp.stdout}${imp.stderr}`);
+async function importPlaneConfigsBatch(
+    configs: ImportConfig[],
+    batchPath: string,
+    log: string[],
+): Promise<void> {
+    fs.writeFileSync(batchPath, JSON.stringify({ configs }, null, 2));
+    const imp = await runPython(['tools/import_mod.py', '--batch', batchPath]);
+    log.push(`$ python tools/import_mod.py --batch ${path.basename(batchPath)}\n${imp.stdout}${imp.stderr}`);
     if (imp.code !== 0) {
-        throw new Error('import_mod.py failed');
+        throw new Error('import_mod.py batch failed');
     }
 }
 
@@ -597,8 +668,9 @@ app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Resp
     const zipPath = path.join(UPLOADS_DIR, `${baseSlug}-${stamp}.zip`);
     fs.writeFileSync(zipPath, req.file.buffer);
 
-    const embedded = findEmbeddedConfig(req.file.buffer);
-    const catalog = extractModCatalog(req.file.buffer);
+    const zipFiles = unzipModBuffer(req.file.buffer);
+    const embedded = findEmbeddedConfig(zipFiles);
+    const catalog = extractModCatalog(zipFiles);
     const log: string[] = [];
     const imported: ImportedAircraft[] = [];
 
@@ -622,6 +694,9 @@ app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Resp
                 log.push(`[catalog] ${catalog.aircraft.length} aircraft entries from mod metadata`);
             }
             planes = buildPlanesFromCatalog(discovered, catalog, baseSlug);
+            if (planes.length > 1) {
+                log.push(`[import] ${planes.length} aircraft queued (collection import)`);
+            }
             if (planes.length === 0) {
                 // Fallback: still allow import if matching fails.
                 planes = [{
@@ -635,15 +710,17 @@ app.post('/api/import-mod', upload.single('mod'), async (req: Request, res: Resp
             }
         }
 
-        const importJobs = planes.map((plane) => {
-            const config = buildPlaneConfig(zipPath, plane, embedded, catalog);
-            const configPath = path.join(UPLOADS_DIR, `${plane.modId}-${stamp}.config.json`);
-            fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-            return importPlaneConfig(configPath, log);
-        });
-        await Promise.all(importJobs);
+        const configs = planes.map((plane) => buildPlaneConfig(zipPath, plane, embedded, catalog));
+        const batchPath = path.join(UPLOADS_DIR, `${baseSlug}-${stamp}.batch.json`);
+        await importPlaneConfigsBatch(configs, batchPath, log);
 
-        const pack = await runPython(['tools/pack_aircraft_mods.py', '--imports-only']);
+        const modIds = planes.map((plane) => plane.modId);
+        const pack = await runPython([
+            'tools/pack_aircraft_mods.py',
+            '--imports-only',
+            '--only',
+            ...modIds,
+        ]);
         log.push(`\n$ python tools/pack_aircraft_mods.py\n${pack.stdout}${pack.stderr}`);
         if (pack.code !== 0) {
             return res.status(500).json({ ok: false, error: 'pack_aircraft_mods.py failed', log: log.join('\n') });

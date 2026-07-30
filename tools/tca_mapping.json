@@ -1,0 +1,411 @@
+{
+  "$schema": "Canonical Tiny Combat Arena naming conventions for tools/import_mod.py. See docs/tca-aircraft-mods.md.",
+  "sharedMaterials": {
+    "Canopy": { "paletteCategory": "GLASS" },
+    "Glass": { "paletteCategory": "GLASS" },
+    "Glass HUD": { "paletteCategory": "GLASS" },
+    "CanopyGlass": { "paletteCategory": "GLASS" },
+    "Windscreen": { "paletteCategory": "GLASS" },
+    "CanopyBack": { "paletteCategory": "GLASS" },
+    "ColliderMat": { "action": "skip" },
+    "Collider": { "action": "skip" },
+    "ShadowDepthOffset": { "action": "skip" },
+    "ShadowHeightOffset": { "action": "skip" },
+    "Shadow": { "action": "skip" },
+    "NozzleInteriorMat": { "paletteCategory": "FX_FIRE" },
+    "NozzleInterior": { "paletteCategory": "FX_FIRE" }
+  },
+  "partCategories": {
+    "glass": {
+      "exact": ["Canopy"],
+      "substring": [
+        "CanopyGlass",
+        "CanopyFront",
+        "CanopyBack",
+        "CanopySide",
+        "Windscreen",
+        "CanopyEject"
+      ],
+      "excludeSubstring": ["CanopyFrame"]
+    },
+    "nozzle": {
+      "exact": ["Nozzle"],
+      "substring": [
+        "NozzleInterior",
+        "NozzleInner",
+        "NozzleInt",
+        "NozzleInside",
+        "NozzleIn",
+        "NozzleL",
+        "NozzleR",
+        "NozzleLeft",
+        "NozzleRight",
+        "Nozzle1",
+        "Nozzle2",
+        "AfterburnerInterior",
+        "AfterburnerInner",
+        "BurnerInterior",
+        "BurnerInner",
+        "ABInterior",
+        "ABInner"
+      ]
+    },
+    "engine": {
+      "substring": [
+        "Engine",
+        "Nozzle",
+        "Exhaust",
+        "Burner",
+        "Jetpipe",
+        "Tailpipe",
+        "Afterburner",
+        "TailInner"
+      ],
+      "excludeSubstring": ["Tail"]
+    },
+    "skip": {
+      "substring": ["Collider", "Shadow"]
+    },
+    "discoverSkip": {
+      "substring": [
+        "Collider",
+        "Shadow",
+        "Stick",
+        "Gauge",
+        "Needle",
+        "Pylon",
+        "Weapon",
+        "Cockpit",
+        "Seat",
+        "Mirror",
+        "Empty",
+        "FX",
+        "Light",
+        "Bolt",
+        "AIM",
+        "Gun",
+        "Tank",
+        "Launcher"
+      ]
+    },
+    "importClutterSkip": {
+      "substring": [
+        "Stick",
+        "Gauge",
+        "Needle",
+        "Pylon",
+        "Weapon",
+        "Mirror",
+        "FX",
+        "Light",
+        "Bolt",
+        "AIM",
+        "Gun",
+        "Tank",
+        "Launcher",
+        "Missile",
+        "Bomb",
+        "Rocket",
+        "Pod"
+      ]
+    },
+    "cockpit": {
+      "substring": [
+        "Cockpit",
+        "CockpitInterior",
+        "Instrument",
+        "Instruments",
+        "Console",
+        "Dashboard",
+        "HUDMount"
+      ],
+      "excludeSubstring": ["Canopy"]
+    },
+    "attachmentEmpty": {
+      "substring": [
+        "Pylon",
+        "Hardpoint",
+        "Loadout",
+        "WeaponPoint",
+        "WeaponMount",
+        "WeaponStation",
+        "Station",
+        "Rack",
+        "Pilot",
+        "CockpitCam",
+        "Camera",
+        "WingTrail",
+        "EngineFX",
+        "EngineEffect",
+        "Trail"
+      ],
+      "exact": ["Empty"]
+    },
+    "bodyHint": {
+      "substring": [
+        "Fuselage",
+        "Wing",
+        "Nose",
+        "Elevator",
+        "Rudder",
+        "Aileron",
+        "Tail",
+        "Fin",
+        "Stabilizer",
+        "Slat",
+        "Flap",
+        "Intake",
+        "Nozzle",
+        "SpeedBrake",
+        "Body",
+        "Hull"
+      ]
+    },
+    "fuselage": {
+      "substring": ["Fuselage"],
+      "exact": ["Body", "Hull", "Fuse"]
+    },
+    "gear": {
+      "exact": [
+        "GearNoseWheel",
+        "GearMainWheelL",
+        "GearMainWheelR",
+        "GearNoseStrut",
+        "GearMainStrutL",
+        "GearMainStrutR",
+        "GearNoseBase",
+        "GearNoseBase2",
+        "GearMainBaseL",
+        "GearMainBaseR",
+        "GearDoorFront",
+        "GearDoorL",
+        "GearDoorR",
+        "GearNoseDoor",
+        "GearLSupport1",
+        "GearLSupport2",
+        "GearRSupport1",
+        "GearRSupport2",
+        "GearNoseSupport",
+        "GearNoseSupporter1",
+        "GearNoseSupporter2",
+        "GearDoorFront1",
+        "GearDoorFront2",
+        "GearDoorFrontL",
+        "GearDoorFrontR",
+        "GearDoorL1",
+        "GearDoorL2",
+        "GearDoorR1",
+        "GearDoorR2",
+        "GearDoorLE",
+        "GearDoorRE",
+        "GearDoorNoseL",
+        "GearDoorNoseR",
+        "GearNoseDoor1",
+        "GearNoseDoorL",
+        "GearNoseDoorR",
+        "GearNoseDoorL1",
+        "GearNoseDoorL2",
+        "GearNoseDoorR1",
+        "GearNoseDoorR2",
+        "DoorEmpty1",
+        "FuselageDoor1",
+        "WLDoor1",
+        "WLDoor2",
+        "WRDoor1",
+        "WRDoor2",
+        "WingLDoor1",
+        "WingLDoor2",
+        "WingRDoor1",
+        "WingRDoor2"
+      ],
+      "prefix": [
+        "WLDoor",
+        "WRDoor",
+        "DoorEmpty",
+        "WingLDoor",
+        "WingRDoor",
+        "BGearDoor",
+        "BGearNoseDoor"
+      ],
+      "substringAll": [
+        ["door", "gear"],
+        ["geardoor"]
+      ],
+      "clipSkip": {
+        "exact": ["GearHandle", "GearLever", "GearLever1", "GearLever2"],
+        "substring": ["navlight"]
+      },
+      "mandatoryBones": [
+        "GearNoseBase",
+        "GearMainBaseL",
+        "GearMainBaseR"
+      ]
+    }
+  },
+  "surfaceRules": [
+    {
+      "partNames": ["ElevatorLeft", "ElevatorL"],
+      "role": "elevatorLeft",
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    },
+    {
+      "partNames": ["ElevatorRight", "ElevatorR"],
+      "role": "elevatorRight",
+      "control": "pitch",
+      "sign": 1,
+      "rangeRad": 0.42
+    },
+    {
+      "partNames": ["AileronL", "AileronLeft"],
+      "role": "aileronLeft",
+      "control": "roll",
+      "sign": 1,
+      "rangeRad": 0.4
+    },
+    {
+      "partNames": ["AileronR", "AileronRight"],
+      "role": "aileronRight",
+      "control": "roll",
+      "sign": -1,
+      "rangeRad": 0.4
+    },
+    {
+      "partNames": ["FlapL", "FlapLeft"],
+      "role": "flapLeft",
+      "control": "flaps",
+      "sign": -1,
+      "rangeRad": 0.5
+    },
+    {
+      "partNames": ["FlapR", "FlapRight"],
+      "role": "flapRight",
+      "control": "flaps",
+      "sign": -1,
+      "rangeRad": 0.5
+    },
+    {
+      "partNames": ["SlatsL", "SlatL", "SlatLeft"],
+      "role": "slatLeft",
+      "control": "slats",
+      "sign": 1,
+      "rangeRad": 0.35
+    },
+    {
+      "partNames": ["SlatsR", "SlatR", "SlatRight"],
+      "role": "slatRight",
+      "control": "slats",
+      "sign": 1,
+      "rangeRad": 0.35
+    },
+    {
+      "partNames": [
+        "SpeedBrakeL",
+        "SpeedbrakeL",
+        "AirBrakeL",
+        "AirbrakeL",
+        "SpoilerL"
+      ],
+      "role": "speedbrakeLeft",
+      "control": "airbrake",
+      "sign": 1,
+      "rangeRad": 0.45
+    },
+    {
+      "partNames": [
+        "SpeedBrakeR",
+        "SpeedbrakeR",
+        "AirBrakeR",
+        "AirbrakeR",
+        "SpoilerR"
+      ],
+      "role": "speedbrakeRight",
+      "control": "airbrake",
+      "sign": 1,
+      "rangeRad": 0.45
+    },
+    {
+      "partNames": ["SpeedBrakeLL", "SpeedbrakeLL"],
+      "role": "speedbrakeLL",
+      "control": "airbrake",
+      "sign": 1,
+      "rangeRad": 0.45
+    },
+    {
+      "partNames": ["SpeedBrakeLR", "SpeedbrakeLR"],
+      "role": "speedbrakeLR",
+      "control": "airbrake",
+      "sign": 1,
+      "rangeRad": 0.45
+    },
+    {
+      "partNames": ["SpeedBrakeTL", "SpeedbrakeTL"],
+      "role": "speedbrakeTL",
+      "control": "airbrake",
+      "sign": 1,
+      "rangeRad": 0.45
+    },
+    {
+      "partNames": ["SpeedBrakeTR", "SpeedbrakeTR"],
+      "role": "speedbrakeTR",
+      "control": "airbrake",
+      "sign": 1,
+      "rangeRad": 0.45
+    },
+    {
+      "partNames": [
+        "SpeedBrakeT",
+        "SpeedbrakeT",
+        "SpeedBrakeS",
+        "SpeedbrakeS",
+        "SpeedBrake",
+        "Speedbrake",
+        "AirBrake",
+        "Airbrake",
+        "Spoiler"
+      ],
+      "role": "speedbrake",
+      "control": "airbrake",
+      "sign": 1,
+      "rangeRad": 0.55
+    }
+  ],
+  "rudderFallback": {
+    "partNames": ["Rudder", "RudderLeft", "RudderRight"],
+    "role": "rudder",
+    "control": "yaw",
+    "sign": 1,
+    "rangeRad": 0.45
+  },
+  "animatedPartFields": [
+    { "field": "AngleByBrake", "control": "airbrake" },
+    { "field": "FlapInfluence", "control": "flaps" },
+    { "field": "SlatInfluence", "control": "slats" },
+    { "field": "AngleBySlats", "control": "slats" },
+    { "field": "AngleByPitch", "control": "pitch" },
+    { "field": "AngleByRoll", "control": "roll" },
+    { "field": "AngleByYaw", "control": "yaw" }
+  ],
+  "liveryMaterialExclude": {
+    "skipMaterialSubstrings": ["Collider", "ShadowDepthOffset", "Shadow"],
+    "nameSubstringsLower": [
+      "glass",
+      "canopy",
+      "windscreen",
+      "collider"
+    ],
+    "weaponSubstringsLower": [
+      "missile",
+      "weapon",
+      "pylon",
+      "bomb",
+      "rocket",
+      "pod"
+    ]
+  },
+  "conventions": {
+    "hingeBonePrefix": "B",
+    "gearClipNameTokens": ["gearup", "gear"]
+  }
+}

@@ -12,7 +12,7 @@ normally maps to a `PaletteCategory`.
 Many low-poly mods work the same way in spirit: their entire livery (paint,
 national insignia, side numbers, red trim, warning triangles) is authored as
 flat polygon **"vector decals"** whose colours come from a tiny
-**palette-swatch texture** ù a 16x16 (or similar) image of solid colour cells,
+**palette-swatch texture** ÔøΩ a 16x16 (or similar) image of solid colour cells,
 where every triangle's UVs point at one cell.
 
 The importer recovers those real per-polygon colours by sampling the swatch
@@ -39,7 +39,7 @@ result. The Python requirements above must be installed for this to work.
 
 By default the in-app import uses a generic flyable config (no animated control
 surfaces, active flight model). **Multi-plane mod packs are split by Unity livery
-material** ù each aircraft becomes its own `.aircraft.pack` with its colours
+material** ÔøΩ each aircraft becomes its own `.aircraft.pack` with its colours
 preserved. To ship full fidelity for a single plane, drop a `retroflight.json`
 file (the same schema as `tools/mods/*.json`) inside the mod `.zip`; the server
 will use it, overriding only `bundle`/`out`/`outPrefix`.
@@ -59,7 +59,7 @@ automatically.
 
 ### 1. Inspect a mod
 
-Always look before importing ù this lists textures (flagging likely
+Always look before importing ÔøΩ this lists textures (flagging likely
 palette-swatch atlases), materials (texture / colour / alpha), and every mesh
 GameObject with its material(s):
 
@@ -99,7 +99,7 @@ The importer produces loose glTF files under `assets/` for editing and tests.
 At build time, `tools/pack_aircraft_mods.py` bundles each flyable mod into a
 single `dist/assets/{id}.aircraft.pack` file. Shipped mods keep
 their manifests under `assets/`; **F10 imports** stage loose glTF files under
-`tools/mods/imports/` until packing ù they are not written into `assets/`.
+`tools/mods/imports/` until packing ÔøΩ they are not written into `assets/`.
 
 To register a flyable mod, load its pack in `src/script/state/game.ts`:
 
@@ -125,6 +125,13 @@ Runs webpack and then `npm run pack-mods`. The deployable mod output is
 See `tools/mods/_template.json` for a copy-paste starting point. Only `bundle`
 and `out` are required.
 
+TCA part/material naming conventions (shared materials, control-surface fallbacks,
+gear meshes, glass/nozzle detection, livery discovery) live in
+[`tools/tca_mapping.json`](tca_mapping.json), derived from
+[`docs/tca-aircraft-mods.md`](../docs/tca-aircraft-mods.md). Per-import config
+keys such as `glassParts`, `nozzleParts`, and `skipNameParts` extend that base
+mapping at runtime rather than replacing it.
+
 | Field            | Meaning                                                              |
 | ---------------- | ------------------------------------------------------------------- |
 | `bundle`         | **(required)** Path to a mod `.zip`, a Unity asset-bundle file, or a folder. |
@@ -140,7 +147,8 @@ and `out` are required.
 | `glassParts`     | Part-name substrings always exported as glass.                      |
 | `glassAutoAlpha` | Auto-treat transparent materials as glass (default `true`).         |
 | `glassAlphaMax`  | Alpha below which a material counts as glass (default `0.9`).        |
-| `nozzleAuto`     | Auto-detect afterburner nozzle interiors and export them as the `FX_FIRE` PaletteCategory so the sim throttle-drives the glow (default `true`). Detected by the shared `NozzleInteriorMat` name or, when unresolved, mesh names (`NozzleInterior`, `AfterburnerInterior`, `BurnerInterior`). |
+| `nozzleAuto`     | Auto-detect afterburner nozzle interiors and export them as dark metal `#rrggbb` (default `#1a1a1a`, or the material's black rest `_Color`). Afterburner glow is procedural at `fx.nozzles`, not on the body mesh. Detected by `NozzleInteriorMat` or mesh-name fallbacks. |
+| `nozzleColor`    | Literal `#rrggbb` for nozzle-interior faces when the source material has no dark base colour. |
 | `nozzleParts`    | Extra part-name substrings to treat as nozzle interiors.            |
 | `nozzleMaterials`| Extra material-name substrings to treat as nozzle interiors.        |
 | `emissiveLights` | Export materials with a bright `_EmissionColor` over a dark base (e.g. nav/beacon lights) as their literal emissive colour instead of the flat `_Color` (default `true`). |
@@ -151,11 +159,16 @@ and `out` are required.
 | `skipExact`      | Part names dropped exactly.                                         |
 | `includeExact`   | Part names always kept even if they match a skip substring.         |
 | `skipNameParts`  | Part-name substrings to drop (gauges, weapons, colliders, ...).     |
+| `skipClutter`    | When `true`, skip weapon/pylon/gauge clutter from [`tca_mapping.json`](tca_mapping.json) `importClutterSkip`. Defaults to `false`; cockpit/canopy/attachment empties are kept. |
+| `bitmapLivery`   | When `true` (default), sample large livery bitmap textures at face UVs (downsampled to `bitmapSampleMax`, default 512). Without this, only palette swatches ? `swatchMax` are sampled. |
+| `rescueNozzleUnderRoot` | Multi-plane imports: re-admit nozzle-interior meshes under the same transform root as the livery even when their material differs. Defaults to `true` when `includeMaterials` is set. |
+| `rescueNozzleGlobal` | When `true` (default with `includeMaterials`), also re-admit off-root pooled nozzle meshes that lie near the livery hull bounds. |
+| `rescueGlassGlobal` | Same spatial rescue for canopy/glass parts (off-root pooled canopies). Defaults to `true` with `includeMaterials`. |
+| `rescueCockpit` | Re-admit cockpit-interior meshes (by name) under the livery root or near the hull. Defaults to `true` with `includeMaterials`. |
 
-With no include/skip lists, every mesh object is exported (minus
-`skipMaterials`). Narrow it down with `skipNameParts`/`skipExact` for interior
-or clutter parts, and use `includeExact` to rescue a part that a skip substring
-would otherwise catch.
+With `skipClutter` false (the F10 default for flyable imports), cockpit/canopy
+meshes export while weapons/pylons/gauges are still skipped when
+`skipClutter` is enabled. Narrow further with `skipNameParts` / `skipExact`.
 
 Mesh names containing `Collider` or `Shadow` are **always** skipped (in addition
 to `skipNameParts`). TCA's shared `ColliderMat`/`ShadowDepthOffset` materials are
