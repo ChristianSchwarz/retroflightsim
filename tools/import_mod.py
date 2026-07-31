@@ -1015,16 +1015,22 @@ def _renderer_material_names(bundle: Bundle, go):
 def discover_livery_materials(bundle_path: str, bundle: Bundle | None = None) -> list[dict]:
     """Find distinct flyable aircraft liveries in a multi-plane Unity bundle.
 
-    Multi-plane packs (e.g. Tiny Combat Arena collections) reuse the same mesh
-    part names across aircraft; only the Unity *material* (livery) differs.
-    Returns one entry per livery material, suitable for ``includeMaterials``.
+    Multi-plane packs reuse part names across aircraft; the Unity *material*
+    usually separates them. When one material is stamped onto multiple
+    unrelated airframe roots (different sizes), each span-cluster becomes its
+    own discover entry with ``transformRoot`` so imports stay unmerged.
     """
     if bundle is None:
         bundle = Bundle(bundle_path)
     tca = merge_config_overrides({})
-    body_parts: dict[str, set[str]] = defaultdict(set)
+    # mat -> root -> stats
+    root_body: dict[str, dict[int, set[str]]] = defaultdict(lambda: defaultdict(set))
+    root_hits: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    root_mins: dict[str, dict[int, np.ndarray]] = defaultdict(dict)
+    root_maxs: dict[str, dict[int, np.ndarray]] = defaultdict(dict)
+    root_all_mats: dict[int, set[str]] = defaultdict(set)
     fuselage_mats: set[str] = set()
-    mesh_hits: dict[str, int] = defaultdict(int)
+    world_cache: dict[int, np.ndarray] = {}
 
     for o in bundle.env.objects:
         if o.type.name != 'GameObject':
@@ -1035,55 +1041,188 @@ def discover_livery_materials(bundle_path: str, bundle: Bundle | None = None) ->
             continue
         mat_pids: list[int] = []
         has_mesh = False
+        tpid = None
+        mesh_filter = None
         for comp in go.m_Component:
             co = bundle.by_path.get(comp.component.path_id)
             if co is None:
                 continue
-            if co.type.name == 'MeshFilter':
+            if co.type.name == 'Transform':
+                tpid = comp.component.path_id
+            elif co.type.name == 'MeshFilter':
                 has_mesh = True
+                mesh_filter = bundle.mesh_filters.get(comp.component.path_id)
             elif co.type.name == 'MeshRenderer':
                 tt = co.read_typetree()
                 mat_pids = [m['m_PathID'] for m in tt.get('m_Materials', [])]
-        if not has_mesh or not mat_pids:
+        if not has_mesh or not mat_pids or tpid is None:
             continue
 
-        for pid in mat_pids:
-            mat = bundle.materials.get(pid)
-            if mat is None:
-                continue
-            mat_name = mat.get('name', '')
-            if not is_livery_material(mat_name, tca):
-                continue
-            if mat.get('alpha', 1.0) < 0.9:
-                continue
-            mesh_hits[mat_name] += 1
+        root = transform_root(tpid, bundle.transforms)
+        mat_names = [
+            bundle.materials.get(pid, {}).get('name', '') for pid in mat_pids
+        ]
+        for other in mat_names:
+            if (other
+                    and not any(s in other for s in tca.skip_material_substrings)
+                    and other not in ('Canopy', 'Glass', 'Glass HUD', 'NozzleInteriorMat')):
+                root_all_mats[root].add(other)
+
+        livery_on_mesh = [
+            m for m, pid in zip(mat_names, mat_pids)
+            if m and is_livery_material(m, tca)
+            and bundle.materials.get(pid, {}).get('alpha', 1.0) >= 0.9
+        ]
+        if not livery_on_mesh:
+            continue
+
+        mesh_pts = None
+        if mesh_filter is not None:
+            mesh = bundle.meshes.get(mesh_filter.m_Mesh.path_id)
+            if mesh is not None:
+                verts, _uvs, sub_faces, _sft = mesh_geometry(mesh, mat_pids)
+                if len(verts) and sub_faces:
+                    wm = world_matrix(tpid, bundle.transforms, world_cache)
+                    wm = _FLIP_X @ wm @ _FLIP_X
+                    mesh_pts = (wm @ np.c_[verts, np.ones(len(verts))].T).T[:, :3]
+
+        for mat_name in livery_on_mesh:
+            root_hits[mat_name][root] += 1
             if is_body_hint_part(name, tca):
-                body_parts[mat_name].add(name)
+                root_body[mat_name][root].add(name)
             if is_fuselage_part(name, tca):
                 fuselage_mats.add(mat_name)
+            if mesh_pts is not None and len(mesh_pts):
+                pmin = mesh_pts.min(axis=0)
+                pmax = mesh_pts.max(axis=0)
+                if root not in root_mins[mat_name]:
+                    root_mins[mat_name][root] = pmin.copy()
+                    root_maxs[mat_name][root] = pmax.copy()
+                else:
+                    root_mins[mat_name][root] = np.minimum(
+                        root_mins[mat_name][root], pmin)
+                    root_maxs[mat_name][root] = np.maximum(
+                        root_maxs[mat_name][root], pmax)
 
+    # Materials that look like complete airframes.
     candidates = sorted(fuselage_mats) if fuselage_mats else sorted(
-        m for m, parts in body_parts.items() if len(parts) >= 3)
-
-    if not candidates and body_parts:
+        m for m, roots in root_body.items()
+        if any(len(parts) >= 3 for parts in roots.values()))
+    if not candidates and root_body:
         candidates = sorted(
-            m for m, parts in body_parts.items() if len(parts) >= 2)
-
-    # Drop materials with too few distinct airframe parts (decals, weapons, etc.).
+            m for m, roots in root_body.items()
+            if any(len(parts) >= 2 for parts in roots.values()))
     candidates = [
         m for m in candidates
-        if len(body_parts.get(m, ())) >= 5 or m in fuselage_mats
+        if m in fuselage_mats
+        or any(len(parts) >= 5 for parts in root_body.get(m, {}).values())
     ]
 
-    out = []
+    out: list[dict] = []
     for mat_name in candidates:
-        out.append({
-            'material': mat_name,
-            'name': mat_name,
-            'partCount': mesh_hits[mat_name],
-            'bodyParts': len(body_parts.get(mat_name, ())),
-        })
+        roots = set(root_hits[mat_name]) | set(root_body.get(mat_name, {}))
+        if not roots:
+            continue
+        spans = {
+            r: float(np.max(root_maxs[mat_name][r] - root_mins[mat_name][r]))
+            for r in roots
+            if r in root_mins.get(mat_name, {})
+        }
+        # Group duplicate copies (same span) vs unrelated airframes.
+        remaining = set(spans) if spans else set(roots)
+        clusters: list[set[int]] = []
+        while remaining:
+            seed = max(remaining, key=lambda r: (
+                len(root_body[mat_name].get(r, ())),
+                root_hits[mat_name].get(r, 0),
+            ))
+            if seed not in spans:
+                clusters.append({seed})
+                remaining.remove(seed)
+                continue
+            selected = select_primary_livery_roots(
+                {r: spans[r] for r in remaining if r in spans},
+                {r: len(root_body[mat_name].get(r, ())) for r in remaining},
+                single_root=False,
+            )
+            # One cluster = selected (same-size copies). Peel off; leftover
+            # outliers become further clusters.
+            cluster = set(selected) & remaining
+            if not cluster:
+                cluster = {seed}
+            clusters.append(cluster)
+            remaining -= cluster
+
+        clusters.sort(
+            key=lambda c: -sum(len(root_body[mat_name].get(r, ())) for r in c))
+
+        for i, cluster in enumerate(clusters):
+            root = max(
+                cluster,
+                key=lambda r: (
+                    len(root_body[mat_name].get(r, ())),
+                    root_hits[mat_name].get(r, 0),
+                ),
+            )
+            body = set()
+            hits = 0
+            companions: set[str] = set()
+            for r in cluster:
+                body |= root_body[mat_name].get(r, set())
+                hits += root_hits[mat_name].get(r, 0)
+                # Props / secondary mats often live on sibling meshes under the
+                # same root that do not use the borrowed livery material.
+                companions |= (root_all_mats.get(r, set()) - {mat_name})
+            # Only keep companions that identify this airframe (Prop mats or
+            # mats naming the companion label). Shared cockpit/weapon mats must
+            # not widen includeMaterials across the whole collection pack.
+            if i == 0:
+                label = mat_name
+            else:
+                label = _label_from_companions(companions) or f'{mat_name} (alt {i})'
+            companions = _airframe_companions(companions, label)
+            entry: dict = {
+                'material': mat_name,
+                'name': label,
+                'partCount': hits,
+                'bodyParts': len(body),
+                'transformRoot': root,
+                # One root per import so duplicate packed copies / foreign
+                # hulls sharing this material are never merged.
+                'includeRoots': [root],
+            }
+            if companions:
+                entry['companionMaterials'] = sorted(companions)
+            out.append(entry)
     return out
+
+
+def _label_from_companions(companions: set[str]) -> str | None:
+    """Best-effort airframe name from non-livery mats on the same root."""
+    for c in sorted(companions):
+        if 'Prop' not in c:
+            continue
+        label = re.sub(r'\s+Prop\s+Mat\s*$', '', c, flags=re.I).strip()
+        label = re.sub(r'\s+Mat\s*$', '', label, flags=re.I).strip()
+        if label:
+            return label
+    return None
+
+
+def _airframe_companions(companions: set[str], label: str) -> set[str]:
+    """Filter co-root materials down to ones safe for includeMaterials."""
+    keep: set[str] = set()
+    label_norm = re.sub(r'[^a-z0-9]+', '', (label or '').lower())
+    for c in companions:
+        if 'Prop' in c:
+            keep.add(c)
+            continue
+        if not label_norm:
+            continue
+        c_norm = re.sub(r'[^a-z0-9]+', '', c.lower())
+        if label_norm in c_norm:
+            keep.add(c)
+    return keep
 
 
 def count_livery_materials(bundle: Bundle, tca=None) -> int:
@@ -1581,6 +1720,15 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     # set, only meshes whose renderer uses one of these materials are exported,
     # carving one plane out of a multi-plane bundle. Empty = include all.
     include_materials = set(cfg.get('includeMaterials', []))
+    # Extra mats on the same transform root (e.g. "AC-208 Prop Mat" when the
+    # hull wrongly shares another plane's livery material).
+    for companion in cfg.get('companionMaterials', []) or []:
+        if companion:
+            include_materials.add(companion)
+    # Explicit transform roots: carve one airframe when several share a material.
+    include_roots_cfg = {
+        int(r) for r in (cfg.get('includeRoots') or [])
+    }
     # Some bundles pack two overlapping copies of the same plane (e.g. a
     # flyable + a scenery prefab, or two liveries sharing one material). Left
     # in, they z-fight and the model looks broken. When true, only the first
@@ -1905,7 +2053,19 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
                 root_mins[root] = np.minimum(root_mins[root], pmin)
                 root_maxs[root] = np.maximum(root_maxs[root], pmax)
 
-        if len(matched_roots) > 1:
+        if include_roots_cfg:
+            selected = include_roots_cfg & matched_roots if matched_roots else set(include_roots_cfg)
+            if not selected:
+                selected = set(include_roots_cfg)
+            dropped = matched_roots - selected
+            if dropped:
+                print(
+                    f'includeRoots pinned {sorted(selected)}; '
+                    f'dropping {len(dropped)} other material-matched roots.',
+                    file=sys.stderr,
+                )
+            matched_roots = selected
+        elif len(matched_roots) > 1:
             root_spans = {
                 r: float(np.max(root_maxs[r] - root_mins[r]))
                 for r in matched_roots
@@ -1931,19 +2091,20 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
                         file=sys.stderr,
                     )
             matched_roots = selected
-            # Rebuild plane bounds from the kept root only.
-            if selected and root_mins:
-                livery_mins = None
-                livery_maxs = None
-                for r in selected:
-                    if r not in root_mins:
-                        continue
-                    if livery_mins is None:
-                        livery_mins = root_mins[r].copy()
-                        livery_maxs = root_maxs[r].copy()
-                    else:
-                        livery_mins = np.minimum(livery_mins, root_mins[r])
-                        livery_maxs = np.maximum(livery_maxs, root_maxs[r])
+
+        # Rebuild plane bounds from the kept root(s) only.
+        if matched_roots and root_mins:
+            livery_mins = None
+            livery_maxs = None
+            for r in matched_roots:
+                if r not in root_mins:
+                    continue
+                if livery_mins is None:
+                    livery_mins = root_mins[r].copy()
+                    livery_maxs = root_maxs[r].copy()
+                else:
+                    livery_mins = np.minimum(livery_mins, root_mins[r])
+                    livery_maxs = np.maximum(livery_maxs, root_maxs[r])
 
         if livery_mins is not None:
             plane_bounds = (livery_mins, livery_maxs)

@@ -28,6 +28,8 @@ interface ImportConfig {
     bundle: string;
     out: string;
     includeMaterials?: string[];
+    includeRoots?: number[];
+    companionMaterials?: string[];
     dedupeParts?: boolean;
     rescueGlassUnderRoot?: boolean;
     rescueGlassGlobal?: boolean;
@@ -47,6 +49,9 @@ interface DiscoveredPlane {
     name: string;
     partCount?: number;
     bodyParts?: number;
+    transformRoot?: number;
+    includeRoots?: number[];
+    companionMaterials?: string[];
 }
 
 interface CatalogAircraft {
@@ -79,6 +84,8 @@ interface PlaneImportPlan {
     spawnOffset?: number;
     spawnRotation?: number;
     dotColors?: [number, number, number];
+    includeRoots?: number[];
+    companionMaterials?: string[];
 }
 
 interface AircraftImportChoice {
@@ -87,7 +94,13 @@ interface AircraftImportChoice {
     displayName: string;
     category?: string;
     description?: string;
-    liveries: Array<{ material: string; label: string; confidence: number }>;
+    liveries: Array<{
+        material: string;
+        label: string;
+        confidence: number;
+        includeRoots?: number[];
+        companionMaterials?: string[];
+    }>;
     defaultMaterial: string;
 }
 
@@ -313,7 +326,11 @@ function extractModCatalog(files: Record<string, Uint8Array>): ModCatalog | null
 }
 
 function scoreCatalogMatch(plane: DiscoveredPlane, aircraft: CatalogAircraft): number {
-    const planeNorm = normalizeName(`${plane.name} ${plane.material}`);
+    // When discover splits a shared-material foreign hull (name from companions,
+    // e.g. "AC-208"), match on that name — not the borrowed livery material.
+    const renamed = normalizeName(plane.name) !== normalizeName(plane.material);
+    const planeLabel = renamed ? plane.name : `${plane.name} ${plane.material}`;
+    const planeNorm = normalizeName(planeLabel);
     const aircraftNorm = normalizeName(`${aircraft.canonicalName} ${aircraft.displayName}`);
     const aircraftFull = normalizeName(
         `${aircraft.canonicalName} ${aircraft.displayName} ${aircraft.description ?? ''} ${aircraft.modelPath ?? ''}`,
@@ -323,7 +340,7 @@ function scoreCatalogMatch(plane: DiscoveredPlane, aircraft: CatalogAircraft): n
     if (planeNorm === aircraftNorm) score += 10;
     if (planeNorm.includes(aircraftNorm) || aircraftNorm.includes(planeNorm)) score += 5;
 
-    const planeTokens = tokenizeName(`${plane.name} ${plane.material}`);
+    const planeTokens = tokenizeName(planeLabel);
     const aircraftTokens = tokenizeName(`${aircraft.canonicalName} ${aircraft.displayName}`);
     let overlap = 0;
     for (const token of planeTokens) {
@@ -365,6 +382,37 @@ function scoreCatalogMatch(plane: DiscoveredPlane, aircraft: CatalogAircraft): n
     return score;
 }
 
+function discoveryIdentity(plane: DiscoveredPlane): string {
+    const roots = plane.includeRoots?.length
+        ? plane.includeRoots.join('-')
+        : (plane.transformRoot != null ? String(plane.transformRoot) : '');
+    return roots ? `${plane.material}::${roots}` : plane.material;
+}
+
+function planFromDiscovered(
+    plane: DiscoveredPlane,
+    baseSlug: string,
+    extras: Partial<PlaneImportPlan> = {},
+): PlaneImportPlan {
+    const rootTag = plane.includeRoots?.[0] != null ? `_r${plane.includeRoots[0]}` : '';
+    const nameSlug = slugify(plane.name);
+    const matSlug = slugify(plane.material);
+    return {
+        modId: uniqueModId(`${baseSlug}_${nameSlug || matSlug}${rootTag}`),
+        idSlug: nameSlug || matSlug,
+        name: plane.name,
+        displayName: plane.name === plane.material
+            ? `${plane.name} (${plane.material})`
+            : plane.name,
+        material: plane.material,
+        sourceMaterial: plane.material,
+        includeRoots: plane.includeRoots,
+        companionMaterials: plane.companionMaterials,
+        confidence: 0.5,
+        ...extras,
+    };
+}
+
 function buildAllLiveryPlans(
     discovered: DiscoveredPlane[],
     catalog: ModCatalog | null,
@@ -372,15 +420,9 @@ function buildAllLiveryPlans(
 ): PlaneImportPlan[] {
     const filtered = discovered.filter(p => !materialLooksLikeNoise(p.material));
     if (!catalog) {
-        return filtered.map((plane) => ({
-            modId: uniqueModId(`${baseSlug}_${slugify(plane.material)}`),
-            idSlug: slugify(plane.material),
-            name: plane.name,
-            displayName: `${plane.name} (${plane.material})`,
-            material: plane.material,
-            sourceMaterial: plane.material,
-            confidence: 0.5,
-        })).sort((a, b) => a.displayName.localeCompare(b.displayName));
+        return filtered
+            .map((plane) => planFromDiscovered(plane, baseSlug))
+            .sort((a, b) => a.displayName.localeCompare(b.displayName));
     }
 
     const plans: PlaneImportPlan[] = [];
@@ -394,27 +436,25 @@ function buildAllLiveryPlans(
         }
 
         if (!best || best.score < 2) {
-            plans.push({
-                modId: uniqueModId(`${baseSlug}_${slugify(plane.material)}`),
-                idSlug: slugify(plane.material),
-                name: plane.name,
-                displayName: `${plane.name} (${plane.material})`,
-                material: plane.material,
-                sourceMaterial: plane.material,
+            plans.push(planFromDiscovered(plane, baseSlug, {
                 confidence: Number((Math.min(1, (best?.score ?? 0) / 12)).toFixed(3)),
-            });
+            }));
             continue;
         }
 
         const { score, aircraft } = best;
         const idSlug = slugify(aircraft.canonicalName);
         const matSlug = slugify(plane.material);
+        const rootTag = plane.includeRoots?.[0] != null ? `_r${plane.includeRoots[0]}` : '';
         const display = aircraft.displayName || aircraft.canonicalName;
+        const liveryLabel = plane.name !== plane.material && plane.name !== display
+            ? plane.name
+            : plane.material;
         plans.push({
-            modId: uniqueModId(`${baseSlug}_${idSlug}_${matSlug}`),
+            modId: uniqueModId(`${baseSlug}_${idSlug}_${matSlug}${rootTag}`),
             idSlug,
             name: aircraft.canonicalName,
-            displayName: `${display} (${plane.material})`,
+            displayName: `${display} (${liveryLabel})`,
             material: plane.material,
             category: aircraft.category,
             description: aircraft.description,
@@ -423,6 +463,8 @@ function buildAllLiveryPlans(
             spawnOffset: aircraft.spawnOffset,
             spawnRotation: aircraft.spawnRotation,
             dotColors: aircraft.dotColors,
+            includeRoots: plane.includeRoots,
+            companionMaterials: plane.companionMaterials,
         });
     }
     return plans.sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -444,13 +486,15 @@ function buildAircraftChoices(
     const filtered = discovered.filter(p => !materialLooksLikeNoise(p.material));
     if (!catalog) {
         return filtered.map((plane) => ({
-            key: `mat:${slugify(plane.material)}`,
+            key: `id:${slugify(discoveryIdentity(plane))}`,
             canonicalName: plane.name,
             displayName: plane.name,
             liveries: [{
                 material: plane.material,
                 label: plane.material,
                 confidence: 0.5,
+                includeRoots: plane.includeRoots,
+                companionMaterials: plane.companionMaterials,
             }],
             defaultMaterial: plane.material,
         })).sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -458,7 +502,12 @@ function buildAircraftChoices(
 
     const byAircraft = new Map<string, {
         aircraft: CatalogAircraft;
-        liveries: Map<string, { score: number }>;
+        liveries: Map<string, {
+            score: number;
+            includeRoots?: number[];
+            companionMaterials?: string[];
+            label: string;
+        }>;
     }>();
 
     for (const plane of filtered) {
@@ -470,13 +519,18 @@ function buildAircraftChoices(
             }
         }
         if (!best || best.score < 2) {
-            const key = `mat:${slugify(plane.material)}`;
+            const key = `id:${slugify(discoveryIdentity(plane))}`;
             byAircraft.set(key, {
                 aircraft: {
                     canonicalName: plane.name,
                     displayName: plane.name,
                 },
-                liveries: new Map([[plane.material, { score: best?.score ?? 0 }]]),
+                liveries: new Map([[discoveryIdentity(plane), {
+                    score: best?.score ?? 0,
+                    includeRoots: plane.includeRoots,
+                    companionMaterials: plane.companionMaterials,
+                    label: plane.material,
+                }]]),
             });
             continue;
         }
@@ -486,9 +540,15 @@ function buildAircraftChoices(
             entry = { aircraft: best.aircraft, liveries: new Map() };
             byAircraft.set(key, entry);
         }
-        const prev = entry.liveries.get(plane.material);
+        const liveryKey = discoveryIdentity(plane);
+        const prev = entry.liveries.get(liveryKey);
         if (!prev || best.score > prev.score) {
-            entry.liveries.set(plane.material, { score: best.score });
+            entry.liveries.set(liveryKey, {
+                score: best.score,
+                includeRoots: plane.includeRoots,
+                companionMaterials: plane.companionMaterials,
+                label: plane.material,
+            });
         }
     }
 
@@ -496,10 +556,12 @@ function buildAircraftChoices(
     for (const [key, { aircraft, liveries }] of byAircraft) {
         const sorted = [...liveries.entries()]
             .sort((a, b) => b[1].score - a[1].score)
-            .map(([material, { score }]) => ({
-                material,
-                label: material,
-                confidence: Number((Math.min(1, score / 12)).toFixed(3)),
+            .map(([, meta]) => ({
+                material: meta.label,
+                label: meta.label,
+                confidence: Number((Math.min(1, meta.score / 12)).toFixed(3)),
+                includeRoots: meta.includeRoots,
+                companionMaterials: meta.companionMaterials,
             }));
         choices.push({
             key,
@@ -544,7 +606,10 @@ function buildPlanesFromSelections(
         const matSlug = slugify(sel.material);
         const canon = normalizeName(choice.canonicalName);
         const variantImport = (enabledByCanon.get(canon) ?? 0) > 1 || choice.liveries.length > 1;
-        const modIdBase = variantImport ? `${baseSlug}_${idSlug}_${matSlug}` : `${baseSlug}_${idSlug}`;
+        const rootTag = livery.includeRoots?.[0] != null ? `_r${livery.includeRoots[0]}` : '';
+        const modIdBase = variantImport
+            ? `${baseSlug}_${idSlug}_${matSlug}${rootTag}`
+            : `${baseSlug}_${idSlug}${rootTag}`;
         const liverySuffix = choice.liveries.length > 1 ? ` (${livery.label})` : '';
 
         plans.push({
@@ -560,6 +625,8 @@ function buildPlanesFromSelections(
             spawnOffset: aircraft?.spawnOffset,
             spawnRotation: aircraft?.spawnRotation,
             dotColors: aircraft?.dotColors,
+            includeRoots: livery.includeRoots,
+            companionMaterials: livery.companionMaterials,
         });
     }
     return plans;
@@ -737,6 +804,10 @@ function buildPlaneConfig(
         ...(multiPlane ? {
             collectionPack,
             includeMaterials: [plane.material!],
+            ...(plane.includeRoots?.length ? { includeRoots: plane.includeRoots } : {}),
+            ...(plane.companionMaterials?.length
+                ? { companionMaterials: plane.companionMaterials }
+                : {}),
             dedupeParts: true,
             skipClutter: false,
             bitmapLivery: true,
