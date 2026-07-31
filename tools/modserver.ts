@@ -63,6 +63,8 @@ interface CatalogAircraft {
     spawnOffset?: number;
     spawnRotation?: number;
     dotColors?: [number, number, number];
+    /** False for TCA AI-only / scenery airframes not listed in flyables.json. */
+    playerFlyable?: boolean;
 }
 
 interface ModCatalog {
@@ -207,6 +209,10 @@ function normalizeName(value: string): string {
         .toLowerCase()
         .replace(/\.[0-9]+$/g, '')
         .replace(/\b(material|mat|palette|pallete)\b/g, '')
+        // Collapse hyphenated airframe tokens ("E-3" -> "e3") before spaces
+        // are normalized, so catalog "E3 Sentry" matches material "E-3 Mat".
+        .replace(/([a-z])-+(?=\d)/g, '$1')
+        .replace(/(\d)-+(?=[a-z])/g, '$1')
         .replace(/[^a-z0-9]+/g, ' ')
         .trim();
 }
@@ -244,23 +250,60 @@ function zipEntryByName(files: Record<string, Uint8Array>, matcher: (normalized:
     return null;
 }
 
+function catalogEntryFromSources(
+    canonicalName: string,
+    db: Record<string, unknown> | undefined,
+    a2: Record<string, unknown> | undefined,
+    playerFlyable: boolean,
+): CatalogAircraft {
+    const displayName = (typeof a2?.DisplayName === 'string' && a2.DisplayName)
+        || (typeof db?.DisplayName === 'string' && db.DisplayName)
+        || canonicalName;
+    const category = (typeof db?.Filter === 'string' && db.Filter)
+        || (typeof a2?.TargetType === 'string' ? a2.TargetType : undefined);
+    const description = (typeof db?.Description === 'string' ? db.Description : undefined);
+    const modelPath = (typeof a2?.ModelPath === 'string' ? a2.ModelPath : undefined);
+    const spawnOffset = typeof a2?.SpawnOffset === 'number' ? a2.SpawnOffset : undefined;
+    const spawnRotation = typeof a2?.SpawnRotation === 'number' ? a2.SpawnRotation : undefined;
+    const dotRaw = a2?.DotColors;
+    const dotColors = Array.isArray(dotRaw) && dotRaw.length >= 3
+        ? [Number(dotRaw[0]), Number(dotRaw[1]), Number(dotRaw[2])] as [number, number, number]
+        : undefined;
+    return {
+        canonicalName,
+        displayName,
+        category,
+        description,
+        modelPath,
+        spawnOffset,
+        spawnRotation,
+        dotColors,
+        playerFlyable,
+    };
+}
+
 function extractModCatalog(files: Record<string, Uint8Array>): ModCatalog | null {
     try {
         const modEntry = zipEntryByName(files, name => name.endsWith('/mod.json') || name === 'mod.json');
         const flyablesEntry = zipEntryByName(files, name => name.endsWith('/data/flyables.json'));
-        if (!flyablesEntry) return null;
-
         const dbEntry = zipEntryByName(files, name => name.endsWith('/data/database/aircraft.json'));
         const aircraft2Entries = Object.keys(files)
             .filter(name => name.replace(/\\/g, '/').toLowerCase().includes('/data/aircraft2/') && name.toLowerCase().endsWith('.json'));
 
+        // Prefer flyables when present, but still catalog AI-only / scenery
+        // airframes that only appear in Aircraft2 or database/aircraft.json.
+        if (!flyablesEntry && !dbEntry && aircraft2Entries.length === 0) {
+            return null;
+        }
+
         const modJsonText = modEntry ? readZipText(files, modEntry) : null;
-        const flyablesText = readZipText(files, flyablesEntry);
-        if (!flyablesText) return null;
+        const flyablesText = flyablesEntry ? readZipText(files, flyablesEntry) : null;
         const dbText = dbEntry ? readZipText(files, dbEntry) : null;
 
         const modJson = modJsonText ? parseJsonLoose(modJsonText) as Record<string, unknown> : {};
-        const flyables = parseJsonLoose(flyablesText) as Array<Record<string, unknown>>;
+        const flyables = flyablesText
+            ? parseJsonLoose(flyablesText) as Array<Record<string, unknown>>
+            : [];
         const database = dbText ? parseJsonLoose(dbText) as Array<Record<string, unknown>> : [];
 
         const dbByName = new Map<string, Record<string, unknown>>();
@@ -282,38 +325,45 @@ function extractModCatalog(files: Record<string, Uint8Array>): ModCatalog | null
             }
         }
 
-        const aircraft: CatalogAircraft[] = [];
+        const aircraftByKey = new Map<string, CatalogAircraft>();
+
         for (const flyable of flyables) {
             const canonicalName = typeof flyable.Name === 'string' ? flyable.Name : '';
             if (!canonicalName) continue;
             const key = normalizeName(canonicalName);
-            const db = dbByName.get(key);
-            const a2 = aircraft2ByName.get(key);
-            const displayName = (typeof a2?.DisplayName === 'string' && a2.DisplayName)
-                || (typeof db?.DisplayName === 'string' && db.DisplayName)
-                || canonicalName;
-            const category = (typeof db?.Filter === 'string' && db.Filter)
-                || (typeof a2?.TargetType === 'string' ? a2.TargetType : undefined);
-            const description = (typeof db?.Description === 'string' ? db.Description : undefined);
-            const modelPath = (typeof a2?.ModelPath === 'string' ? a2.ModelPath : undefined);
-            const spawnOffset = typeof a2?.SpawnOffset === 'number' ? a2.SpawnOffset : undefined;
-            const spawnRotation = typeof a2?.SpawnRotation === 'number' ? a2.SpawnRotation : undefined;
-            const dotRaw = a2?.DotColors;
-            const dotColors = Array.isArray(dotRaw) && dotRaw.length >= 3
-                ? [Number(dotRaw[0]), Number(dotRaw[1]), Number(dotRaw[2])] as [number, number, number]
-                : undefined;
-            aircraft.push({
+            aircraftByKey.set(key, catalogEntryFromSources(
                 canonicalName,
-                displayName,
-                category,
-                description,
-                modelPath,
-                spawnOffset,
-                spawnRotation,
-                dotColors,
-            });
+                dbByName.get(key),
+                aircraft2ByName.get(key),
+                true,
+            ));
         }
 
+        for (const [key, a2] of aircraft2ByName) {
+            if (aircraftByKey.has(key)) continue;
+            const canonicalName = typeof a2.Name === 'string' ? a2.Name : '';
+            if (!canonicalName) continue;
+            aircraftByKey.set(key, catalogEntryFromSources(
+                canonicalName,
+                dbByName.get(key),
+                a2,
+                false,
+            ));
+        }
+
+        for (const [key, db] of dbByName) {
+            if (aircraftByKey.has(key)) continue;
+            const canonicalName = typeof db.Name === 'string' ? db.Name : '';
+            if (!canonicalName) continue;
+            aircraftByKey.set(key, catalogEntryFromSources(
+                canonicalName,
+                db,
+                aircraft2ByName.get(key),
+                false,
+            ));
+        }
+
+        const aircraft = [...aircraftByKey.values()];
         if (!aircraft.length) return null;
         return {
             modName: typeof modJson?.DisplayName === 'string' ? modJson.DisplayName : undefined,
@@ -698,7 +748,7 @@ async function executeImport(
         });
     }
     if (imported.length === 0) {
-        throw new Error('Import produced no flyable aircraft (the mod may not be a supported plane bundle).');
+        throw new Error('Import produced no aircraft packs (the mod may not be a supported plane bundle).');
     }
     return imported;
 }
@@ -854,7 +904,9 @@ function listAircraftPacks(): ImportedAircraft[] {
                 ].join('::');
             }
         }
-        const entry = { id, name, packUrl: `assets/${file}` };
+        // Bust browser cache when a pack is rebuilt (same URL otherwise sticks).
+        const packUrl = `assets/${file}?v=${Math.floor(stat.mtimeMs)}`;
+        const entry = { id, name, packUrl };
         const prev = deduped.get(dedupeKey);
         if (!prev || stat.mtimeMs > prev.mtimeMs) {
             deduped.set(dedupeKey, { entry, mtimeMs: stat.mtimeMs });
@@ -1024,7 +1076,7 @@ app.post('/api/preview-mod', upload.single('mod'), async (req: Request, res: Res
         if (choices.length === 0) {
             return res.status(400).json({
                 ok: false,
-                error: 'No flyable aircraft liveries found in this mod.',
+                error: 'No aircraft liveries found in this mod.',
             });
         }
 
@@ -1159,7 +1211,7 @@ app.use(express.static(DIST_DIR, {
         res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
         res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
         res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-        if (filePath.endsWith('.js') || filePath.endsWith('.html')) {
+        if (filePath.endsWith('.js') || filePath.endsWith('.html') || filePath.endsWith('.aircraft.pack')) {
             res.setHeader('Cache-Control', 'no-store');
         }
     },
