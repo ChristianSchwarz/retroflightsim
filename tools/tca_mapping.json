@@ -161,6 +161,10 @@
         "Hull"
       ]
     },
+    "wingtip": {
+      "exact": ["WingTip", "Wingtip", "Tip"],
+      "substring": ["WingTip", "Wingtip"]
+    },
     "fuselage": {
       "substring": ["Fuselage"],
       "exact": ["Body", "Hull", "Fuse"]

@@ -173,6 +173,9 @@ def merge_config_overrides(cfg: dict | None) -> TcaMapping:
     if cfg.get('nozzleParts'):
         n = cats.setdefault('nozzle', {})
         n.setdefault('substring', []).extend(cfg['nozzleParts'])
+    if cfg.get('wingtipParts'):
+        w = cats.setdefault('wingtip', {})
+        w.setdefault('substring', []).extend(cfg['wingtipParts'])
 
     skip_extra = list(cfg.get('skipNameParts', []))
     if cfg.get('skipClutter', False):
@@ -285,6 +288,10 @@ def default_import_skip_substrings(mapping: TcaMapping | None = None) -> tuple[s
 
 def is_cockpit_part(name: str, mapping: TcaMapping | None = None) -> bool:
     return classify_part(name, 'cockpit', mapping)
+
+
+def is_wingtip_part(name: str, mapping: TcaMapping | None = None) -> bool:
+    return classify_part(name, 'wingtip', mapping)
 
 
 def is_attachment_empty(name: str, mapping: TcaMapping | None = None) -> bool:

@@ -16,6 +16,7 @@ from tca_mapping import (
     is_livery_material,
     is_nozzle_mesh,
     is_nozzle_part,
+    is_wingtip_part,
     merge_config_overrides,
     point_in_expanded_bounds,
     should_skip_gear_clip_part,
@@ -44,6 +45,13 @@ class TcaMappingTests(unittest.TestCase):
         self.assertTrue(is_glass_part('Canopy'))
         self.assertFalse(is_glass_part('CanopyFrame'))
         self.assertFalse(is_glass_part('Fuselage'))
+
+    def test_wingtip_part_by_mesh_name(self):
+        self.assertTrue(is_wingtip_part('WingTipL'))
+        self.assertTrue(is_wingtip_part('WingTipR'))
+        self.assertTrue(is_wingtip_part('Wingtip'))
+        self.assertFalse(is_wingtip_part('WingL'))
+        self.assertFalse(is_wingtip_part('ElevatorTipL'))
 
     def test_nozzle_part_unresolved_material_fallback(self):
         self.assertTrue(is_nozzle_part('NozzleInterior'))

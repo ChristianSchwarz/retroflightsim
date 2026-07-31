@@ -161,10 +161,12 @@ mapping at runtime rather than replacing it.
 | `skipNameParts`  | Part-name substrings to drop (gauges, weapons, colliders, ...).     |
 | `skipClutter`    | When `true`, skip weapon/pylon/gauge clutter from [`tca_mapping.json`](tca_mapping.json) `importClutterSkip`. Defaults to `false`; cockpit/canopy/attachment empties are kept. |
 | `bitmapLivery`   | When `true` (default), sample large livery bitmap textures at face UVs (downsampled to `bitmapSampleMax`, default 512). Without this, only palette swatches ? `swatchMax` are sampled. |
+| `dedupeParts`    | Keep one mesh per `(name, transformRoot)`. With `includeMaterials`, also span-clusters airframe roots so a shared livery name on an unrelated larger hull (or duplicate packed copies) is not merged into the export. |
 | `rescueNozzleUnderRoot` | Multi-plane imports: re-admit nozzle-interior meshes under the same transform root as the livery even when their material differs. Defaults to `true` when `includeMaterials` is set. |
 | `rescueNozzleGlobal` | When `true` (default with `includeMaterials`), also re-admit off-root pooled nozzle meshes that lie near the livery hull bounds. |
 | `rescueGlassGlobal` | Same spatial rescue for canopy/glass parts (off-root pooled canopies). Defaults to `true` with `includeMaterials`. |
 | `rescueCockpit` | Re-admit cockpit-interior meshes (by name) under the livery root or near the hull. Defaults to `true` with `includeMaterials`. |
+| `wingtipParts`   | Extra part-name substrings treated as wingtip meshes for `fx.wingtips` trail origins (default mapping matches `WingTip` / `Wingtip`). |
 
 With `skipClutter` false (the F10 default for flyable imports), cockpit/canopy
 meshes export while weapons/pylons/gauges are still skipped when

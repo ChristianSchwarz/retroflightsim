@@ -82,6 +82,7 @@ from tca_mapping import (
     is_nozzle_mesh,
     is_nozzle_part,
     is_body_hint_part,
+    is_wingtip_part,
     merge_config_overrides,
     point_in_expanded_bounds,
     should_skip_gear_clip_part,
@@ -1389,6 +1390,46 @@ def transform_root(tpid: int, transforms) -> int:
         cur = father
 
 
+def select_primary_livery_roots(
+    root_spans: dict[int, float],
+    root_part_counts: dict[int, int],
+    *,
+    single_root: bool = True,
+    span_ratio: float = 1.6,
+) -> set[int]:
+    """Pick transform root(s) when several airframes share one livery material.
+
+    Collection packs sometimes stamp the same Unity material name onto unrelated
+    models (e.g. a fighter livery also on a bomber-sized hull). Span-cluster the
+    roots and optionally keep a single copy so the export is one coherent plane.
+    """
+    if not root_spans:
+        return set()
+    if len(root_spans) == 1:
+        return set(root_spans.keys())
+
+    spans = sorted(root_spans.values())
+    median = spans[len(spans) // 2]
+    if median < 1e-3:
+        best = max(root_part_counts, key=lambda r: root_part_counts.get(r, 0))
+        return {best}
+
+    lo, hi = median / span_ratio, median * span_ratio
+    cluster = [r for r, s in root_spans.items() if lo <= s <= hi]
+    if not cluster:
+        cluster = [min(root_spans, key=lambda r: abs(root_spans[r] - median))]
+
+    if single_root:
+        return {max(
+            cluster,
+            key=lambda r: (
+                root_part_counts.get(r, 0),
+                -abs(root_spans[r] - median),
+            ),
+        )}
+    return set(cluster)
+
+
 def _transform_pid_of(go, bundle: Bundle) -> int | None:
     for comp in go.m_Component:
         co = bundle.by_path.get(comp.component.path_id)
@@ -1797,22 +1838,29 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
 
     matched_roots: set[int] = set()
     plane_bounds: tuple[np.ndarray, np.ndarray] | None = None
-    if include_materials and (rescue_glass or rescue_nozzle or rescue_materials
-                              or rescue_cockpit):
+    if include_materials:
+        # Build livery-root stats when includeMaterials is set so we can drop
+        # foreign airframes that reuse the same material name.
         livery_mins = None
         livery_maxs = None
+        root_mins: dict[int, np.ndarray] = {}
+        root_maxs: dict[int, np.ndarray] = {}
+        root_part_counts: dict[int, int] = defaultdict(int)
         for o in bundle.env.objects:
             if o.type.name != 'GameObject':
                 continue
             go = o.read()
             tpid = None
             mat_pids = []
+            mesh_filter = None
             for comp in go.m_Component:
                 co = bundle.by_path.get(comp.component.path_id)
                 if co is None:
                     continue
                 if co.type.name == 'Transform':
                     tpid = comp.component.path_id
+                elif co.type.name == 'MeshFilter':
+                    mesh_filter = bundle.mesh_filters.get(comp.component.path_id)
                 elif co.type.name == 'MeshRenderer':
                     tt = co.read_typetree()
                     mat_pids = [m['m_PathID'] for m in tt.get('m_Materials', [])]
@@ -1822,7 +1870,9 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
                     bundle.materials.get(pid, {}).get('name', '') in include_materials
                     for pid in mat_pids):
                 continue
-            matched_roots.add(_root_of(tpid))
+            root = _root_of(tpid)
+            matched_roots.add(root)
+            root_part_counts[root] += 1
             origin = _transform_origin(tpid)
             if livery_mins is None:
                 livery_mins = origin.copy()
@@ -1830,6 +1880,71 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
             else:
                 livery_mins = np.minimum(livery_mins, origin)
                 livery_maxs = np.maximum(livery_maxs, origin)
+
+            # Prefer mesh AABB for span (collection packs share one origin).
+            mesh_pts = None
+            if mesh_filter is not None:
+                mesh = bundle.meshes.get(mesh_filter.m_Mesh.path_id)
+                if mesh is not None:
+                    verts, _uvs, sub_faces, _sft = mesh_geometry(mesh, mat_pids)
+                    if len(verts) and sub_faces:
+                        wm = world_matrix(tpid, bundle.transforms, world_cache)
+                        wm = _FLIP_X @ wm @ _FLIP_X
+                        mesh_pts = (wm @ np.c_[verts, np.ones(len(verts))].T).T[:, :3] * scale
+                        if rotation_matrix is not None:
+                            mesh_pts = mesh_pts @ rotation_matrix.T
+            if mesh_pts is not None and len(mesh_pts):
+                pmin = mesh_pts.min(axis=0)
+                pmax = mesh_pts.max(axis=0)
+            else:
+                pmin = pmax = origin
+            if root not in root_mins:
+                root_mins[root] = pmin.copy()
+                root_maxs[root] = pmax.copy()
+            else:
+                root_mins[root] = np.minimum(root_mins[root], pmin)
+                root_maxs[root] = np.maximum(root_maxs[root], pmax)
+
+        if len(matched_roots) > 1:
+            root_spans = {
+                r: float(np.max(root_maxs[r] - root_mins[r]))
+                for r in matched_roots
+                if r in root_mins
+            }
+            selected = select_primary_livery_roots(
+                root_spans,
+                dict(root_part_counts),
+                single_root=dedupe_parts or collection_bundle,
+            )
+            dropped = matched_roots - selected
+            if dropped:
+                print(
+                    f'Livery material shared by {len(matched_roots)} airframe roots; '
+                    f'keeping {len(selected)} (span-clustered), dropping {len(dropped)}.',
+                    file=sys.stderr,
+                )
+                for r in sorted(dropped, key=lambda x: -root_spans.get(x, 0)):
+                    span = root_spans.get(r, 0.0)
+                    print(
+                        f'  drop root parts={root_part_counts.get(r, 0)} '
+                        f'span={span:.1f}m',
+                        file=sys.stderr,
+                    )
+            matched_roots = selected
+            # Rebuild plane bounds from the kept root only.
+            if selected and root_mins:
+                livery_mins = None
+                livery_maxs = None
+                for r in selected:
+                    if r not in root_mins:
+                        continue
+                    if livery_mins is None:
+                        livery_mins = root_mins[r].copy()
+                        livery_maxs = root_maxs[r].copy()
+                    else:
+                        livery_mins = np.minimum(livery_mins, root_mins[r])
+                        livery_maxs = np.maximum(livery_maxs, root_maxs[r])
+
         if livery_mins is not None:
             plane_bounds = (livery_mins, livery_maxs)
 
@@ -1899,6 +2014,10 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
             bundle.materials.get(pid, {}).get('name', '') in include_materials
             for pid in mat_pids)
         same_root = _root_of(transform_pid) in matched_roots
+        # When includeMaterials matched several airframes, matched_roots was
+        # span-clustered to one primary copy — reject other roots' livery meshes.
+        if include_materials and has_livery and matched_roots and not same_root:
+            continue
         rescued = (
             not has_livery
             and (
@@ -2522,13 +2641,39 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
             return points, radius, 'body-slab'
         return [], None, None
 
-    def wingtip_trail_origins(parts, translate) -> list | None:
-        """Wingtip vortex trail origins at the outermost lateral body vertices."""
+    def wingtip_trail_origins(parts, translate) -> tuple[list | None, str | None]:
+        """Wingtip vortex trail origins: prefer named WingTip meshes, else hull extremes."""
         if not parts:
-            return None
-        v = np.vstack([p['world_v'] for p in parts]) + translate
+            return None, None
+        offset = np.asarray(translate, dtype=np.float64)
+
+        tip_parts = [p for p in parts if is_wingtip_part(p['name'], tca)]
+        if tip_parts:
+            left_cands: list[np.ndarray] = []
+            right_cands: list[np.ndarray] = []
+            for p in tip_parts:
+                v = p['world_v'] + offset
+                if len(v) == 0:
+                    continue
+                mean_x = float(v[:, 0].mean())
+                if mean_x >= 0:
+                    left_cands.append(v[int(np.argmax(v[:, 0]))])
+                else:
+                    right_cands.append(v[int(np.argmin(v[:, 0]))])
+            if left_cands and right_cands:
+                left = left_cands[int(np.argmax([c[0] for c in left_cands]))]
+                right = right_cands[int(np.argmin([c[0] for c in right_cands]))]
+                if float(left[0] - right[0]) >= 0.6:
+                    return [
+                        [round(float(left[0]), 4), round(float(left[1]), 4),
+                         round(float(left[2]), 4)],
+                        [round(float(right[0]), 4), round(float(right[1]), 4),
+                         round(float(right[2]), 4)],
+                    ], 'wingtip-part'
+
+        v = np.vstack([p['world_v'] for p in parts]) + offset
         if len(v) < 8:
-            return None
+            return None, None
         zmin, zmax = float(v[:, 2].min()), float(v[:, 2].max())
         zrange = zmax - zmin
         if zrange >= 0.5:
@@ -2545,14 +2690,12 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
         ri = int(np.argmin(v[:, 0]))
         left = v[li]
         right = v[ri]
-        outward = float(max(left[0], -right[0]))
-        if outward < 0.1:
-            return None
-        ref = left if left[0] >= -right[0] else right
+        if float(left[0] - right[0]) < 0.6:
+            return None, None
         return [
-            [round(outward, 4), round(float(ref[1]), 4), round(float(ref[2]), 4)],
-            [round(-outward, 4), round(float(ref[1]), 4), round(float(ref[2]), 4)],
-        ]
+            [round(float(left[0]), 4), round(float(left[1]), 4), round(float(left[2]), 4)],
+            [round(float(right[0]), 4), round(float(right[1]), 4), round(float(right[2]), 4)],
+        ], 'body-extreme'
 
     attachments: list[dict] = []
     gt = np.asarray(ground_translate)
@@ -2611,11 +2754,11 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     fx.setdefault('nozzles', None)
     fx.setdefault('nozzleRadius', None)
     if fx.get('wingtips') is None:
-        auto_wingtips = wingtip_trail_origins(
+        auto_wingtips, wingtip_src = wingtip_trail_origins(
             body_parts, np.asarray(ground_translate))
         if auto_wingtips:
             fx['wingtips'] = auto_wingtips
-            print(f'Wingtip trails: {auto_wingtips}')
+            print(f'Wingtip trails ({wingtip_src}): {auto_wingtips}')
         else:
             fx.setdefault('wingtips', None)
 
