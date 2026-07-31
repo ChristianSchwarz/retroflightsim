@@ -746,7 +746,10 @@ function buildPlaneConfig(
             rescueCockpitGlobal: !collectionPack,
             rescueNozzleUnderRoot: true,
             rescueNozzleGlobal: !collectionPack,
-            rescueMaterialsUnderRoot: true,
+            rescueMaterialsUnderRoot: false,
+            // Coplanar inner wing shells z-fight with WingL/WingR at the wing root
+            // (confirmed on F-18A/C and Su-33 in Global Skies Collection).
+            skipExact: ['WingInnerL', 'WingInnerR'],
         } : {}),
     };
 }
