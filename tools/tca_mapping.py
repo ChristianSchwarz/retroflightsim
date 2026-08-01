@@ -228,7 +228,7 @@ def classify_part(name: str, category: str, mapping: TcaMapping | None = None) -
         return False
     if not _matches_spec(name, spec):
         return False
-    if spec.exclude_substring and name in spec.exclude_substring:
+    if spec.exclude_substring and any(ex in name for ex in spec.exclude_substring):
         return False
     return True
 
@@ -239,10 +239,25 @@ def classify_material(name: str, mapping: TcaMapping | None = None) -> MaterialC
     mapping = mapping or default_mapping()
     if name in mapping.shared_materials:
         return mapping.shared_materials[name]
-    for mat_name, cls in mapping.shared_materials.items():
-        if mat_name in name:
-            return cls
+    # Longer shared names first so "CanopyGlass" / "Glass HUD" win over "Glass".
+    for mat_name, cls in sorted(
+        mapping.shared_materials.items(), key=lambda kv: len(kv[0]), reverse=True,
+    ):
+        if mat_name not in name:
+            continue
+        # "Canopy" must not match frame/rubber/seal materials (CanopyRubber,
+        # CanopyFrameMat, …) — those are opaque structure, not TinyCanopy glass.
+        if cls.palette_category == 'GLASS' and any(
+            ex in name for ex in _GLASS_MATERIAL_EXCLUDE_SUBSTRINGS
+        ):
+            continue
+        return cls
     return None
+
+
+_GLASS_MATERIAL_EXCLUDE_SUBSTRINGS = (
+    'Frame', 'Rubber', 'Seal', 'Rail', 'Strut', 'Hinge', 'Latch', 'Handle',
+)
 
 
 def is_glass_part(name: str, mapping: TcaMapping | None = None) -> bool:

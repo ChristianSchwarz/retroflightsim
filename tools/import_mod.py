@@ -758,26 +758,50 @@ def gear_clip_sample_times(clip: dict, max_samples: int = 96) -> np.ndarray:
 # Mesh / material parsing
 # --------------------------------------------------------------------------- #
 def mesh_geometry(mesh, mat_pids: list) -> tuple[np.ndarray, np.ndarray | None, list[np.ndarray], list[np.ndarray]]:
-    """Return verts, uvs, per-submesh face indices, and per-submesh UV indices."""
+    """Return verts, uvs, per-submesh face indices, and per-submesh UV indices.
+
+    Submesh order matches Unity material slots on the MeshRenderer. UnityPy's
+    OBJ export emits ``g MeshName_N`` groups — one per submesh — which we keep
+    separate so frame/livery slots are not collapsed into material 0 (glass).
+    """
     # UnityPy's Mesh.export() returns False for meshes it cannot decode (e.g.
     # certain compressed/skinned meshes). Skip those parts instead of crashing.
     obj_text = mesh.export()
     if not isinstance(obj_text, str):
         return np.empty((0, 3)), None, [], []
-    verts, uvs, face_v, face_t = parse_obj(obj_text)
-    if len(verts) == 0 or len(face_v) == 0:
+    verts, uvs, sub_faces, sub_face_t = parse_obj(obj_text)
+    if len(verts) == 0 or not sub_faces:
         return np.empty((0, 3)), None, [], []
-    return verts, uvs, [face_v], [face_t]
+    # Drop trailing empty slots; keep holes so material index still aligns.
+    while sub_faces and len(sub_faces[-1]) == 0:
+        sub_faces.pop()
+        sub_face_t.pop()
+    if not sub_faces:
+        return np.empty((0, 3)), None, [], []
+    return verts, uvs, sub_faces, sub_face_t
 
 
 def parse_obj(obj_text: str):
-    """Return (vertices Nx3, uvs Mx2 or None, face_v Fx3, face_t Fx3)."""
-    verts, uvs, face_v, face_t = [], [], [], []
+    """Return (vertices Nx3, uvs Mx2 or None, sub_faces[], sub_face_t[]).
+
+    Faces are grouped by UnityPy's ``g Name_N`` submesh markers. A bare
+    ``g Name`` group (no faces) is ignored. If no numbered groups appear, all
+    faces go to submesh 0.
+    """
+    verts, uvs = [], []
+    sub_fv: dict[int, list] = defaultdict(list)
+    sub_ft: dict[int, list] = defaultdict(list)
+    current_sub: int | None = None
+
     for line in obj_text.splitlines():
         if line.startswith('v '):
             verts.append([float(x) for x in line.split()[1:4]])
         elif line.startswith('vt '):
             uvs.append([float(x) for x in line.split()[1:3]])
+        elif line.startswith('g '):
+            name = line[2:].strip()
+            m = re.search(r'_(\d+)$', name)
+            current_sub = int(m.group(1)) if m else None
         elif line.startswith('f '):
             corners = line.split()[1:]
             if len(corners) < 3:
@@ -787,13 +811,27 @@ def parse_obj(obj_text: str):
                 p = c.split('/')
                 vi.append(int(p[0]) - 1)
                 ti.append(int(p[1]) - 1 if len(p) > 1 and p[1] else -1)
-            face_v.append(vi)
-            face_t.append(ti)
-    verts = np.array(verts, dtype=np.float64) if verts else np.empty((0, 3))
-    uvs = np.array(uvs, dtype=np.float64) if uvs else None
-    face_v = np.array(face_v, dtype=np.int64) if face_v else np.empty((0, 3), np.int64)
-    face_t = np.array(face_t, dtype=np.int64) if face_t else np.empty((0, 3), np.int64)
-    return verts, uvs, face_v, face_t
+            slot = 0 if current_sub is None else current_sub
+            sub_fv[slot].append(vi)
+            sub_ft[slot].append(ti)
+
+    verts_a = np.array(verts, dtype=np.float64) if verts else np.empty((0, 3))
+    uvs_a = np.array(uvs, dtype=np.float64) if uvs else None
+    if not sub_fv:
+        return verts_a, uvs_a, [], []
+    n = max(sub_fv.keys()) + 1
+    face_v_list: list[np.ndarray] = []
+    face_t_list: list[np.ndarray] = []
+    for i in range(n):
+        fv = sub_fv.get(i) or []
+        ft = sub_ft.get(i) or []
+        face_v_list.append(
+            np.array(fv, dtype=np.int64) if fv else np.empty((0, 3), dtype=np.int64)
+        )
+        face_t_list.append(
+            np.array(ft, dtype=np.int64) if ft else np.empty((0, 3), dtype=np.int64)
+        )
+    return verts_a, uvs_a, face_v_list, face_t_list
 
 
 def sample_hex(pal: np.ndarray, uv_centroids: np.ndarray) -> np.ndarray:
@@ -1186,10 +1224,13 @@ def discover_livery_materials(bundle_path: str, bundle: Bundle | None = None) ->
                 'name': label,
                 'partCount': hits,
                 'bodyParts': len(body),
-                'transformRoot': root,
+                # Stringify 64-bit Unity path IDs: JS JSON.parse cannot round-trip
+                # integers beyond Number.MAX_SAFE_INTEGER, which would corrupt
+                # includeRoots and make multi-plane imports miss every mesh.
+                'transformRoot': str(root),
                 # One root per import so duplicate packed copies / foreign
                 # hulls sharing this material are never merged.
-                'includeRoots': [root],
+                'includeRoots': [str(root)],
             }
             if companions:
                 entry['companionMaterials'] = sorted(companions)
@@ -1788,16 +1829,41 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
         print('Multi-aircraft collection bundle: global spatial part rescue disabled.',
               file=sys.stderr)
 
-    def is_glass(name: str, mat: dict | None) -> bool:
-        if is_glass_part(name, tca):
+    def material_is_true_glass(mat: dict | None) -> bool:
+        """Shared Canopy/Glass material or low-alpha transparency — not livery paint."""
+        if mat is None:
+            return False
+        cls = classify_material(mat.get('name', ''), tca)
+        if cls is not None and cls.palette_category == GLASS_CATEGORY:
             return True
-        if mat is not None:
-            cls = classify_material(mat.get('name', ''), tca)
-            if cls is not None and cls.palette_category == GLASS_CATEGORY:
-                return True
-        if glass_auto_alpha and mat is not None and mat['alpha'] < glass_alpha_max:
+        return bool(glass_auto_alpha and mat.get('alpha', 1.0) < glass_alpha_max)
+
+    def is_glass(
+        name: str,
+        mat: dict | None,
+        *,
+        sibling_has_true_glass: bool = False,
+    ) -> bool:
+        """True for see-through canopy glass faces.
+
+        Rules (same for every mod):
+        1. Shared Canopy/Glass material, or low alpha → glass.
+        2. On a canopy-named mesh that also has true glass, opaque materials are
+           frames/seals/interior and stay solid.
+        3. On a canopy-named mesh with no true-glass submesh, opaque materials
+           still count as glass (livery-painted canopy bubble).
+        """
+        if material_is_true_glass(mat):
             return True
-        return False
+        if not is_glass_part(name, tca):
+            return False
+        if (
+            sibling_has_true_glass
+            and mat is not None
+            and mat.get('alpha', 1.0) >= glass_alpha_max
+        ):
+            return False
+        return True
 
     def is_nozzle(name: str, mat: dict | None) -> bool:
         """True for an afterburner nozzle-interior mesh (shared NozzleInteriorMat
@@ -1842,7 +1908,8 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
         return rgba01_to_hex(em)
 
     def face_colors(name: str, mat: dict | None, face_t: np.ndarray,
-                    uvs: np.ndarray | None, pal: np.ndarray | None) -> np.ndarray:
+                    uvs: np.ndarray | None, pal: np.ndarray | None,
+                    *, sibling_has_true_glass: bool = False) -> np.ndarray:
         # 1. Explicit per-material override wins.
         if mat is not None and mat['name'] in material_colors:
             res = np.full(len(face_t), material_colors[mat['name']])
@@ -1853,7 +1920,7 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
         # 3. Glass: a PaletteCategory glass colour (e.g. 'GLASS') always renders
         # as one uniform material so the sim can tint/dither it; a literal
         # '#rrggbb' still samples per-poly tint when the glass has a swatch.
-        elif is_glass(name, mat):
+        elif is_glass(name, mat, sibling_has_true_glass=sibling_has_true_glass):
             # Always tag glass faces with the configured glass colour (usually the
             # PaletteCategory 'GLASS'). Do not palette-sample glass: livery swatches
             # on canopy parts would export as opaque hex colours the renderer cannot
@@ -1893,9 +1960,11 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     surface_defs = flyable.get('surfaces', []) if flyable else []
     gear_names = set(flyable.get('gear', [])) if flyable else set()
 
-    def colourable(name: str, sub_mat: dict | None, pal) -> bool:
+    def colourable(name: str, sub_mat: dict | None, pal,
+                   *, sibling_has_true_glass: bool = False) -> bool:
         has_override = sub_mat is not None and sub_mat['name'] in material_colors
-        return bool(has_override or is_nozzle(name, sub_mat) or is_glass(name, sub_mat)
+        return bool(has_override or is_nozzle(name, sub_mat)
+                    or is_glass(name, sub_mat, sibling_has_true_glass=sibling_has_true_glass)
                     or emissive_hex(sub_mat) is not None
                     or pal is not None or (sub_mat is not None and sub_mat['color']))
 
@@ -2242,16 +2311,24 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     def build_buckets(parts, translate) -> dict[str, list[np.ndarray]]:
         buckets: dict[str, list[np.ndarray]] = defaultdict(list)
         for p in parts:
+            sibling_glass = any(material_is_true_glass(m) for m in p['sub_mats'])
             for si, face_v in enumerate(p['sub_faces']):
+                if len(face_v) == 0:
+                    continue
                 sub_mat = p['sub_mats'][si]
                 if sub_mat and any(s in sub_mat['name'] for s in skip_materials):
                     continue
                 pal = palette_array(sub_mat)
-                if not colourable(p['name'], sub_mat, pal):
+                if not colourable(
+                    p['name'], sub_mat, pal, sibling_has_true_glass=sibling_glass,
+                ):
                     continue
                 face_t = p['sub_face_t'][si]
                 tri_corners = p['world_v'][face_v] + translate
-                keys = face_colors(p['name'], sub_mat, face_t, p['uvs'], pal)
+                keys = face_colors(
+                    p['name'], sub_mat, face_t, p['uvs'], pal,
+                    sibling_has_true_glass=sibling_glass,
+                )
                 for key in np.unique(keys):
                     buckets[str(key)].append(tri_corners[keys == key].reshape(-1, 3))
         return buckets
@@ -2333,16 +2410,24 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
             tpid = p.get('tpid')
             # Build per-colour buckets for THIS part only (keep part identity).
             part_buckets: dict[str, list[np.ndarray]] = defaultdict(list)
+            sibling_glass = any(material_is_true_glass(m) for m in p['sub_mats'])
             for si, face_v in enumerate(p['sub_faces']):
+                if len(face_v) == 0:
+                    continue
                 sub_mat = p['sub_mats'][si]
                 if sub_mat and any(s in sub_mat['name'] for s in skip_materials):
                     continue
                 pal = palette_array(sub_mat)
-                if not colourable(p['name'], sub_mat, pal):
+                if not colourable(
+                    p['name'], sub_mat, pal, sibling_has_true_glass=sibling_glass,
+                ):
                     continue
                 face_t = p['sub_face_t'][si]
                 tri_corners = p['world_v'][face_v] + translate
-                face_keys = face_colors(p['name'], sub_mat, face_t, p['uvs'], pal)
+                face_keys = face_colors(
+                    p['name'], sub_mat, face_t, p['uvs'], pal,
+                    sibling_has_true_glass=sibling_glass,
+                )
                 for key in np.unique(face_keys):
                     part_buckets[str(key)].append(tri_corners[face_keys == key].reshape(-1, 3))
             if not part_buckets:

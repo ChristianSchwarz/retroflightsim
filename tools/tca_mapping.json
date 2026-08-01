@@ -26,7 +26,7 @@
         "Windscreen",
         "CanopyEject"
       ],
-      "excludeSubstring": ["CanopyFrame"]
+      "excludeSubstring": ["CanopyFrame", "CanopyRubber", "CanopySeal", "CanopyRail"]
     },
     "nozzle": {
       "exact": ["Nozzle"],
@@ -64,7 +64,7 @@
       "excludeSubstring": ["Tail"]
     },
     "skip": {
-      "substring": ["Collider", "Shadow"]
+      "substring": ["Collider", "Shadow", "WingInner"]
     },
     "discoverSkip": {
       "substring": [

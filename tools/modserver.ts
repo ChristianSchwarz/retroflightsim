@@ -28,7 +28,7 @@ interface ImportConfig {
     bundle: string;
     out: string;
     includeMaterials?: string[];
-    includeRoots?: number[];
+    includeRoots?: Array<string | number>;
     companionMaterials?: string[];
     dedupeParts?: boolean;
     rescueGlassUnderRoot?: boolean;
@@ -49,8 +49,9 @@ interface DiscoveredPlane {
     name: string;
     partCount?: number;
     bodyParts?: number;
-    transformRoot?: number;
-    includeRoots?: number[];
+    /** Unity path ID — string to preserve values beyond JS MAX_SAFE_INTEGER. */
+    transformRoot?: string | number;
+    includeRoots?: Array<string | number>;
     companionMaterials?: string[];
 }
 
@@ -86,7 +87,7 @@ interface PlaneImportPlan {
     spawnOffset?: number;
     spawnRotation?: number;
     dotColors?: [number, number, number];
-    includeRoots?: number[];
+    includeRoots?: Array<string | number>;
     companionMaterials?: string[];
 }
 
@@ -100,7 +101,7 @@ interface AircraftImportChoice {
         material: string;
         label: string;
         confidence: number;
-        includeRoots?: number[];
+        includeRoots?: Array<string | number>;
         companionMaterials?: string[];
     }>;
     defaultMaterial: string;
@@ -382,9 +383,6 @@ function scoreCatalogMatch(plane: DiscoveredPlane, aircraft: CatalogAircraft): n
     const planeLabel = renamed ? plane.name : `${plane.name} ${plane.material}`;
     const planeNorm = normalizeName(planeLabel);
     const aircraftNorm = normalizeName(`${aircraft.canonicalName} ${aircraft.displayName}`);
-    const aircraftFull = normalizeName(
-        `${aircraft.canonicalName} ${aircraft.displayName} ${aircraft.description ?? ''} ${aircraft.modelPath ?? ''}`,
-    );
     if (!planeNorm || !aircraftNorm) return 0;
     let score = 0;
     if (planeNorm === aircraftNorm) score += 10;
@@ -411,21 +409,6 @@ function scoreCatalogMatch(plane: DiscoveredPlane, aircraft: CatalogAircraft): n
         const modelBase = path.basename(aircraft.modelPath, path.extname(aircraft.modelPath));
         const modelNorm = normalizeName(modelBase);
         if (modelNorm && (planeNorm.includes(modelNorm) || modelNorm.includes(planeNorm))) {
-            score += 4;
-        }
-    }
-
-    const keywordBoost: Array<[string, string]> = [
-        ['rnlaf', 'rnlaf'],
-        ['rdaf', 'rdaf'],
-        ['vvs', 'vvs'],
-        ['gdr', 'gdr'],
-        ['czaf', 'czaf'],
-        ['sabers', '52'],
-        ['sabers', '15'],
-    ];
-    for (const [planeKey, aircraftKey] of keywordBoost) {
-        if (planeNorm.includes(planeKey) && aircraftFull.includes(aircraftKey)) {
             score += 4;
         }
     }
@@ -554,7 +537,7 @@ function buildAircraftChoices(
         aircraft: CatalogAircraft;
         liveries: Map<string, {
             score: number;
-            includeRoots?: number[];
+            includeRoots?: Array<string | number>;
             companionMaterials?: string[];
             label: string;
         }>;
@@ -771,6 +754,16 @@ function runPython(args: string[]): Promise<PythonResult> {
     });
 }
 
+function parseJsonPreservingLargeInts(text: string): unknown {
+    // JS Number cannot represent Unity 64-bit path IDs exactly. Quote any bare
+    // integer outside the safe range so JSON.parse keeps the full digits.
+    const quoted = text.replace(
+        /(^|[:\[,]\s*)(-?(?:0|[1-9]\d{15,}))(?=\s*[,\]}])/gm,
+        '$1"$2"',
+    );
+    return JSON.parse(quoted);
+}
+
 async function discoverPlanes(bundlePath: string): Promise<DiscoveredPlane[]> {
     const result = await runPython(['tools/import_mod.py', '--bundle', bundlePath, '--discover']);
     if (result.code !== 0) {
@@ -783,7 +776,7 @@ async function discoverPlanes(bundlePath: string): Promise<DiscoveredPlane[]> {
         throw new Error(`discover returned invalid JSON: ${text}`);
     }
     try {
-        return JSON.parse(text.slice(start, end + 1)) as DiscoveredPlane[];
+        return parseJsonPreservingLargeInts(text.slice(start, end + 1)) as DiscoveredPlane[];
     } catch {
         throw new Error(`discover returned invalid JSON: ${text}`);
     }
@@ -868,9 +861,6 @@ function buildPlaneConfig(
             rescueNozzleUnderRoot: true,
             rescueNozzleGlobal: !collectionPack,
             rescueMaterialsUnderRoot: false,
-            // Coplanar inner wing shells z-fight with WingL/WingR at the wing root
-            // (confirmed on F-18A/C and Su-33 in Global Skies Collection).
-            skipExact: ['WingInnerL', 'WingInnerR'],
         } : {}),
     };
 }

@@ -43,8 +43,19 @@ class TcaMappingTests(unittest.TestCase):
     def test_glass_part_by_mesh_name(self):
         self.assertTrue(is_glass_part('CanopyFront'))
         self.assertTrue(is_glass_part('Canopy'))
+        self.assertTrue(is_glass_part('CanopyEject'))
         self.assertFalse(is_glass_part('CanopyFrame'))
+        self.assertFalse(is_glass_part('CanopyFrameL'))
         self.assertFalse(is_glass_part('Fuselage'))
+
+    def test_canopy_frame_materials_are_not_glass(self):
+        self.assertIsNone(classify_material('CanopyRubber'))
+        self.assertIsNone(classify_material('CanopyFrame'))
+        self.assertIsNone(classify_material('CanopyFrameMat'))
+        self.assertIsNone(classify_material('CanopySeal'))
+        gold = classify_material('Canopy Gold')
+        self.assertIsNotNone(gold)
+        self.assertEqual(gold.palette_category, 'GLASS')
 
     def test_wingtip_part_by_mesh_name(self):
         self.assertTrue(is_wingtip_part('WingTipL'))
@@ -72,6 +83,9 @@ class TcaMappingTests(unittest.TestCase):
     def test_skip_part_collider_shadow(self):
         self.assertTrue(classify_part('WingCollider', 'skip'))
         self.assertTrue(classify_part('ShadowMesh', 'skip'))
+        self.assertTrue(classify_part('WingInnerL', 'skip'))
+        self.assertTrue(classify_part('WingInnerR', 'skip'))
+        self.assertFalse(classify_part('WingL', 'skip'))
 
     def test_surface_rules_first_match(self):
         available = {'ElevatorL', 'AileronL', 'Rudder'}
