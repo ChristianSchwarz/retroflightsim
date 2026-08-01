@@ -74,6 +74,7 @@ from tca_mapping import (
     classify_material,
     is_attachment_empty,
     is_cockpit_part,
+    is_collision_mesh,
     is_discover_skip_part,
     is_engine_part,
     is_fuselage_part,
@@ -95,6 +96,8 @@ GLASS_CATEGORY = 'GLASS'
 DEFAULT_MATERIAL = '#909094'  # neutral grey fallback
 # PaletteCategory used for a generated flyable-aircraft shadow silhouette.
 SHADOW_MATERIAL = 'SCENERY_TREE_SHADOW'
+# Reserved material token for invisible TCA hitbox / collider meshes.
+COLLISION_MATERIAL = 'COLLISION'
 # Dark metal for nozzle-interior mesh geometry (TCA rest pose is black).
 DEFAULT_NOZZLE_COLOR = '#1a1a1a'
 # Kept for material-name parsing in legacy glTF node names.
@@ -1750,9 +1753,10 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     ground_part_names = list(cfg.get('groundParts', cfg.get('gearWheelParts', [])))
     ground_parts = set(ground_part_names)
     include_exact = set(cfg.get('includeExact', []))
-    # Always apply the collider/shadow name fallbacks so unbundled shared
-    # materials cannot let those meshes leak in; includeExact still rescues any
-    # legitimate part that happens to match.
+    # Always apply shadow/clutter name fallbacks so unbundled shared materials
+    # cannot let those meshes leak into the visible body; includeExact still
+    # rescues any legitimate part that happens to match. Colliders are kept
+    # separately (see collision_parts) rather than skipped.
     skip_parts = skip_part_substrings(tca)
     skip_exact = set(cfg.get('skipExact', []))
     skip_materials = tuple(cfg.get('skipMaterials', tca.skip_material_substrings))
@@ -2002,6 +2006,14 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
         'rescueNozzleGlobal',
         global_rescue_default,
     )) and bool(include_materials)
+    rescue_collision = bool(cfg.get(
+        'rescueCollisionUnderRoot',
+        bool(include_materials),
+    )) and bool(include_materials)
+    rescue_collision_global = bool(cfg.get(
+        'rescueCollisionGlobal',
+        global_rescue_default,
+    )) and bool(include_materials)
     rescue_materials = bool(cfg.get('rescueMaterialsUnderRoot', False)) and bool(include_materials)
 
     def _root_of(tpid: int) -> int:
@@ -2052,6 +2064,9 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
 
     def _is_cockpit_mesh(name: str) -> bool:
         return is_cockpit_part(name, tca)
+
+    def _is_collision_mesh(name: str, pids) -> bool:
+        return is_collision_mesh(name, _mat_names_for_pids(pids), tca)
 
     matched_roots: set[int] = set()
     plane_bounds: tuple[np.ndarray, np.ndarray] | None = None
@@ -2205,6 +2220,13 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
             return True
         return rescue_cockpit_global and _near_plane_bounds(transform_pid)
 
+    def _collision_rescued(name: str, pids, transform_pid: int) -> bool:
+        if not rescue_collision or not _is_collision_mesh(name, pids):
+            return False
+        if _root_of(transform_pid) in matched_roots:
+            return True
+        return rescue_collision_global and _near_plane_bounds(transform_pid)
+
     processed: list[dict] = []
     ground_contact_y = None
 
@@ -2213,7 +2235,10 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
             continue
         go = o.read()
         name = go.m_Name
-        if not _should_include(name, include_exact, skip_parts, skip_exact):
+        # Collider-named parts are collected even when "Collider" appears in an
+        # overridden skipNameParts list — they route to collision_parts, not body.
+        is_collider_name = is_collision_mesh(name, (), tca)
+        if not is_collider_name and not _should_include(name, include_exact, skip_parts, skip_exact):
             continue
 
         transform_pid = None
@@ -2254,6 +2279,7 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
                 _nozzle_rescued(name, mat_pids, transform_pid)
                 or _glass_rescued(name, mat_pids, transform_pid)
                 or _cockpit_rescued(name, transform_pid)
+                or _collision_rescued(name, mat_pids, transform_pid)
                 or (
                     same_root
                     and (
@@ -2265,9 +2291,14 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
         )
         if include_materials and not has_livery and not rescued:
             continue
-        if any(any(s in bundle.materials.get(pid, {}).get('name', '')
-                   for s in skip_materials)
-               for pid in mat_pids):
+        mat_names = _mat_names_for_pids(mat_pids)
+        part_is_collision = is_collision_mesh(name, mat_names, tca)
+        # Skip shadow materials always; collider materials are kept as collision.
+        if not part_is_collision and any(
+            any(s in bundle.materials.get(pid, {}).get('name', '')
+                for s in skip_materials)
+            for pid in mat_pids
+        ):
             continue
         if dedupe_parts:
             dedupe_key = (name, _root_of(transform_pid))
@@ -2298,13 +2329,19 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
             'name': name, 'world_v': world_v, 'uvs': uvs,
             'sub_faces': sub_faces, 'sub_face_t': sub_face_t, 'sub_mats': sub_mats,
             'tpid': transform_pid,
+            'is_collision': part_is_collision,
         })
 
     if not processed:
         raise SystemExit('No colourable meshes found. Try --list to inspect the bundle.')
 
+    collision_parts = [p for p in processed if p.get('is_collision')]
+    visual_parts = [p for p in processed if not p.get('is_collision')]
+    if not visual_parts:
+        raise SystemExit('No visual meshes found (only colliders). Try --list to inspect the bundle.')
+
     if ground_contact_y is None:
-        ground_contact_y = min(float(p['world_v'][:, 1].min()) for p in processed)
+        ground_contact_y = min(float(p['world_v'][:, 1].min()) for p in visual_parts)
     ground_min_y = ground_contact_y
     ground_offset_y = -ground_distance - ground_min_y
 
@@ -2348,6 +2385,53 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
             scene.add_geometry(m, node_name=f'0_{idx}_{key}', geom_name=f'{idx}_{key}')
         _write_gltf(scene, out_path, buffer_prefix, animations=animations)
         return sorted(buckets)
+
+    def emit_collision(parts, translate, out_path, buffer_prefix) -> bool:
+        """Emit collider meshes under the reserved COLLISION material (invisible)."""
+        translate = np.asarray(translate, dtype=np.float64)
+        tris: list[np.ndarray] = []
+        for p in parts:
+            for face_v in p['sub_faces']:
+                if len(face_v) == 0:
+                    continue
+                tris.append((p['world_v'][face_v] + translate).reshape(-1, 3))
+        if not tris:
+            return False
+        v = np.vstack(tris)
+        f = np.arange(len(v), dtype=np.int64).reshape(-1, 3)
+        m = trimesh.Trimesh(vertices=v, faces=f, process=False)
+        _set_flat_normals(m)
+        m.visual = trimesh.visual.TextureVisuals(
+            material=trimesh.visual.material.PBRMaterial(name=COLLISION_MATERIAL))
+        scene = trimesh.Scene()
+        scene.add_geometry(m, node_name=f'0_0_{COLLISION_MATERIAL}',
+                           geom_name=f'0_{COLLISION_MATERIAL}')
+        _write_gltf(scene, out_path, buffer_prefix)
+        return True
+
+    def bake_collision_mesh(parts, translate) -> dict | None:
+        """Body-frame triangle soup + AABB for runtime bullet/ground tests."""
+        translate = np.asarray(translate, dtype=np.float64)
+        flat: list[float] = []
+        for p in parts:
+            for face_v in p['sub_faces']:
+                if len(face_v) == 0:
+                    continue
+                corners = (p['world_v'][face_v] + translate).reshape(-1, 3)
+                for row in corners:
+                    flat.extend((float(row[0]), float(row[1]), float(row[2])))
+        if not flat:
+            return None
+        arr = np.asarray(flat, dtype=np.float64).reshape(-1, 3)
+        mn = arr.min(axis=0)
+        mx = arr.max(axis=0)
+        return {
+            'triangles': [round(float(x), 5) for x in flat],
+            'aabb': {
+                'min': [round(float(x), 5) for x in mn],
+                'max': [round(float(x), 5) for x in mx],
+            },
+        }
 
     def emit_gear_animated(parts, translate, out_path, buffer_prefix, clip) -> tuple[list[str], bool]:
         """Emit per-part gear meshes with baked GearUp clips (doors close late).
@@ -2544,17 +2628,17 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     ground_translate = [0.0, ground_offset_y, 0.0]
 
     if not flyable:
-        keys = emit(processed, ground_translate, out, buffer_prefix)
+        keys = emit(visual_parts, ground_translate, out, buffer_prefix)
         print(f'Wrote {out}')
-        print(f'Parts: {len(processed)}, colours/materials: {len(keys)}')
+        print(f'Parts: {len(visual_parts)}, colours/materials: {len(keys)}')
         print('  ' + ', '.join(keys))
         print(f'ground_min_y: {ground_min_y:.3f}, ground_offset_y: {ground_offset_y:.3f}')
         return 0
 
-    available = {p['name'] for p in processed}
+    available = {p['name'] for p in visual_parts}
     _, _, full_paths_for_roots = build_transform_path_index(bundle)
     aircraft_roots: set[str] = set()
-    for p in processed:
+    for p in visual_parts:
         tpid = p.get('tpid')
         if not tpid or tpid not in full_paths_for_roots:
             continue
@@ -2603,7 +2687,7 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     if not gear_names and flyable.get('autoGear', True) is not False:
         _, _, full_paths_for_gear = build_transform_path_index(bundle)
         detected_gear = auto_gear_names_from_clip(
-            available, gear_clip, processed, full_paths_for_gear, tca)
+            available, gear_clip, visual_parts, full_paths_for_gear, tca)
         if detected_gear:
             gear_names = detected_gear
             print(f'Auto-detected {len(gear_names)} gear/door part(s)')
@@ -2623,9 +2707,9 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
         prefix = os.path.join(PROJECT_ROOT, prefix)
 
     surface_parts = set(surface_of_part.keys())
-    body_parts = [p for p in processed
+    body_parts = [p for p in visual_parts
                   if p['name'] not in surface_parts and p['name'] not in gear_names]
-    gear_parts = [p for p in processed if p['name'] in gear_names]
+    gear_parts = [p for p in visual_parts if p['name'] in gear_names]
 
     body_path = f'{prefix}_body.gltf'
     body_keys = emit(body_parts, ground_translate, body_path, bp(body_path))
@@ -2656,7 +2740,7 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
 
     surfaces_manifest = []
     for si, sd in enumerate(surface_defs):
-        members = [p for pn in sd.get('parts', []) for p in processed if p['name'] == pn]
+        members = [p for pn in sd.get('parts', []) for p in visual_parts if p['name'] == pn]
         if not members:
             print(f'WARNING: surface "{sd.get("role", si)}" matched no parts; skipping.')
             continue
@@ -2745,7 +2829,7 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     # Flattened planform shadow in the same aircraft-local frame as the body.
     shadow_path = f'{prefix}_shadow.gltf'
     shadow_manifest = (rel(shadow_path)
-                       if emit_shadow(processed, ground_translate, shadow_path, bp(shadow_path))
+                       if emit_shadow(visual_parts, ground_translate, shadow_path, bp(shadow_path))
                        else None)
     if shadow_manifest:
         print(f'Wrote {shadow_path}')
@@ -3013,7 +3097,7 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
     if ground_part_names and flight:
         gear_cfg = dict(flight.get('gear') or {})
         derived = derive_gear_points(
-            processed, ground_part_names, np.asarray(ground_translate),
+            visual_parts, ground_part_names, np.asarray(ground_translate),
             bottom_percentile=ground_contact_percentile,
         )
         if derived:
@@ -3024,10 +3108,22 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
 
     # Emit the ramp static model before writing the manifest so a crashed or
     # empty static export cannot leave a dangling static path in the pack list.
-    static_keys = emit(processed, ground_translate, out, buffer_prefix)
+    static_keys = emit(visual_parts, ground_translate, out, buffer_prefix)
     static_manifest = rel(out) if static_keys else None
     if static_keys:
         print(f'Wrote {out} ({len(static_keys)} colours)')
+
+    collision_path = f'{prefix}_collision.gltf'
+    collision_gltf = None
+    collision_mesh = None
+    if collision_parts:
+        if emit_collision(collision_parts, ground_translate, collision_path, bp(collision_path)):
+            collision_gltf = rel(collision_path)
+            print(f'Wrote {collision_path} ({len(collision_parts)} collider part(s))')
+        collision_mesh = bake_collision_mesh(collision_parts, ground_translate)
+        if collision_mesh:
+            n_tri = len(collision_mesh['triangles']) // 9
+            print(f'Baked collision mesh: {n_tri} triangle(s)')
 
     manifest = {
         'id': cfg.get('id', stem),
@@ -3046,6 +3142,8 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
         'gear': gear_manifest,
         'gearAnimated': bool(gear_animated),
         'static': static_manifest,
+        'collision': collision_gltf,
+        'collisionMesh': collision_mesh,
         'surfaces': surfaces_manifest,
         'fx': fx,
         'attachments': attachments or None,
@@ -3060,8 +3158,8 @@ def import_mod(cfg: dict, bundle: Bundle | None = None) -> int:
         json.dump(manifest, f, indent=2)
     print(f'Wrote {manifest_path}')
 
-    print(f'Parts: {len(processed)} (body {len(body_parts)}, '
-          f'gear {len(gear_parts)}, surfaces {len(surfaces_manifest)})')
+    print(f'Parts: {len(visual_parts)} visual + {len(collision_parts)} collision '
+          f'(body {len(body_parts)}, gear {len(gear_parts)}, surfaces {len(surfaces_manifest)})')
     print(f'ground_min_y: {ground_min_y:.3f}, ground_offset_y: {ground_offset_y:.3f}')
     return 0
 
@@ -3093,7 +3191,7 @@ def _material_key_from_node_name(nm: str) -> str:
             except ValueError:
                 pass
     # Known PaletteCategory names (may contain underscores).
-    for cat in (SHADOW_MATERIAL, FX_FIRE_MATERIAL, GLASS_CATEGORY):
+    for cat in (SHADOW_MATERIAL, FX_FIRE_MATERIAL, GLASS_CATEGORY, COLLISION_MATERIAL):
         if nm == cat or nm.endswith('_' + cat):
             return cat
     # Classic `0_{idx}_{key}` / `0_{part}_{key}`: everything after the second '_'.

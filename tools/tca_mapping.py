@@ -64,7 +64,10 @@ class TcaMapping:
     gear_mandatory_bones: tuple[str, ...]
     hinge_bone_prefix: str
     skip_material_substrings: tuple[str, ...] = (
-        'Collider', 'ShadowDepthOffset', 'Shadow',
+        'ShadowDepthOffset', 'Shadow',
+    )
+    collision_material_substrings: tuple[str, ...] = (
+        'Collider',
     )
 
 
@@ -132,8 +135,8 @@ def _parse_mapping(data: dict[str, Any]) -> TcaMapping:
         rudder_fallback=rudder_fallback,
         animated_part_fields=animated,
         livery_skip_material_substrings=tuple(
-            livery.get('skipMaterialSubstrings', ['Collider', 'ShadowDepthOffset', 'Shadow']),
-        ),
+            livery.get('skipMaterialSubstrings', ['ShadowDepthOffset', 'Shadow'])
+        ) + tuple(livery.get('collisionMaterialSubstrings', ['Collider'])),
         livery_name_substrings_lower=tuple(livery.get('nameSubstringsLower', [])),
         livery_weapon_substrings_lower=tuple(livery.get('weaponSubstringsLower', [])),
         gear_clip_skip_exact=tuple(clip_skip.get('exact', [])),
@@ -141,7 +144,10 @@ def _parse_mapping(data: dict[str, Any]) -> TcaMapping:
         gear_mandatory_bones=tuple(gear_raw.get('mandatoryBones', [])),
         hinge_bone_prefix=str(conventions.get('hingeBonePrefix', 'B')),
         skip_material_substrings=tuple(
-            livery.get('skipMaterialSubstrings', ['Collider', 'ShadowDepthOffset', 'Shadow']),
+            livery.get('skipMaterialSubstrings', ['ShadowDepthOffset', 'Shadow']),
+        ),
+        collision_material_substrings=tuple(
+            livery.get('collisionMaterialSubstrings', ['Collider']),
         ),
     )
 
@@ -272,8 +278,29 @@ def is_skip_part(name: str, mapping: TcaMapping | None = None) -> bool:
     return classify_part(name, 'skip', mapping)
 
 
+def is_collision_part(name: str, mapping: TcaMapping | None = None) -> bool:
+    return classify_part(name, 'collision', mapping)
+
+
 def is_discover_skip_part(name: str, mapping: TcaMapping | None = None) -> bool:
     return classify_part(name, 'discoverSkip', mapping)
+
+
+def is_collision_material(name: str, mapping: TcaMapping | None = None) -> bool:
+    """True when a material name is a TCA collider (ColliderMat / Collider*)."""
+    mapping = mapping or default_mapping()
+    cls = classify_material(name, mapping)
+    if cls is not None and cls.action == 'collision':
+        return True
+    return any(s in name for s in mapping.collision_material_substrings)
+
+
+def is_collision_mesh(name: str, mat_names: tuple[str, ...] | list[str],
+                      mapping: TcaMapping | None = None) -> bool:
+    """True when a mesh is collision geometry by part name or collider material."""
+    if is_collision_part(name, mapping):
+        return True
+    return any(is_collision_material(m, mapping) for m in mat_names if m)
 
 
 def is_body_hint_part(name: str, mapping: TcaMapping | None = None) -> bool:

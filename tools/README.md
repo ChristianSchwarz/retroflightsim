@@ -172,8 +172,10 @@ With `skipClutter` false (the F10 default for flyable imports), cockpit/canopy
 meshes export while weapons/pylons/gauges are still skipped when
 `skipClutter` is enabled. Narrow further with `skipNameParts` / `skipExact`.
 
-Mesh names containing `Collider` or `Shadow` are **always** skipped (in addition
-to `skipNameParts`). TCA's shared `ColliderMat`/`ShadowDepthOffset` materials are
+Mesh names containing `Shadow` or `WingInner` are **always** skipped (in addition
+to `skipNameParts`). TCA's shared `ColliderMat` meshes are exported as an invisible
+`*_collision.gltf` plus baked `collisionMesh` triangles for combat/ground hits.
+`ShadowDepthOffset` / authored shadow meshes remain skipped — shared shadow materials are
 referenced by GUID and usually are not bundled with a workshop mod, so their
 material name cannot be resolved; the name fallback ensures those meshes are
 still dropped (the sim generates its own shadow silhouette). Use `includeExact`

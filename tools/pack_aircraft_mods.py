@@ -57,6 +57,8 @@ def collect_manifest_paths(manifest: dict) -> tuple[list[str], set[str]]:
         paths.append(manifest['shadow'])
     if manifest.get('gear'):
         paths.append(manifest['gear'])
+    if manifest.get('collision'):
+        paths.append(manifest['collision'])
     if manifest.get('static'):
         paths.append(manifest['static'])
         optional.add(pack_relative(manifest['static']))
@@ -107,6 +109,10 @@ def rewrite_manifest(manifest: dict, mod_id: str, files: set[str]) -> dict:
         out['gear'] = pack_relative(manifest['gear'])
     else:
         out['gear'] = None
+    if manifest.get('collision') and pack_relative(manifest['collision']) in files:
+        out['collision'] = pack_relative(manifest['collision'])
+    else:
+        out['collision'] = None
     static_rel = f'{mod_id}_static.gltf'
     if static_rel in files:
         out['static'] = static_rel

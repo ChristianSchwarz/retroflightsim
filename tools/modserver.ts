@@ -814,7 +814,7 @@ function buildPlaneConfig(
             bitmapLivery: true,
             glassColor: 'GLASS',
             glassAutoAlpha: true,
-            skipMaterials: ['Collider', 'ShadowDepthOffset', 'Shadow'],
+            skipMaterials: ['ShadowDepthOffset', 'Shadow'],
         };
 
     const catalogSpawn = buildSpawnFromPlan(plane);
@@ -860,6 +860,8 @@ function buildPlaneConfig(
             rescueCockpitGlobal: !collectionPack,
             rescueNozzleUnderRoot: true,
             rescueNozzleGlobal: !collectionPack,
+            rescueCollisionUnderRoot: true,
+            rescueCollisionGlobal: !collectionPack,
             rescueMaterialsUnderRoot: false,
         } : {}),
     };

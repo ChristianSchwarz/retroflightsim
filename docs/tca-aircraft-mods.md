@@ -344,8 +344,9 @@ Real mods vary along several axes the importer must handle:
   substrings, and auto-alpha; rendered as a fixed `glassColor` (default
   `GLASS` category). Gap: the shared `Canopy` tint/alpha (blue, ~16%) is ignored
   in favour of a constant.
-- **Colliders / authored shadows** — Handled. Skipped by `DEFAULT_SKIP_MATERIALS`;
-  the sim generates its own silhouette shadow. No gap.
+- **Colliders / authored shadows** — Colliders exported as invisible
+  `*_collision.gltf` + baked `collisionMesh` for bullet/ground hits. Authored
+  shadows still skipped; the sim generates its own silhouette. No gap.
 - **Nozzle interior / afterburner** — Not handled. `NozzleInteriorMat` meshes are
   either colour-sampled like body parts or dropped; they are never tagged
   `FX_FIRE`, so the sim's throttle-driven glow (which already exists) never binds.
@@ -470,7 +471,7 @@ present.
 - `Canopy` shared material / TinyCanopy -> `GLASS` palette category.
 - `NozzleInteriorMat` -> should map to `FX_FIRE` (recommendation 1).
 - `ShadowDepthOffset` mesh -> skipped; sim generates `VEHICLE_PLANE_GREY` silhouette.
-- `ColliderMat` mesh -> skipped (`DEFAULT_SKIP_MATERIALS`).
+- `ColliderMat` mesh -> exported as `*_collision.gltf` + baked `collisionMesh` (invisible hitboxes).
 - `GearUp` animator + `.anim` -> currently discarded; target of recommendation 2.
 - Procedural control-surface bones -> `surfaces[]` with pivot/axis in the manifest.
 - `SpawnOffset`/`SpawnRotation`/`DotColors` -> currently unused (recommendation 5).

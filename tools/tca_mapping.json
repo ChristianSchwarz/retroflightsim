@@ -7,8 +7,8 @@
     "CanopyGlass": { "paletteCategory": "GLASS" },
     "Windscreen": { "paletteCategory": "GLASS" },
     "CanopyBack": { "paletteCategory": "GLASS" },
-    "ColliderMat": { "action": "skip" },
-    "Collider": { "action": "skip" },
+    "ColliderMat": { "action": "collision" },
+    "Collider": { "action": "collision" },
     "ShadowDepthOffset": { "action": "skip" },
     "ShadowHeightOffset": { "action": "skip" },
     "Shadow": { "action": "skip" },
@@ -63,8 +63,11 @@
       ],
       "excludeSubstring": ["Tail"]
     },
+    "collision": {
+      "substring": ["Collider"]
+    },
     "skip": {
-      "substring": ["Collider", "Shadow", "WingInner"]
+      "substring": ["Shadow", "WingInner"]
     },
     "discoverSkip": {
       "substring": [
@@ -392,7 +395,8 @@
     { "field": "AngleByYaw", "control": "yaw" }
   ],
   "liveryMaterialExclude": {
-    "skipMaterialSubstrings": ["Collider", "ShadowDepthOffset", "Shadow"],
+    "skipMaterialSubstrings": ["ShadowDepthOffset", "Shadow"],
+    "collisionMaterialSubstrings": ["Collider"],
     "nameSubstringsLower": [
       "glass",
       "canopy",

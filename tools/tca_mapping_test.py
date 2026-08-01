@@ -12,6 +12,8 @@ from tca_mapping import (
     default_import_skip_substrings,
     is_attachment_empty,
     is_cockpit_part,
+    is_collision_mesh,
+    is_collision_part,
     is_glass_part,
     is_livery_material,
     is_nozzle_mesh,
@@ -30,10 +32,10 @@ class TcaMappingTests(unittest.TestCase):
         self.assertIsNotNone(cls)
         self.assertEqual(cls.palette_category, 'GLASS')
 
-    def test_shared_material_collider_skips(self):
+    def test_shared_material_collider_is_collision(self):
         cls = classify_material('ColliderMat')
         self.assertIsNotNone(cls)
-        self.assertEqual(cls.action, 'skip')
+        self.assertEqual(cls.action, 'collision')
 
     def test_shared_material_nozzle_is_fx_fire(self):
         cls = classify_material('NozzleInteriorMat')
@@ -80,12 +82,18 @@ class TcaMappingTests(unittest.TestCase):
         self.assertTrue(point_in_expanded_bounds((-2.0, 0.5, 0.5), lo, hi))
         self.assertFalse(point_in_expanded_bounds((10.0, 0.5, 0.5), lo, hi))
 
-    def test_skip_part_collider_shadow(self):
-        self.assertTrue(classify_part('WingCollider', 'skip'))
+    def test_skip_part_shadow_not_collider(self):
+        self.assertFalse(classify_part('WingCollider', 'skip'))
+        self.assertTrue(classify_part('WingCollider', 'collision'))
         self.assertTrue(classify_part('ShadowMesh', 'skip'))
         self.assertTrue(classify_part('WingInnerL', 'skip'))
         self.assertTrue(classify_part('WingInnerR', 'skip'))
         self.assertFalse(classify_part('WingL', 'skip'))
+
+    def test_collision_mesh_by_name_or_material(self):
+        self.assertTrue(is_collision_part('FuselageCollider'))
+        self.assertTrue(is_collision_mesh('Hitbox', ('ColliderMat',)))
+        self.assertFalse(is_collision_mesh('Fuselage', ('SomeLivery',)))
 
     def test_surface_rules_first_match(self):
         available = {'ElevatorL', 'AileronL', 'Rudder'}
@@ -127,11 +135,13 @@ class TcaMappingTests(unittest.TestCase):
         tca = merge_config_overrides({'skipNameParts': ['Gauge']})
         subs = skip_part_substrings(tca)
         self.assertIn('Gauge', subs)
-        self.assertIn('Collider', subs)
+        self.assertNotIn('Collider', subs)
+        self.assertIn('Shadow', subs)
 
     def test_livery_material_excludes_glass_and_weapons(self):
         self.assertFalse(is_livery_material('CanopyGlass'))
         self.assertFalse(is_livery_material('MissileMat'))
+        self.assertFalse(is_livery_material('ColliderMat'))
         self.assertTrue(is_livery_material('F16_Livery'))
 
     def test_default_import_skip_includes_clutter_not_collider_dup(self):
@@ -162,13 +172,15 @@ class TcaMappingTests(unittest.TestCase):
         tca = merge_config_overrides({'skipClutter': False, 'skipNameParts': []})
         subs = skip_part_substrings(tca)
         self.assertNotIn('Weapon', subs)
-        self.assertIn('Collider', subs)
+        self.assertNotIn('Collider', subs)
+        self.assertIn('Shadow', subs)
 
     def test_skip_clutter_adds_weapon_skip(self):
         tca = merge_config_overrides({'skipClutter': True, 'skipNameParts': []})
         subs = skip_part_substrings(tca)
         self.assertIn('Weapon', subs)
         self.assertNotIn('Cockpit', subs)
+        self.assertNotIn('Collider', subs)
 
 
 if __name__ == '__main__':
