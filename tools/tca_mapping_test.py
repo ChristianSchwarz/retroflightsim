@@ -86,8 +86,10 @@ class TcaMappingTests(unittest.TestCase):
         self.assertFalse(classify_part('WingCollider', 'skip'))
         self.assertTrue(classify_part('WingCollider', 'collision'))
         self.assertTrue(classify_part('ShadowMesh', 'skip'))
-        self.assertTrue(classify_part('WingInnerL', 'skip'))
-        self.assertTrue(classify_part('WingInnerR', 'skip'))
+        # WingInner* is real wing fill on many TCA airframes — do not skip
+        # globally (that punched rectangular holes in F-18 / collection wings).
+        self.assertFalse(classify_part('WingInnerL', 'skip'))
+        self.assertFalse(classify_part('WingInnerR', 'skip'))
         self.assertFalse(classify_part('WingL', 'skip'))
 
     def test_collision_mesh_by_name_or_material(self):

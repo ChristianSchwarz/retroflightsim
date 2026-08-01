@@ -67,7 +67,7 @@
       "substring": ["Collider"]
     },
     "skip": {
-      "substring": ["Shadow", "WingInner"]
+      "substring": ["Shadow"]
     },
     "discoverSkip": {
       "substring": [
