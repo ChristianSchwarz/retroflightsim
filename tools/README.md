@@ -194,6 +194,20 @@ palette/alpha heuristics get it wrong. The value can be either a literal
 "materialColors": { "CanopyRubber": "#262826", "Windscreen": "GLASS" }
 ```
 
+## DEM terrain tiles
+
+Build a geographic height pyramid from a WGS84 GeoTIFF for the planetary
+quadtree (`src/script/terrain/`):
+
+```
+pip install rasterio numpy
+python tools/build_dem_tiles.py --input data/output_hh.tif --out assets/terrain
+```
+
+Optional: `--max-zoom 10` to cap detail (faster). Runtime loads
+`assets/terrain/manifest.json` when `?terrain=planet` (default). Use
+`?terrain=legacy` for the old `map.gltf` mosaic.
+
 ## Notes / limitations
 
 - Colours are **flat-shaded** to match the sim's look; there are no gradients,
