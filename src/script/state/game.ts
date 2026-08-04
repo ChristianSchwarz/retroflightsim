@@ -65,6 +65,7 @@ import { TargetFromCameraUpdater } from './cameraUpdaters/targetFromCameraUpdate
 import { TargetToCameraUpdater } from './cameraUpdaters/targetToCameraUpdater';
 import { StaticModelCameraUpdater } from './cameraUpdaters/staticModelCameraUpdater';
 import { ShowcaseCameraUpdater } from './cameraUpdaters/showcaseCameraUpdater';
+import { duelMidpoint } from './cameraUpdaters/duelCameraUtils';
 import { restoreMainCameraParameters } from './stateUtils';
 import { forEachStaticAircraftSlot, STATIC_MODEL_VIEWS } from './staticModelViews';
 import { SpawnMenuEntity } from '../scene/entities/overlay/spawnMenu';
@@ -1305,8 +1306,11 @@ export class Game {
     private orbitCameraAroundAircraft() {
         if (this.view === PlayerViewState.STATIC_MODEL) {
             this._orbitPivot.copy(STATIC_MODEL_VIEWS[this.staticModelIndex].position);
-        } else if (this.view === PlayerViewState.AI_CHASE && this.aiOpponent) {
-            this._orbitPivot.copy(this.aiOpponent.getDisplayPosition());
+        } else if (this.isDuelAxisView()) {
+            duelMidpoint(
+                this.player.getDisplayPosition(),
+                this.aiOpponent!.getDisplayPosition(),
+                this._orbitPivot);
         } else {
             this._orbitPivot.copy(this.player.getDisplayPosition());
         }
@@ -1327,18 +1331,19 @@ export class Game {
             .copy(this._orbitPivot)
             .add(this._orbitOffset);
         this.playerCamera.main.up.copy(UP);
-        if (this.view === PlayerViewState.AI_CHASE && this.aiOpponent?.enabled) {
-            this.playerCamera.main.lookAt(this.player.getDisplayPosition());
-        } else if (this.exteriorEnemyLock && this.isF2ExteriorView() && this.aiOpponent?.enabled) {
-            this.playerCamera.main.lookAt(this.aiOpponent.getDisplayPosition());
-        } else {
-            this.playerCamera.main.lookAt(this._orbitPivot);
-        }
+        this.playerCamera.main.lookAt(this._orbitPivot);
     }
 
     private isF2ExteriorView(): boolean {
         return this.view === PlayerViewState.EXTERIOR_BEHIND
             || this.view === PlayerViewState.EXTERIOR_FRONT;
+    }
+
+    /** F2 enemy-lock and F6 chase views frame both aircraft on the same axis. */
+    private isDuelAxisView(): boolean {
+        return !!this.aiOpponent?.enabled
+            && (this.view === PlayerViewState.AI_CHASE
+                || this.exteriorEnemyLock && this.isF2ExteriorView());
     }
 
     private toggleExteriorEnemyLock(): void {
