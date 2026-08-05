@@ -194,19 +194,20 @@ palette/alpha heuristics get it wrong. The value can be either a literal
 "materialColors": { "CanopyRubber": "#262826", "Windscreen": "GLASS" }
 ```
 
-## DEM terrain tiles
+## Planet DEM tiles
 
-Build a geographic height pyramid from a WGS84 GeoTIFF for the planetary
-quadtree (`src/script/terrain/`):
+Bake a WGS84 GeoTIFF into the adaptive-TIN planet pyramid
+(`src/script/planet/`):
 
 ```
 pip install rasterio numpy
-python tools/build_dem_tiles.py --input data/output_hh.tif --out assets/terrain
+python tools/bake_planet_dem.py --input data/output_hh.tif --out assets/planet
 ```
 
-Optional: `--max-zoom 10` to cap detail (faster). Runtime loads
-`assets/terrain/manifest.json` when `?terrain=planet` (default). Use
-`?terrain=legacy` for the old `map.gltf` mosaic.
+Optional: `--max-zoom 10` to cap detail (faster); `--clean` to wipe the
+output directory first. Runtime loads `assets/planet/manifest.json` when
+`?terrain=planet` (default). Use `?terrain=legacy` for the old `map.gltf`
+mosaic.
 
 ## Notes / limitations
 
