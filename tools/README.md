@@ -212,7 +212,7 @@ python tools/bake_osm_coast.py --manifest assets/planet/manifest.json
 
 # 3. meshes: .pdm + .lvr -> draw-ready .ptm tiles + index_mesh.bin
 npm run bake:mesh
-npm run verify:planet -- --dir assets/planet2
+npm run verify:planet -- --dir assets/terrain
 ```
 
 Stage 3 is the only place terrain geometry is produced. The runtime fetches,
@@ -230,7 +230,7 @@ already oversamples it 1.6x.
 | Flag | Meaning |
 | --- | --- |
 | `--src DIR` | input pyramid (default `assets/planet`) |
-| `--out DIR` | output tree (default `assets/planet2`) |
+| `--out DIR` | output tree (default `assets/terrain`) |
 | `--budget N` | triangles per tile (default 6144) |
 | `--max-zoom N` | cap detail |
 | `--only z/x/y` | bake one tile, repeatable, for debugging |

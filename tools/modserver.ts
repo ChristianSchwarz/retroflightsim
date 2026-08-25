@@ -1237,10 +1237,10 @@ app.post('/api/import-mod', importUpload, async (req: Request, res: Response) =>
 // Content-Encoding: gzip so the browser inflates them in native code off the
 // main thread. express.static would otherwise serve them as opaque bytes.
 const PLANET_DIR = path.join(PROJECT_ROOT, 'assets', 'planet');
-const TERRAIN_DIR = path.join(PROJECT_ROOT, 'assets', 'planet2');
+const TERRAIN_DIR = path.join(PROJECT_ROOT, 'assets', 'terrain');
 const TERRAIN_MOUNTS: ReadonlyArray<readonly [string, string]> = [
-    ['/assets/planet2', TERRAIN_DIR],   // baked .ptm meshes
-    ['/assets/planet', PLANET_DIR],     // .pdm heights the bake reads
+    ['/assets/terrain', TERRAIN_DIR],   // baked .ptm meshes (bake output)
+    ['/assets/planet', PLANET_DIR],     // .pdm heights (bake input)
 ];
 for (const [mount, dir] of TERRAIN_MOUNTS) {
     app.use(mount, express.static(dir, {

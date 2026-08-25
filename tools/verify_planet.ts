@@ -6,7 +6,7 @@
  * show up as holes in the terrain rather than as an error.
  *
  * Usage:
- *   node --import tsx tools/verify_planet.ts [--dir assets/planet2] [--sample N]
+ *   node --import tsx tools/verify_planet.ts [--dir assets/terrain] [--sample N]
  */
 
 import * as fs from 'node:fs';
@@ -20,7 +20,7 @@ interface Args {
 }
 
 function parseArgs(argv: string[]): Args {
-    const a: Args = { dir: 'assets/planet2' };
+    const a: Args = { dir: 'assets/terrain' };
     for (let i = 0; i < argv.length; i++) {
         if (argv[i] === '--dir') a.dir = argv[++i];
         else if (argv[i] === '--sample') a.sample = Number(argv[++i]);

@@ -15,7 +15,7 @@
  *   node --import tsx tools/bake_planet_mesh.ts [options]
  *
  *     --src DIR        input pyramid            (default assets/planet)
- *     --out DIR        output tree              (default assets/planet2)
+ *     --out DIR        output tree              (default assets/terrain)
  *     --max-zoom N     cap detail
  *     --budget N       triangles per tile       (default 6144)
  *     --only z/x/y     bake a single tile (repeatable), for debugging
@@ -50,7 +50,7 @@ interface Args {
 function parseArgs(argv: string[]): Args {
     const a: Args = {
         src: 'assets/planet',
-        out: 'assets/planet2',
+        out: 'assets/terrain',
         budget: DEFAULT_BUDGET,
         only: [],
     };
