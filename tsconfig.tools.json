@@ -25,6 +25,8 @@
     // src/**/* would drag in a pre-existing error in f16PaperCharts.test.ts.
     "include": [
         "src/script/terrain/**/*",
-        "tools/bake/**/*"
+        "tools/bake/**/*",
+        "tools/bake_planet_mesh.ts",
+        "tools/verify_planet.ts"
     ]
 }

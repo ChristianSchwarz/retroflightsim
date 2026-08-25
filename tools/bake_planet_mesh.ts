@@ -162,6 +162,50 @@ function computePadHeight(
     return Number.isFinite(maxH) ? maxH : seaLevel;
 }
 
+/**
+ * Copy the height tiles the runtime actually reads into the output tree.
+ *
+ * CPU ground queries sample one fixed queryZoom plus an always-resident coarse
+ * tier, so only z0..queryZoom is needed — the finest DEM level exists purely as
+ * bake input. Copying them makes the output a single self-contained directory
+ * that any static file server can serve and that deploys as one unit.
+ *
+ * The alternative — pointing the manifest back at the input tree — only worked
+ * when something happened to be mounting both, which is exactly how a stale dev
+ * server turns into a 404 on the manifest.
+ */
+function copyHeightTiles(src: string, out: string, maxZoom: number): number {
+    let bytes = 0;
+    for (let z = 0; z <= maxZoom; z++) {
+        const zDir = path.join(src, String(z));
+        if (!fs.existsSync(zDir)) {
+            continue;
+        }
+        for (const xs of fs.readdirSync(zDir)) {
+            const xDir = path.join(zDir, xs);
+            if (!fs.statSync(xDir).isDirectory()) {
+                continue;
+            }
+            for (const f of fs.readdirSync(xDir)) {
+                if (!f.endsWith('.pdm')) {
+                    continue;
+                }
+                const dstDir = path.join(out, String(z), xs);
+                fs.mkdirSync(dstDir, { recursive: true });
+                const dst = path.join(dstDir, f);
+                fs.copyFileSync(path.join(xDir, f), dst);
+                bytes += fs.statSync(dst).size;
+            }
+        }
+    }
+    const index = path.join(src, 'index.bin');
+    if (fs.existsSync(index)) {
+        fs.copyFileSync(index, path.join(out, 'index.bin'));
+        bytes += fs.statSync(index).size;
+    }
+    return bytes;
+}
+
 function walkTiles(src: string, maxZoom: number): Array<{ z: number; x: number; y: number }> {
     const out: Array<{ z: number; x: number; y: number }> = [];
     for (let z = 0; z <= maxZoom; z++) {
@@ -283,6 +327,11 @@ function main(): void {
     }
     process.stdout.write('\n');
 
+    const heightMaxZoom = Math.min(11, src.maxZoom);
+    const heightBytes = copyHeightTiles(args.src, args.out, heightMaxZoom);
+    console.log(`copied height tiles z0..${heightMaxZoom}: `
+        + `${(heightBytes / 1048576).toFixed(1)} MB`);
+
     const minZoom = written.length > 0 ? Math.min(...written.map(t => t.z)) : 0;
     const maxWritten = written.length > 0 ? Math.max(...written.map(t => t.z)) : 0;
     fs.writeFileSync(
@@ -314,16 +363,13 @@ function main(): void {
         height: {
             path: '{z}/{x}/{y}.pdm',
             indexPath: 'index.bin',
-            // Heights are the bake's input and are not copied into the output,
-            // so point the runtime back at the source pyramid.
-            baseUrl: args.src.replace(/\/g, '/'),
             tileSize: src.tileSize,
             encoding: src.encoding,
             compression: src.compression,
             nodata: src.nodata,
             minZoom: src.minZoom,
-            maxZoom: Math.min(11, src.maxZoom),
-            queryZoom: Math.min(11, src.maxZoom),
+            maxZoom: heightMaxZoom,
+            queryZoom: heightMaxZoom,
             coarseZoom: 7,
         },
         flattenPads: [{

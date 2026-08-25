@@ -259,10 +259,21 @@ triangles per tile but had no ceiling at all — its worst z12 tile was 86,463.
 
 ### Serving
 
-`tools/modserver.ts` mounts `/assets/planet` straight from the repo, so tiles
-do not need a rebuild and are not copied into `dist/`. `.ptm` files are stored
-gzip-compressed and served with `Content-Encoding: gzip` so the browser
-inflates them in native code off the main thread.
+`assets/terrain` is **self-contained**: the mesh bake copies the height tiles
+the runtime reads (z0..queryZoom) in alongside the `.ptm` meshes, so the whole
+tree is one directory that any static file server can serve.
+
+In development `tools/modserver.ts` mounts it straight from the repo, so tiles
+need no rebuild and a dev build does not spend time copying ~82 MB it did not
+change. `npm run build:prod` *does* copy it into `dist/`, because a deployed
+`dist/` has to stand on its own.
+
+`.ptm` files are stored gzip-compressed and served with `Content-Encoding:
+gzip`, so the browser inflates them in native code off the main thread.
+
+If the app reports `Failed to load terrain manifest ... 404`, either the tree
+has not been baked yet (`npm run bake:mesh`) or a long-running `npm run serve`
+predates the last change to the mounts — restart it.
 
 ## Notes / limitations
 
