@@ -118,9 +118,10 @@ describe('buildTile', () => {
          * water sat at sea level, and OSM coastlines do not follow the DEM's
          * zero contour — on real tiles that was tens to hundreds of metres.
          */
-        it('puts land and water at the same height where they meet', () => {
-            // Terrain that is high right where the coastline runs, so a
-            // mismatch would be large and obvious.
+        it('bridges the land/water step with a wall instead of moving terrain', () => {
+            // Terrain held high right where the coastline runs, which is the
+            // real situation: OSM coastlines often follow the foot of a cliff
+            // whose DEM pixel reads the top.
             const r = buildTile(base({
                 heights: heightsFrom(() => 400),
                 polygons: [coastAt(16)],
@@ -128,38 +129,29 @@ describe('buildTile', () => {
             }));
             const tile = decodePtm(r.bytes);
 
-            // Collect water vertex positions, then look for land vertices at
-            // the same horizontal spot: those are the shared shoreline points.
-            const key = (x: number, z: number) => `${x},${z}`;
-            const water = new Map<string, number[]>();
-            for (let v = 0; v < tile.waterPositions.length / 3; v++) {
-                const k = key(tile.waterPositions[v * 3], tile.waterPositions[v * 3 + 2]);
-                const list = water.get(k) ?? [];
-                list.push(tile.waterPositions[v * 3 + 1]);
-                water.set(k, list);
-            }
-
-            let shared = 0;
-            let worstGapM = 0;
+            const ys: number[] = [];
             for (let v = 0; v < tile.landPositions.length / 3; v++) {
-                const k = key(tile.landPositions[v * 3], tile.landPositions[v * 3 + 2]);
-                const ys = water.get(k);
-                if (!ys) {
-                    continue;
-                }
-                shared++;
-                const ly = tile.landPositions[v * 3 + 1];
-                let best = Infinity;
-                for (const wy of ys) {
-                    best = Math.min(best, Math.abs(ly - wy) * tile.quantScale);
-                }
-                worstGapM = Math.max(worstGapM, best);
+                ys.push(tile.landPositions[v * 3 + 1] * tile.quantScale);
             }
+            const top = Math.max(...ys);
+            const bottom = Math.min(...ys);
 
-            assert.ok(shared > 0, 'land and water share shoreline points');
+            // A wall reaches from the coast down to sea level, so the land mesh
+            // spans roughly the full terrain height.
             assert.ok(
-                worstGapM < 0.25,
-                `shoreline seam is open by ${worstGapM.toFixed(2)} m`,
+                top - bottom > 380,
+                `no shore wall: land spans only ${(top - bottom).toFixed(1)} m`,
+            );
+
+            // And the terrain itself is untouched. Forcing shoreline vertices
+            // to sea level closed the seam but dragged real mountainside down
+            // with it — up to 1360 m on Canary tiles — so most of the mesh must
+            // still sit at the surface, not somewhere between.
+            const atSurface = ys.filter(y => Math.abs(y - top) < 1).length;
+            assert.ok(
+                atSurface / ys.length > 0.6,
+                `terrain was dragged down: only ${(100 * atSurface / ys.length).toFixed(0)}% `
+                + 'of land vertices are still at the surface',
             );
         });
 

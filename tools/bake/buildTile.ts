@@ -118,18 +118,23 @@ function landDistanceCells(landNodes: Uint8Array, size: number): Float32Array {
  * so the budget has to include them or a tile silently lands over budget.
  */
 function costWithSkirts(tris: GridTriangle[], cells: number): number {
-    let border = 0;
+    let quads = 0;
     for (const t of tris) {
         for (let e = 0; e < 3; e++) {
             const a = t.pts[e];
             const b = t.pts[(e + 1) % 3];
+            // Tile-border edge -> skirt quad.
             if ((a.x === 0 && b.x === 0) || (a.x === cells && b.x === cells)
                 || (a.y === 0 && b.y === 0) || (a.y === cells && b.y === cells)) {
-                border++;
+                quads++;
+            }
+            // Land edge along the shore chord -> shore wall quad.
+            if (t.land && a.shore && b.shore) {
+                quads++;
             }
         }
     }
-    return tris.length + border * 2;
+    return tris.length + quads * 2;
 }
 
 export function buildTile(input: BuildTileInput): BuildTileResult {
@@ -289,11 +294,10 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
      *
      * The tag alone is not quite enough. When the coast passes within SNAP_EPS
      * of a grid node the crossing snaps onto that corner, so one polygon gets
-     * the tagged snapped point and the other gets the plain, untagged corner at
-     * the same place — and the untagged side would fall back to the DEM height.
-     * Those positions are integers, so matching them is exact; it is only true
-     * crossings, computed independently by adjacent leaves, that cannot be
-     * compared numerically. Hence: trust the tag, and fall back to position.
+     * the tagged snapped point and the other the plain, untagged corner at the
+     * same place. Those positions are integers, so matching them is exact; it
+     * is only true crossings, computed independently by adjacent leaves, that
+     * cannot be compared numerically. So: trust the tag, fall back to position.
      */
     const shorePositions = new Set<string>();
     for (const t of tris) {
@@ -306,15 +310,28 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     const isShore = (gx: number, gy: number, tagged?: boolean) =>
         tagged === true || shorePositions.has(gridKey(gx, gy));
 
+    /**
+     * Land keeps its DEM height everywhere, including at the shoreline.
+     *
+     * Forcing it to sea level there to close the seam was far too blunt: OSM
+     * coastlines and the DEM disagree about where the shore is — the vector
+     * often runs along the foot of a cliff whose DEM pixel reads the top — so
+     * it dragged real mountainside down. Measured on Canary tiles that hit 453
+     * vertices dropped by as much as 1360 m, tearing the terrain open.
+     *
+     * The seam is closed with geometry instead: a wall along the shore chord,
+     * built below. Only the water side changes here, skipping its depth bias at
+     * the shoreline so the wall has a single height to meet.
+     */
     const project = (gx: number, gy: number, land: boolean, tagged = false): Enu => {
         const onShore = isShore(gx, gy, tagged);
         const lon = bounds.west + (gx / cells) * lonSpan;
         const lat = bounds.north - (gy / cells) * latSpan;
-        let h = land && !onShore ? sampleHeight(gx, gy) : seaLevel;
+        let h = land ? sampleHeight(gx, gy) : seaLevel;
         if (!Number.isFinite(h)) {
             h = seaLevel;
         }
-        if (land && !onShore) {
+        if (land) {
             // The pad blend is in ENU, so we need a first ENU pass to know
             // where we are before we can decide how much to flatten.
             geodeticToEcef(lat, lon, h, _ecef);
@@ -322,10 +339,19 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             if (input.pad) {
                 h = applyFlattenPad(h, _enu.e, _enu.n, input.pad);
             }
-        } else if (!land && !onShore) {
+        } else if (!onShore) {
             h -= WATER_DEPTH_BIAS_M;
         }
         geodeticToEcef(lat, lon, h, _ecef);
+        ecefToEnu(basis, _ecef, _enu);
+        return { e: _enu.e, n: _enu.n, u: _enu.u };
+    };
+
+    /** Sea-level ENU at a grid point: the foot of a shore wall. */
+    const projectSeaLevel = (gx: number, gy: number): Enu => {
+        const lon = bounds.west + (gx / cells) * lonSpan;
+        const lat = bounds.north - (gy / cells) * latSpan;
+        geodeticToEcef(lat, lon, seaLevel, _ecef);
         ecefToEnu(basis, _ecef, _enu);
         return { e: _enu.e, n: _enu.n, u: _enu.u };
     };
@@ -431,6 +457,36 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     const sameBorder = (a: { x: number; y: number }, b: { x: number; y: number }) =>
         (a.x === 0 && b.x === 0) || (a.x === cells && b.x === cells)
         || (a.y === 0 && b.y === 0) || (a.y === cells && b.y === cells);
+
+    // Shore walls. Land keeps its DEM height and water sits at sea level, so
+    // wherever they meet there is a vertical step — often large, because OSM
+    // coastlines and the DEM disagree about where the shore is. Closing it by
+    // moving terrain destroys real geography; closing it with a wall does not.
+    //
+    // A land triangle edge whose *both* ends are shoreline points is exactly a
+    // shore chord, so drop a quad from it to sea level.
+    for (const t of tris) {
+        if (!t.land) {
+            continue;
+        }
+        for (let e = 0; e < 3; e++) {
+            const a = t.pts[e];
+            const b = t.pts[(e + 1) % 3];
+            if (!isShore(a.x, a.y, a.shore) || !isShore(b.x, b.y, b.shore)) {
+                continue;
+            }
+            const topA = project(a.x, a.y, true, a.shore);
+            const topB = project(b.x, b.y, true, b.shore);
+            const botA = projectSeaLevel(a.x, a.y);
+            const botB = projectSeaLevel(b.x, b.y);
+            // Nothing to close where the coast really is at sea level.
+            if (Math.abs(topA.u - botA.u) < 0.1 && Math.abs(topB.u - botB.u) < 0.1) {
+                continue;
+            }
+            pushLandTriangle(topA, topB, botB, TerrainTone.Grass);
+            pushLandTriangle(topA, botB, botA, TerrainTone.Grass);
+        }
+    }
 
     const skirt = input.skirtDepthM;
     for (const t of tris) {
