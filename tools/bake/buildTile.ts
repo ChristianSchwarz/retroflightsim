@@ -112,6 +112,26 @@ function landDistanceCells(landNodes: Uint8Array, size: number): Float32Array {
     return d;
 }
 
+/**
+ * Triangles a mesh will cost once skirts are added. Every triangle edge lying
+ * on the tile border belongs to exactly one triangle and becomes a skirt quad,
+ * so the budget has to include them or a tile silently lands over budget.
+ */
+function costWithSkirts(tris: GridTriangle[], cells: number): number {
+    let border = 0;
+    for (const t of tris) {
+        for (let e = 0; e < 3; e++) {
+            const a = t.pts[e];
+            const b = t.pts[(e + 1) % 3];
+            if ((a.x === 0 && b.x === 0) || (a.x === cells && b.x === cells)
+                || (a.y === 0 && b.y === 0) || (a.y === cells && b.y === cells)) {
+                border++;
+            }
+        }
+    }
+    return tris.length + border * 2;
+}
+
 export function buildTile(input: BuildTileInput): BuildTileResult {
     const { size, heights, bounds, seaLevel, basis } = input;
     const cells = size - 1;
@@ -124,37 +144,86 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     });
 
     // --- 3. budget-constrained decimation ---------------------------------
-    let maxErrorM = input.maxErrorM;
-    let minLeafSize = input.minLeafSize ?? 1;
+    //
+    // Two knobs pull in different directions. Raising maxErrorM coarsens the
+    // interior but does nothing for the coast, because shoreline blocks are
+    // pinned to minLeafSize whatever the height error. Raising minLeafSize is
+    // the only thing that reduces coastline cost, and it is the visible one:
+    // measured on real Canary tiles the coast alone runs 12k-20k triangles at
+    // minLeafSize 1 and roughly halves per doubling.
+    //
+    // So: buy the finest coast that fits, then spend whatever is left on
+    // interior detail. Doing it the other way round wastes budget, and the
+    // naive "alternate doubling both" lands far under the budget with a much
+    // coarser coast than it needed to.
+    const HUGE_ERROR_M = 1e9;
+    /** Fraction of the budget the coast may claim before interior detail. */
+    const COAST_SHARE = 0.8;
+
     let attempts = 0;
-    let tris: GridTriangle[] = [];
-    for (;;) {
+    const run = (err: number, leaf: number) => {
         attempts++;
-        const r = decimate({
+        return decimate({
             size,
             heights,
             landNodes: shoreline.landNodes,
-            maxErrorM,
-            minLeafSize,
+            maxErrorM: err,
+            minLeafSize: leaf,
             edgeCrossing: shoreline.edgeCrossing,
             centreIsLand: shoreline.centreIsLand,
         });
-        tris = r.triangles;
-        const budget = input.triangleBudget;
-        if (!budget || tris.length <= budget || minLeafSize >= cells) {
-            break;
+    };
+
+    let maxErrorM = input.maxErrorM;
+    let minLeafSize = input.minLeafSize ?? 1;
+    const budget = input.triangleBudget;
+    let tris: GridTriangle[];
+
+    if (!budget) {
+        tris = run(maxErrorM, minLeafSize).triangles;
+    } else {
+        // 1. Finest shoreline that leaves room for some interior.
+        let coastOnly = run(HUGE_ERROR_M, minLeafSize);
+        while (costWithSkirts(coastOnly.triangles, cells) > budget * COAST_SHARE
+            && minLeafSize < cells) {
+            minLeafSize *= 2;
+            coastOnly = run(HUGE_ERROR_M, minLeafSize);
         }
-        // Interior first: doubling the tolerance is cheap and preserves the
-        // coast. Only once that stops helping do we coarsen the shoreline,
-        // which is the visible cost.
-        if (attempts % 2 === 1) {
-            maxErrorM = maxErrorM > 0 ? maxErrorM * 2 : 1;
+
+        // 2. Finest interior that still fits. Exponential search up from the
+        //    requested tolerance, then bisect.
+        let best = coastOnly;
+        let fine = run(maxErrorM, minLeafSize);
+        if (costWithSkirts(fine.triangles, cells) <= budget) {
+            best = fine;
         } else {
-            minLeafSize = Math.min(cells, minLeafSize * 2);
+            let lo = maxErrorM;          // too fine
+            let hi = maxErrorM > 0 ? maxErrorM : 1;
+            let hiFits = false;
+            for (let i = 0; i < 24 && !hiFits; i++) {
+                hi *= 2;
+                fine = run(hi, minLeafSize);
+                hiFits = costWithSkirts(fine.triangles, cells) <= budget;
+            }
+            if (!hiFits) {
+                best = coastOnly;
+                hi = HUGE_ERROR_M;
+            } else {
+                best = fine;
+            }
+            for (let i = 0; i < 8; i++) {
+                const mid = Math.sqrt(lo * hi) || (lo + hi) / 2;
+                const r = run(mid, minLeafSize);
+                if (costWithSkirts(r.triangles, cells) <= budget) {
+                    hi = mid;
+                    best = r;
+                } else {
+                    lo = mid;
+                }
+            }
+            maxErrorM = hi;
         }
-        if (attempts > 32) {
-            break;
-        }
+        tris = best.triangles;
     }
 
     // --- 4/5. projection, pad, depth bias ---------------------------------

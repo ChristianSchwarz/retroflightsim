@@ -140,18 +140,40 @@ describe('buildTile', () => {
         it('leaves a tile that already fits untouched', () => {
             const input = base({ heights: heightsFrom(() => 10), triangleBudget: 5000 });
             const r = buildTile(input);
-            assert.equal(r.attempts, 1);
+            // The search always probes the coast first, so attempts > 1 even
+            // for a tile that fits; what matters is that neither knob moved.
             assert.equal(r.maxErrorM, input.maxErrorM);
             assert.equal(r.minLeafSize, 1);
         });
 
-        it('coarsens the interior before it coarsens the coast', () => {
+        it('spends most of the budget instead of overshooting', () => {
+            // The naive "alternate doubling both knobs" search landed around a
+            // quarter of the budget with a needlessly coarse coast. The search
+            // buys the finest coast that fits and then spends the remainder on
+            // interior detail, so the result should sit near the ceiling.
+            const budget = 1200;
             const r = buildTile(base({
                 heights: heightsFrom((x, y) => (x * 37 + y * 53) % 200),
                 polygons: [coastAt(16)],
-                triangleBudget: 300,
+                triangleBudget: budget,
             }));
-            assert.ok(r.maxErrorM > 2, 'tolerance was raised first');
+            assert.ok(r.triangleCount <= budget, `${r.triangleCount} over budget`);
+            assert.ok(
+                r.triangleCount > budget * 0.4,
+                `${r.triangleCount} wastes most of the ${budget} budget`,
+            );
+        });
+
+        it('prefers a finer coast over a finer interior', () => {
+            // A tight budget must show up as a raised interior tolerance, with
+            // the shoreline kept as fine as it can afford.
+            const r = buildTile(base({
+                heights: heightsFrom((x, y) => (x * 37 + y * 53) % 200),
+                polygons: [coastAt(16)],
+                triangleBudget: 600,
+            }));
+            assert.ok(r.maxErrorM >= 2, 'interior tolerance did not tighten below the request');
+            assert.ok(r.minLeafSize <= 8, `coast coarsened to ${r.minLeafSize} cells`);
         });
     });
 

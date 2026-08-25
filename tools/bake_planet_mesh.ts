@@ -1,0 +1,350 @@
+/**
+ * Bake draw-ready terrain tiles (.ptm) from the DEM height pyramid and the OSM
+ * coastline vectors.
+ *
+ * Reads the existing pyramid written by tools/bake_planet_dem.py and
+ * tools/bake_osm_coast.py — .pdm heights, .lvr land polygons — and writes one
+ * gzip-compressed PTM1 tile per land tile, plus index_mesh.bin and a manifest
+ * describing the mesh stream.
+ *
+ * This is the only place terrain geometry is produced. The runtime fetches,
+ * decodes and draws; it never triangulates, so there is no fallback path to
+ * keep in sync.
+ *
+ * Usage:
+ *   node --import tsx tools/bake_planet_mesh.ts [options]
+ *
+ *     --src DIR        input pyramid            (default assets/planet)
+ *     --out DIR        output tree              (default assets/planet2)
+ *     --max-zoom N     cap detail
+ *     --budget N       triangles per tile       (default 3072)
+ *     --only z/x/y     bake a single tile (repeatable), for debugging
+ *     --limit N        stop after N tiles, for a quick smoke bake
+ */
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as zlib from 'node:zlib';
+import { decodePdm } from '../src/script/planet/demTile';
+import { decodeLvr } from '../src/script/planet/coastVector';
+import { EnuBasis, enuToGeodeticApprox, makeEnuBasis } from '../src/script/planet/geodesy';
+import { AIRBASE_FLATTEN_PAD, PLAY_ORIGIN } from '../src/script/state/worldLayout';
+import { buildTile } from './bake/buildTile';
+import { encodeTileIndex } from './bake/index';
+import { CoastPolygon, LonLatBounds } from './bake/shoreline';
+
+const DEFAULT_BUDGET = 3072;
+
+interface Args {
+    src: string;
+    out: string;
+    maxZoom?: number;
+    budget: number;
+    only: string[];
+    limit?: number;
+}
+
+function parseArgs(argv: string[]): Args {
+    const a: Args = {
+        src: 'assets/planet',
+        out: 'assets/planet2',
+        budget: DEFAULT_BUDGET,
+        only: [],
+    };
+    for (let i = 0; i < argv.length; i++) {
+        const k = argv[i];
+        const next = () => argv[++i];
+        if (k === '--src') a.src = next();
+        else if (k === '--out') a.out = next();
+        else if (k === '--max-zoom') a.maxZoom = Number(next());
+        else if (k === '--budget') a.budget = Number(next());
+        else if (k === '--only') a.only.push(next());
+        else if (k === '--limit') a.limit = Number(next());
+        else throw new Error(`unknown argument ${k}`);
+    }
+    return a;
+}
+
+/** Geographic quadtree: level z has 2^(z+1) columns by 2^z rows. */
+function tileBounds(z: number, x: number, y: number): LonLatBounds {
+    const span = 180 / (1 << z);
+    const west = -180 + x * span;
+    const north = 90 - y * span;
+    return { west, south: north - span, east: west + span, north };
+}
+
+function tileEdgeMetres(z: number, x: number, y: number): number {
+    const b = tileBounds(z, x, y);
+    const midLat = (b.south + b.north) / 2;
+    return Math.max(
+        (b.east - b.west) * 111320 * Math.cos(midLat * Math.PI / 180),
+        (b.north - b.south) * 110540,
+    );
+}
+
+/**
+ * Skirt depth per level. The worst vertical mismatch across an LOD seam is
+ * bounded by the *coarser* neighbour's geometric error, so the parent level's
+ * error is the right term; 2x is margin, and the edge-length term covers
+ * ellipsoid sagitta at coarse levels where geometric error is small.
+ */
+function skirtDepthForLevel(z: number, levelErrors: number[], edgeM: number): number {
+    const parentErr = z > 0 ? (levelErrors[z - 1] ?? 0) : (levelErrors[0] ?? 0);
+    return Math.max(2 * parentErr, 0.01 * edgeM);
+}
+
+/** Interior tolerance: half the level's geometric error, floored so flats collapse. */
+function maxErrorForLevel(z: number, levelErrors: number[]): number {
+    const err = levelErrors[z] ?? 0;
+    return err <= 0 ? 1 : Math.max(1, err * 0.5);
+}
+
+/**
+ * Max DEM height under the airbase pad footprint.
+ *
+ * The old runtime sampled this at boot (HeightQuery.sampleMaxUnderPad) and then
+ * re-meshed the pad tiles, which was the slowest step in the boot sequence. It
+ * is a deterministic function of the DEM and a compile-time pad, so the bake
+ * computes it once instead and the runtime never has to.
+ */
+function computePadHeight(
+    src: string,
+    manifest: { maxZoom: number; seaLevel?: number },
+    basis: EnuBasis,
+    pad: { centerX: number; centerZ: number; halfW: number; halfD: number },
+): number {
+    const seaLevel = manifest.seaLevel ?? 0;
+    const cache = new Map<string, ReturnType<typeof decodePdm> | null>();
+    const load = (z: number, x: number, y: number) => {
+        const key = `${z}/${x}/${y}`;
+        if (!cache.has(key)) {
+            const p = path.join(src, String(z), String(x), `${y}.pdm`);
+            cache.set(key, fs.existsSync(p) ? decodePdm(fs.readFileSync(p)) : null);
+        }
+        return cache.get(key)!;
+    };
+
+    const sampleAt = (lon: number, lat: number): number => {
+        for (let z = manifest.maxZoom; z >= 0; z--) {
+            const span = 180 / (1 << z);
+            const x = Math.floor((lon + 180) / span);
+            const y = Math.floor((90 - lat) / span);
+            const tile = load(z, x, y);
+            if (!tile) {
+                continue;
+            }
+            const b = tileBounds(z, x, y);
+            const u = (lon - b.west) / (b.east - b.west);
+            const v = (b.north - lat) / (b.north - b.south);
+            const n = tile.size;
+            const fx = Math.min(n - 1, Math.max(0, u * (n - 1)));
+            const fy = Math.min(n - 1, Math.max(0, v * (n - 1)));
+            const h = tile.heights[Math.round(fy) * n + Math.round(fx)];
+            return Number.isFinite(h) ? h : seaLevel;
+        }
+        return seaLevel;
+    };
+
+    const step = Math.max(10, Math.min(pad.halfW, pad.halfD) / 8);
+    let maxH = -Infinity;
+    for (let dz = -pad.halfD; dz <= pad.halfD; dz += step) {
+        for (let dx = -pad.halfW; dx <= pad.halfW; dx += step) {
+            const g = enuToGeodeticApprox(basis, pad.centerX + dx, pad.centerZ + dz, 0);
+            const h = sampleAt(g.lon, g.lat);
+            if (h > seaLevel && h > maxH) {
+                maxH = h;
+            }
+        }
+    }
+    return Number.isFinite(maxH) ? maxH : seaLevel;
+}
+
+function walkTiles(src: string, maxZoom: number): Array<{ z: number; x: number; y: number }> {
+    const out: Array<{ z: number; x: number; y: number }> = [];
+    for (let z = 0; z <= maxZoom; z++) {
+        const zDir = path.join(src, String(z));
+        if (!fs.existsSync(zDir)) {
+            continue;
+        }
+        for (const xs of fs.readdirSync(zDir)) {
+            const xDir = path.join(zDir, xs);
+            if (!fs.statSync(xDir).isDirectory()) {
+                continue;
+            }
+            for (const f of fs.readdirSync(xDir)) {
+                if (f.endsWith('.pdm')) {
+                    out.push({ z, x: Number(xs), y: Number(f.slice(0, -4)) });
+                }
+            }
+        }
+    }
+    return out;
+}
+
+function main(): void {
+    const args = parseArgs(process.argv.slice(2));
+    const manifestPath = path.join(args.src, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+        console.error(`error: no manifest at ${manifestPath}`);
+        console.error('Run tools/bake_planet_dem.py first.');
+        process.exit(1);
+    }
+    const src = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const levelErrors: number[] = src.levelGeometricErrorM ?? [];
+    const maxZoom = Math.min(args.maxZoom ?? src.maxZoom, src.maxZoom);
+    const basis = makeEnuBasis(PLAY_ORIGIN.lat, PLAY_ORIGIN.lon, PLAY_ORIGIN.height);
+    const padHeightMsl = computePadHeight(args.src, src, basis, AIRBASE_FLATTEN_PAD);
+    console.log(`airbase pad height: ${padHeightMsl.toFixed(2)} m MSL`);
+
+    let tiles = args.only.length > 0
+        ? args.only.map(s => {
+            const [z, x, y] = s.split('/').map(Number);
+            return { z, x, y };
+        })
+        : walkTiles(args.src, maxZoom);
+    tiles.sort((a, b) => a.z - b.z || a.x - b.x || a.y - b.y);
+    if (args.limit !== undefined) {
+        tiles = tiles.slice(0, args.limit);
+    }
+
+    console.log(`baking ${tiles.length} tiles from ${args.src} -> ${args.out} `
+        + `(z0..${maxZoom}, budget ${args.budget})`);
+
+    fs.mkdirSync(args.out, { recursive: true });
+    const written: Array<{ z: number; x: number; y: number }> = [];
+    const levelSkirt: number[] = [];
+    let totalBytes = 0;
+    let totalTris = 0;
+    let maxTris = 0;
+    let budgeted = 0;
+    const t0 = Date.now();
+
+    for (let i = 0; i < tiles.length; i++) {
+        const { z, x, y } = tiles[i];
+        const stem = path.join(args.src, String(z), String(x), String(y));
+        const pdmPath = `${stem}.pdm`;
+        if (!fs.existsSync(pdmPath)) {
+            continue;
+        }
+        const dem = decodePdm(fs.readFileSync(pdmPath));
+        let polygons: CoastPolygon[] | undefined;
+        const lvrPath = `${stem}.lvr`;
+        if (fs.existsSync(lvrPath)) {
+            polygons = decodeLvr(fs.readFileSync(lvrPath)).polygons as CoastPolygon[];
+        }
+
+        const bounds = tileBounds(z, x, y);
+        const edgeM = tileEdgeMetres(z, x, y);
+        const skirtDepthM = skirtDepthForLevel(z, levelErrors, edgeM);
+        levelSkirt[z] = skirtDepthM;
+        // Simplify the coast to roughly the interior tolerance, in cells.
+        const cellM = edgeM / (dem.size - 1);
+        const simplifyCells = cellM > 0 ? Math.min(2, (maxErrorForLevel(z, levelErrors) / cellM)) : 0;
+
+        const r = buildTile({
+            id: { z, x, y },
+            bounds,
+            heights: dem.heights,
+            size: dem.size,
+            seaLevel: src.seaLevel ?? 0,
+            maxErrorM: maxErrorForLevel(z, levelErrors),
+            skirtDepthM,
+            basis,
+            polygons,
+            simplifyCells,
+            triangleBudget: args.budget,
+            pad: { ...AIRBASE_FLATTEN_PAD },
+            padHeightMsl,
+        });
+
+        const outPath = path.join(args.out, String(z), String(x), `${y}.ptm`);
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        const gz = zlib.gzipSync(r.bytes, { level: 9 });
+        fs.writeFileSync(outPath, gz);
+
+        written.push({ z, x, y });
+        totalBytes += gz.byteLength;
+        totalTris += r.triangleCount;
+        maxTris = Math.max(maxTris, r.triangleCount);
+        if (r.attempts > 1) {
+            budgeted++;
+        }
+
+        if ((i + 1) % 100 === 0 || i + 1 === tiles.length) {
+            const pct = (((i + 1) / tiles.length) * 100).toFixed(1);
+            process.stdout.write(
+                `\r  ${i + 1}/${tiles.length} (${pct}%)  ${(totalBytes / 1048576).toFixed(1)} MB`,
+            );
+        }
+    }
+    process.stdout.write('\n');
+
+    const minZoom = written.length > 0 ? Math.min(...written.map(t => t.z)) : 0;
+    const maxWritten = written.length > 0 ? Math.max(...written.map(t => t.z)) : 0;
+    fs.writeFileSync(
+        path.join(args.out, 'index_mesh.bin'),
+        encodeTileIndex(written, minZoom, maxWritten),
+    );
+
+    const outManifest = {
+        version: 4,
+        scheme: 'retro-terrain/1',
+        ellipsoid: 'WGS84',
+        seaLevel: src.seaLevel ?? 0,
+        coverage: src.coverage,
+        enuOrigin: { lat: PLAY_ORIGIN.lat, lon: PLAY_ORIGIN.lon, height: PLAY_ORIGIN.height },
+        mesh: {
+            path: '{z}/{x}/{y}.ptm',
+            indexPath: 'index_mesh.bin',
+            minZoom,
+            maxZoom: maxWritten,
+            encoding: 'PTM1',
+            transport: 'gzip',
+            triangleBudget: args.budget,
+            levelGeometricErrorM: levelErrors.slice(0, maxWritten + 1),
+            levelSkirtDepthM: Array.from(
+                { length: maxWritten + 1 },
+                (_, z) => levelSkirt[z] ?? 0,
+            ),
+        },
+        height: {
+            path: '{z}/{x}/{y}.pdm',
+            indexPath: 'index.bin',
+            tileSize: src.tileSize,
+            encoding: src.encoding,
+            compression: src.compression,
+            nodata: src.nodata,
+            minZoom: src.minZoom,
+            maxZoom: Math.min(11, src.maxZoom),
+            queryZoom: Math.min(11, src.maxZoom),
+            coarseZoom: 7,
+        },
+        flattenPads: [{
+            lat: PLAY_ORIGIN.lat,
+            lon: PLAY_ORIGIN.lon,
+            halfW: AIRBASE_FLATTEN_PAD.halfW,
+            halfD: AIRBASE_FLATTEN_PAD.halfD,
+            featherM: AIRBASE_FLATTEN_PAD.featherM,
+            heightMsl: padHeightMsl,
+        }],
+        bake: {
+            tool: 'bake_planet_mesh',
+            version: '1.0.0',
+            utc: new Date().toISOString(),
+        },
+    };
+    fs.writeFileSync(
+        path.join(args.out, 'manifest.json'),
+        `${JSON.stringify(outManifest, null, 2)}\n`,
+    );
+
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`wrote ${written.length} tiles, ${(totalBytes / 1048576).toFixed(1)} MB in ${secs}s`);
+    if (written.length > 0) {
+        console.log(`  triangles: mean ${Math.round(totalTris / written.length)}, max ${maxTris}`);
+        console.log(`  mean tile: ${Math.round(totalBytes / written.length / 1024)} KB gzip`);
+        console.log(`  budget engaged on ${budgeted} tiles`);
+    }
+}
+
+main();
