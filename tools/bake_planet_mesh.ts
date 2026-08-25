@@ -17,7 +17,7 @@
  *     --src DIR        input pyramid            (default assets/planet)
  *     --out DIR        output tree              (default assets/planet2)
  *     --max-zoom N     cap detail
- *     --budget N       triangles per tile       (default 3072)
+ *     --budget N       triangles per tile       (default 6144)
  *     --only z/x/y     bake a single tile (repeatable), for debugging
  *     --limit N        stop after N tiles, for a quick smoke bake
  */
@@ -33,7 +33,10 @@ import { buildTile } from './bake/buildTile';
 import { encodeTileIndex } from './bake/index';
 import { CoastPolygon, LonLatBounds } from './bake/shoreline';
 
-const DEFAULT_BUDGET = 3072;
+// Triangles per tile. Measured on real Canary z12 tiles: the coast alone costs
+// ~18k at full resolution and roughly halves per coarsening step, so this buys
+// a ~34 m shoreline (minLeafSize 2) and lands near 5,300 triangles per tile.
+const DEFAULT_BUDGET = 6144;
 
 interface Args {
     src: string;
@@ -216,7 +219,8 @@ function main(): void {
     let totalBytes = 0;
     let totalTris = 0;
     let maxTris = 0;
-    let budgeted = 0;
+    let coarsenedCoast = 0;
+    const leafHistogram = new Map<number, number>();
     const t0 = Date.now();
 
     for (let i = 0; i < tiles.length; i++) {
@@ -266,9 +270,10 @@ function main(): void {
         totalBytes += gz.byteLength;
         totalTris += r.triangleCount;
         maxTris = Math.max(maxTris, r.triangleCount);
-        if (r.attempts > 1) {
-            budgeted++;
+        if (r.minLeafSize > 1) {
+            coarsenedCoast++;
         }
+        leafHistogram.set(r.minLeafSize, (leafHistogram.get(r.minLeafSize) ?? 0) + 1);
 
         if ((i + 1) % 100 === 0 || i + 1 === tiles.length) {
             const pct = (((i + 1) / tiles.length) * 100).toFixed(1);
@@ -343,7 +348,11 @@ function main(): void {
     if (written.length > 0) {
         console.log(`  triangles: mean ${Math.round(totalTris / written.length)}, max ${maxTris}`);
         console.log(`  mean tile: ${Math.round(totalBytes / written.length / 1024)} KB gzip`);
-        console.log(`  budget engaged on ${budgeted} tiles`);
+        const pct = ((coarsenedCoast / written.length) * 100).toFixed(0);
+        console.log(`  coast coarsened on ${coarsenedCoast}/${written.length} tiles (${pct}%)`);
+        const leaves = [...leafHistogram.entries()].sort((a, b) => a[0] - b[0]);
+        console.log(`  shoreline leaf size: `
+            + leaves.map(([k, v]) => `${k}cell x${v}`).join(', '));
     }
 }
 

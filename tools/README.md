@@ -194,20 +194,75 @@ palette/alpha heuristics get it wrong. The value can be either a literal
 "materialColors": { "CanopyRubber": "#262826", "Windscreen": "GLASS" }
 ```
 
-## Planet DEM tiles
+## Planet terrain
 
-Bake a WGS84 GeoTIFF into the adaptive-TIN planet pyramid
-(`src/script/planet/`):
+`assets/planet` is a **build product**, not a tracked asset. It is gitignored
+and must be generated locally before the sim will show terrain.
+
+The pipeline has three stages:
 
 ```
+# 1. heights: WGS84 GeoTIFF -> .pdm pyramid + index.bin + manifest.json
 pip install rasterio numpy
 python tools/bake_planet_dem.py --input data/output_hh.tif --out assets/planet
+
+# 2. coastlines: OSM -> .lwm masks + .lvr land polygons
+pip install shapely requests
+python tools/bake_osm_coast.py --manifest assets/planet/manifest.json
+
+# 3. meshes: .pdm + .lvr -> draw-ready .ptm tiles + index_mesh.bin
+npm run bake:mesh
+npm run verify:planet -- --dir assets/planet2
 ```
 
-Optional: `--max-zoom 10` to cap detail (faster); `--clean` to wipe the
-output directory first. Runtime loads `assets/planet/manifest.json` when
-`?terrain=planet` (default). Use `?terrain=legacy` for the old `map.gltf`
-mosaic.
+Stage 3 is the only place terrain geometry is produced. The runtime fetches,
+decodes and draws — it never triangulates — so there is no fallback path that
+can drift out of sync with the bake.
+
+### Options
+
+`bake_planet_dem.py`: `--max-zoom N` caps detail, `--clean` wipes the output
+first. Do not bake past zoom 12: the source is 1 arc-second (~30 m) and z12
+already oversamples it 1.6x.
+
+`bake_planet_mesh.ts` (`npm run bake:mesh -- ...`):
+
+| Flag | Meaning |
+| --- | --- |
+| `--src DIR` | input pyramid (default `assets/planet`) |
+| `--out DIR` | output tree (default `assets/planet2`) |
+| `--budget N` | triangles per tile (default 6144) |
+| `--max-zoom N` | cap detail |
+| `--only z/x/y` | bake one tile, repeatable, for debugging |
+| `--limit N` | stop after N tiles, for a smoke bake |
+
+### The triangle budget
+
+`--budget` is the main quality knob, and what it really controls is
+**shoreline resolution**. Raising the interior height tolerance coarsens flat
+ground but does nothing for the coast, because shoreline blocks are pinned to
+the finest leaf size regardless of height error. So the bake buys the finest
+coast that fits in 80% of the budget and spends the rest on interior detail.
+
+Measured on real Canary z12 tiles, the coast alone costs:
+
+| Leaf size | Coast resolution | Triangles |
+| --- | --- | --- |
+| 1 cell | ~17 m | ~18,000 |
+| 2 cells | ~34 m | ~9,000 |
+| 4 cells | ~69 m | ~4,000 |
+| 8 cells | ~138 m | ~1,600 |
+
+The default 6144 lands on a ~34 m coast at roughly 5,300 triangles and 47 KB
+gzip per tile. For comparison the old runtime CDT produced a median of 3,311
+triangles per tile but had no ceiling at all — its worst z12 tile was 86,463.
+
+### Serving
+
+`tools/modserver.ts` mounts `/assets/planet` straight from the repo, so tiles
+do not need a rebuild and are not copied into `dist/`. `.ptm` files are stored
+gzip-compressed and served with `Content-Encoding: gzip` so the browser
+inflates them in native code off the main thread.
 
 ## Notes / limitations
 
