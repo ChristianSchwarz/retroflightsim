@@ -168,8 +168,8 @@ function main(): void {
         if (!Number.isFinite(tile.centerHeightM)) {
             note(`${key}: bad centre height`);
         }
-        if (!(tile.quantScaleXZ > 0) || !(tile.quantScaleY > 0)) {
-            note(`${key}: bad quantisation scales`);
+        if (!(tile.quantScale > 0)) {
+            note(`${key}: bad quantisation scale ${tile.quantScale}`);
         }
         for (let v = 0; v < tile.landTones.length; v++) {
             const t = tile.landTones[v];

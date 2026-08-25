@@ -207,9 +207,9 @@ describe('buildTile', () => {
 
             let inCore = 0;
             for (let v = 0; v < tile.landPositions.length / 3; v++) {
-                const e = centre.e + tile.landPositions[v * 3] * tile.quantScaleXZ;
-                const u = centre.u + tile.landPositions[v * 3 + 1] * tile.quantScaleY;
-                const n = centre.n + tile.landPositions[v * 3 + 2] * tile.quantScaleXZ;
+                const e = centre.e + tile.landPositions[v * 3] * tile.quantScale;
+                const u = centre.u + tile.landPositions[v * 3 + 1] * tile.quantScale;
+                const n = centre.n + tile.landPositions[v * 3 + 2] * tile.quantScale;
                 if (padBlendWeight(e, n, pad) < 1) {
                     continue;
                 }
@@ -272,7 +272,7 @@ describe('buildTile', () => {
             let minY = Infinity;
             let maxY = -Infinity;
             for (let v = 0; v < tile.landPositions.length / 3; v++) {
-                const y = tile.landPositions[v * 3 + 1] * tile.quantScaleY;
+                const y = tile.landPositions[v * 3 + 1] * tile.quantScale;
                 if (y < minY) minY = y;
                 if (y > maxY) maxY = y;
             }
