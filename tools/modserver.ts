@@ -1229,6 +1229,27 @@ app.post('/api/import-mod', importUpload, async (req: Request, res: Response) =>
     }
 });
 
+// Baked terrain pyramid, served straight from the repo rather than copied into
+// dist/ on every build (see webpack.config.js). Mounted before the dist static
+// handler so it wins for /assets/planet/*.
+//
+// .ptm tiles are stored gzip-compressed on disk and served with
+// Content-Encoding: gzip so the browser inflates them in native code off the
+// main thread. express.static would otherwise serve them as opaque bytes.
+const PLANET_DIR = path.join(PROJECT_ROOT, 'assets', 'planet');
+app.use('/assets/planet', express.static(PLANET_DIR, {
+    fallthrough: false,
+    setHeaders(res, filePath) {
+        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+        if (filePath.endsWith('.ptm')) {
+            res.setHeader('Content-Encoding', 'gzip');
+            res.setHeader('Content-Type', 'application/octet-stream');
+        }
+    },
+}));
+
 app.use(express.static(DIST_DIR, {
     index: LIVE_RELOAD ? false : 'index.html',
     setHeaders(res, filePath) {
