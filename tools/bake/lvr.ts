@@ -1,4 +1,9 @@
-/** LVR1 OSM land polygon tile decode + point-in-polygon queries. */
+/**
+ * LVR1 OSM land-polygon tile decode.
+ *
+ * Bake-time only. The runtime never reads coastline vectors any more — the
+ * shoreline is cut offline and baked into the mesh.
+ */
 
 import { unzlibSync } from 'fflate';
 

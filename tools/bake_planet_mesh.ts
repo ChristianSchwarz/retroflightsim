@@ -25,9 +25,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
-import { decodePdm } from '../src/script/planet/demTile';
-import { decodeLvr } from '../src/script/planet/coastVector';
-import { EnuBasis, enuToGeodeticApprox, makeEnuBasis } from '../src/script/planet/geodesy';
+import { decodePdm } from '../src/script/terrain/demTile';
+import { decodeLvr } from './bake/lvr';
+import { EnuBasis, enuToGeodeticApprox, makeEnuBasis } from '../src/script/terrain/geodesy';
 import { AIRBASE_FLATTEN_PAD, PLAY_ORIGIN } from '../src/script/state/worldLayout';
 import { buildTile } from './bake/buildTile';
 import { encodeTileIndex } from './bake/index';
@@ -257,8 +257,7 @@ function main(): void {
             polygons,
             simplifyCells,
             triangleBudget: args.budget,
-            pad: { ...AIRBASE_FLATTEN_PAD },
-            padHeightMsl,
+            pad: { ...AIRBASE_FLATTEN_PAD, heightMsl: padHeightMsl },
         });
 
         const outPath = path.join(args.out, String(z), String(x), `${y}.ptm`);
@@ -315,6 +314,9 @@ function main(): void {
         height: {
             path: '{z}/{x}/{y}.pdm',
             indexPath: 'index.bin',
+            // Heights are the bake's input and are not copied into the output,
+            // so point the runtime back at the source pyramid.
+            baseUrl: args.src.replace(/\/g, '/'),
             tileSize: src.tileSize,
             encoding: src.encoding,
             compression: src.compression,

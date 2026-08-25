@@ -14,8 +14,8 @@
  * point: there is no runtime equivalent of this file, and no fallback path.
  */
 
-import { EnuBasis, Ecef, Enu, ecefToEnu, geodeticToEcef } from '../../src/script/planet/geodesy';
-import { FlattenPadSpec, applyFlattenPad } from '../../src/script/planet/flattenPad';
+import { EnuBasis, Ecef, Enu, ecefToEnu, geodeticToEcef } from '../../src/script/terrain/geodesy';
+import { FlattenPad, applyFlattenPad } from '../../src/script/terrain/flattenPad';
 import { TerrainTone } from '../../src/script/terrain/tones';
 import { PtmTileId, encodePtm } from '../../src/script/terrain/ptm';
 import { GridTriangle, decimate } from './decimate';
@@ -53,8 +53,8 @@ export interface BuildTileInput {
     minLeafSize?: number;
     /** Coarsen and retry until the tile fits. Omit to disable. */
     triangleBudget?: number;
-    pad?: FlattenPadSpec;
-    padHeightMsl?: number;
+    /** Baked flatten pad, heightMsl included. */
+    pad?: FlattenPad;
 }
 
 export interface BuildTileResult {
@@ -281,7 +281,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             // where we are before we can decide how much to flatten.
             geodeticToEcef(lat, lon, h, _ecef);
             ecefToEnu(basis, _ecef, _enu);
-            h = applyFlattenPad(h, _enu.e, _enu.n, input.pad, input.padHeightMsl);
+            if (input.pad) {
+                h = applyFlattenPad(h, _enu.e, _enu.n, input.pad);
+            }
         } else {
             h -= WATER_DEPTH_BIAS_M;
         }

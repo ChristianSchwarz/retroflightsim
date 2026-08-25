@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { ecefToEnu, geodeticToEcef, makeEnuBasis } from '../../src/script/planet/geodesy';
-import { padBlendWeight } from '../../src/script/planet/flattenPad';
+import { ecefToEnu, geodeticToEcef, makeEnuBasis } from '../../src/script/terrain/geodesy';
+import { padBlendWeight } from '../../src/script/terrain/flattenPad';
 import { decodePtm } from '../../src/script/terrain/ptm';
 import { TerrainTone } from '../../src/script/terrain/tones';
 import { CoastPolygon, LonLatBounds } from './shoreline';
@@ -178,17 +178,20 @@ describe('buildTile', () => {
     });
 
     describe('flatten pad', () => {
-        const pad = { centerX: 0, centerZ: 0, halfW: 500, halfD: 2000, featherM: 80 };
+        const pad = {
+            centerX: 0, centerZ: 0, halfW: 500, halfD: 2000,
+            featherM: 80, heightMsl: 41.7,
+        };
 
         it('flattens the runway footprint to the pad height', () => {
             const bumpy = heightsFrom((x, y) => 40 + ((x * 7 + y * 11) % 23));
-            const padHeightMsl = 41.7;
+            const padHeightMsl = pad.heightMsl;
             // Skirts hang below the surface by design, so they would show up
             // as "core vertices" a full skirt depth under the pad height.
             // Drop them here; the skirt tests below cover them separately.
             const r = buildTile(base({
                 heights: bumpy, polygons: [coastAt(CELLS + 2)],
-                pad, padHeightMsl, skirtDepthM: 0,
+                pad, skirtDepthM: 0,
             }));
             const tile = decodePtm(r.bytes);
 
@@ -225,7 +228,7 @@ describe('buildTile', () => {
             const bumpy = heightsFrom((x, y) => 40 + ((x * 7 + y * 11) % 23));
             const withPad = buildTile(base({
                 heights: bumpy, polygons: [coastAt(CELLS + 2)],
-                pad, padHeightMsl: 41.7,
+                pad,
             })).bytes;
             const without = buildTile(base({
                 heights: bumpy, polygons: [coastAt(CELLS + 2)],
@@ -236,7 +239,7 @@ describe('buildTile', () => {
         it('is a no-op when no pad is supplied', () => {
             const a = buildTile(base({ polygons: [coastAt(CELLS + 2)] })).bytes;
             const b = buildTile(base({
-                polygons: [coastAt(CELLS + 2)], pad: undefined, padHeightMsl: 41.7,
+                polygons: [coastAt(CELLS + 2)], pad: undefined,
             })).bytes;
             assert.deepEqual(Array.from(a), Array.from(b));
         });

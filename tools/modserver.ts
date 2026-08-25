@@ -1237,18 +1237,25 @@ app.post('/api/import-mod', importUpload, async (req: Request, res: Response) =>
 // Content-Encoding: gzip so the browser inflates them in native code off the
 // main thread. express.static would otherwise serve them as opaque bytes.
 const PLANET_DIR = path.join(PROJECT_ROOT, 'assets', 'planet');
-app.use('/assets/planet', express.static(PLANET_DIR, {
-    fallthrough: false,
-    setHeaders(res, filePath) {
-        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-        res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-        if (filePath.endsWith('.ptm')) {
-            res.setHeader('Content-Encoding', 'gzip');
-            res.setHeader('Content-Type', 'application/octet-stream');
-        }
-    },
-}));
+const TERRAIN_DIR = path.join(PROJECT_ROOT, 'assets', 'planet2');
+const TERRAIN_MOUNTS: ReadonlyArray<readonly [string, string]> = [
+    ['/assets/planet2', TERRAIN_DIR],   // baked .ptm meshes
+    ['/assets/planet', PLANET_DIR],     // .pdm heights the bake reads
+];
+for (const [mount, dir] of TERRAIN_MOUNTS) {
+    app.use(mount, express.static(dir, {
+        fallthrough: false,
+        setHeaders(res, filePath) {
+            res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+            res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+            res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+            if (filePath.endsWith('.ptm')) {
+                res.setHeader('Content-Encoding', 'gzip');
+                res.setHeader('Content-Type', 'application/octet-stream');
+            }
+        },
+    }));
+}
 
 app.use(express.static(DIST_DIR, {
     index: LIVE_RELOAD ? false : 'index.html',
