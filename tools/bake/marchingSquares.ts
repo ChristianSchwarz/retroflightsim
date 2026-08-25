@@ -26,7 +26,17 @@
  * collapses the offending triangle to zero area so it is dropped.
  */
 
-export type Vec2 = { x: number; y: number };
+/**
+ * A cell-local point. `shore` marks the ones that came from a shoreline
+ * crossing rather than a cell corner.
+ *
+ * Land and water become separate meshes downstream, and they have to agree on
+ * height exactly where they meet or the seam opens. Tagging the crossings here
+ * is what lets the projection recognise them. Matching land against water
+ * positions numerically instead is fragile: adjacent leaves compute the same
+ * crossing independently and can disagree in the last decimal.
+ */
+export type Vec2 = { x: number; y: number; shore?: boolean };
 
 /** A crossing closer than this (in cell fractions) collapses onto the corner. */
 export const SNAP_EPS = 1e-3;
@@ -62,7 +72,8 @@ const CORNERS: readonly Vec2[] = [
 function lerpOnEdge(edge: number, t: number): Vec2 {
     const a = CORNERS[edge];
     const b = CORNERS[(edge + 1) % 4];
-    return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+    // Every point this produces lies on the shoreline by construction.
+    return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, shore: true };
 }
 
 function signedArea(p: Vec2[]): number {

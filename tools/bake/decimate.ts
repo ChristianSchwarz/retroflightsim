@@ -267,9 +267,12 @@ export function decimate(input: DecimateInput): DecimateResult {
                     ? input.centreIsLand(l.x, l.y, l.size)
                     : undefined,
             });
+            // Carry the shoreline tag through: the projection needs to know
+            // which vertices land and water share.
             const lift = (p: Vec2): Vec2 => ({
                 x: l.x + p.x * l.size,
                 y: l.y + p.y * l.size,
+                shore: p.shore,
             });
             for (const t of cut.land) {
                 triangles.push({ pts: [lift(t[0]), lift(t[1]), lift(t[2])], land: true });

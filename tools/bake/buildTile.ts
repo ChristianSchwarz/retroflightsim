@@ -269,14 +269,52 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     };
 
     /** Grid -> ENU (absolute), including the pad and the water rules. */
-    const project = (gx: number, gy: number, land: boolean): Enu => {
+    const gridKey = (gx: number, gy: number) => `${gx.toFixed(4)},${gy.toFixed(4)}`;
+
+    /**
+     * Land and water become separate meshes with their own vertices, so
+     * wherever they meet they must agree on height or the seam opens into a
+     * wall you can see straight through. They meet at the marching-squares
+     * crossing points, which the cutter tags as `shore`.
+     *
+     * They did not agree: land took the DEM sample there while water sat at
+     * sea level, and OSM coastlines do not follow the DEM's zero contour. On
+     * real Canary tiles that was 48 m of mismatch on average and up to 815 m.
+     *
+     * Both sides now use sea level at a tagged point, and the ocean depth bias
+     * is skipped there so it cannot reopen the gap by half a metre.
+     */
+    /**
+     * Positions of every tagged shoreline vertex.
+     *
+     * The tag alone is not quite enough. When the coast passes within SNAP_EPS
+     * of a grid node the crossing snaps onto that corner, so one polygon gets
+     * the tagged snapped point and the other gets the plain, untagged corner at
+     * the same place — and the untagged side would fall back to the DEM height.
+     * Those positions are integers, so matching them is exact; it is only true
+     * crossings, computed independently by adjacent leaves, that cannot be
+     * compared numerically. Hence: trust the tag, and fall back to position.
+     */
+    const shorePositions = new Set<string>();
+    for (const t of tris) {
+        for (const p of t.pts) {
+            if (p.shore) {
+                shorePositions.add(gridKey(p.x, p.y));
+            }
+        }
+    }
+    const isShore = (gx: number, gy: number, tagged?: boolean) =>
+        tagged === true || shorePositions.has(gridKey(gx, gy));
+
+    const project = (gx: number, gy: number, land: boolean, tagged = false): Enu => {
+        const onShore = isShore(gx, gy, tagged);
         const lon = bounds.west + (gx / cells) * lonSpan;
         const lat = bounds.north - (gy / cells) * latSpan;
-        let h = land ? sampleHeight(gx, gy) : seaLevel;
+        let h = land && !onShore ? sampleHeight(gx, gy) : seaLevel;
         if (!Number.isFinite(h)) {
             h = seaLevel;
         }
-        if (land) {
+        if (land && !onShore) {
             // The pad blend is in ENU, so we need a first ENU pass to know
             // where we are before we can decide how much to flatten.
             geodeticToEcef(lat, lon, h, _ecef);
@@ -284,7 +322,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             if (input.pad) {
                 h = applyFlattenPad(h, _enu.e, _enu.n, input.pad);
             }
-        } else {
+        } else if (!land && !onShore) {
             h -= WATER_DEPTH_BIAS_M;
         }
         geodeticToEcef(lat, lon, h, _ecef);
@@ -322,13 +360,13 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     const waterTone: number[] = [];
     const waterKey = new Map<string, number>();
 
-    const waterVertex = (gx: number, gy: number): number => {
-        const key = `${gx.toFixed(4)},${gy.toFixed(4)}`;
+    const waterVertex = (gx: number, gy: number, tagged = false): number => {
+        const key = gridKey(gx, gy);
         let idx = waterKey.get(key);
         if (idx !== undefined) {
             return idx;
         }
-        const p = project(gx, gy, false);
+        const p = project(gx, gy, false, tagged);
         idx = waterPos.length / 3;
         waterPos.push(p.e - centre.e, p.u - centre.u, p.n - centre.n);
         waterKey.set(key, idx);
@@ -364,9 +402,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         const [p0, p1, p2] = t.pts;
         if (t.land) {
             pushLandTriangle(
-                project(p0.x, p0.y, true),
-                project(p1.x, p1.y, true),
-                project(p2.x, p2.y, true),
+                project(p0.x, p0.y, true, p0.shore),
+                project(p1.x, p1.y, true, p1.shore),
+                project(p2.x, p2.y, true, p2.shore),
                 TerrainTone.Grass,
             );
         } else {
@@ -376,9 +414,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
                 sampleDist(p2.x, p2.y),
             );
             waterIdx.push(
-                waterVertex(p0.x, p0.y),
-                waterVertex(p1.x, p1.y),
-                waterVertex(p2.x, p2.y),
+                waterVertex(p0.x, p0.y, p0.shore),
+                waterVertex(p1.x, p1.y, p1.shore),
+                waterVertex(p2.x, p2.y, p2.shore),
             );
             waterTone.push(
                 shore <= SHALLOW_WATER_COAST_M ? TerrainTone.ShallowWater : TerrainTone.Water,

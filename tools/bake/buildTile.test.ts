@@ -109,6 +109,77 @@ describe('buildTile', () => {
         assert.ok(deep[1] > 0, 'some deep water further out');
     });
 
+    describe('shoreline seam', () => {
+        /**
+         * Land and water are separate meshes with their own vertices. They meet
+         * at the marching-squares crossing points, and if the two sides put
+         * those points at different heights the seam opens into a wall you can
+         * see straight through. Land used to take the DEM sample there while
+         * water sat at sea level, and OSM coastlines do not follow the DEM's
+         * zero contour — on real tiles that was tens to hundreds of metres.
+         */
+        it('puts land and water at the same height where they meet', () => {
+            // Terrain that is high right where the coastline runs, so a
+            // mismatch would be large and obvious.
+            const r = buildTile(base({
+                heights: heightsFrom(() => 400),
+                polygons: [coastAt(16)],
+                skirtDepthM: 0,
+            }));
+            const tile = decodePtm(r.bytes);
+
+            // Collect water vertex positions, then look for land vertices at
+            // the same horizontal spot: those are the shared shoreline points.
+            const key = (x: number, z: number) => `${x},${z}`;
+            const water = new Map<string, number[]>();
+            for (let v = 0; v < tile.waterPositions.length / 3; v++) {
+                const k = key(tile.waterPositions[v * 3], tile.waterPositions[v * 3 + 2]);
+                const list = water.get(k) ?? [];
+                list.push(tile.waterPositions[v * 3 + 1]);
+                water.set(k, list);
+            }
+
+            let shared = 0;
+            let worstGapM = 0;
+            for (let v = 0; v < tile.landPositions.length / 3; v++) {
+                const k = key(tile.landPositions[v * 3], tile.landPositions[v * 3 + 2]);
+                const ys = water.get(k);
+                if (!ys) {
+                    continue;
+                }
+                shared++;
+                const ly = tile.landPositions[v * 3 + 1];
+                let best = Infinity;
+                for (const wy of ys) {
+                    best = Math.min(best, Math.abs(ly - wy) * tile.quantScale);
+                }
+                worstGapM = Math.max(worstGapM, best);
+            }
+
+            assert.ok(shared > 0, 'land and water share shoreline points');
+            assert.ok(
+                worstGapM < 0.25,
+                `shoreline seam is open by ${worstGapM.toFixed(2)} m`,
+            );
+        });
+
+        it('still drops open water below land away from the shore', () => {
+            // The depth bias has to survive offshore, where it keeps a coplanar
+            // beach edge from z-fighting; it is only skipped at the seam.
+            const r = buildTile(base({
+                heights: heightsFrom(() => 0),
+                polygons: [coastAt(16)],
+                skirtDepthM: 0,
+            }));
+            const tile = decodePtm(r.bytes);
+            let lowest = Infinity;
+            for (let v = 0; v < tile.waterPositions.length / 3; v++) {
+                lowest = Math.min(lowest, tile.waterPositions[v * 3 + 1] * tile.quantScale);
+            }
+            assert.ok(lowest < -0.4, `open water not biased down, lowest ${lowest}`);
+        });
+    });
+
     describe('triangle budget', () => {
         // A pathological coastline: a fine comb that cuts a great many cells.
         const combPolygons = (): CoastPolygon[] => {
