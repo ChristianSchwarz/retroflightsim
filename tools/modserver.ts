@@ -21,7 +21,7 @@ const IMPORTS_DIR = path.join(PROJECT_ROOT, 'tools', 'mods', 'imports');
 const IMPORTS_PREFIX = 'tools/mods/imports';
 const UPLOADS_DIR = path.join(PROJECT_ROOT, 'tools', 'mods', 'uploads');
 const PYTHON = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
-const PORT = Number(process.env.PORT) || 8010;
+const PORT = Number(process.env.PORT) || 8020;
 
 interface ImportConfig {
     name?: string;
