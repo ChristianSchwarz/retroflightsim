@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { decodePtm } from '../src/script/terrain/ptm';
+import { CLASS_COUNT } from '../src/script/terrain/tones';
 
 interface Args {
     dir: string;
@@ -171,10 +172,20 @@ function main(): void {
         if (!(tile.quantScale > 0)) {
             note(`${key}: bad quantisation scale ${tile.quantScale}`);
         }
-        for (let v = 0; v < tile.landTones.length; v++) {
-            const t = tile.landTones[v];
-            if (t < 2 || t > 4) {
-                note(`${key}: land vertex ${v} has tone ${t}`);
+        for (let v = 0; v < tile.landSmoothNormals.length; v += 4) {
+            const x = tile.landSmoothNormals[v] / 127;
+            const y = tile.landSmoothNormals[v + 1] / 127;
+            const z = tile.landSmoothNormals[v + 2] / 127;
+            const len = Math.hypot(x, y, z);
+            if (!(Math.abs(len - 1) < 0.05) || y < 0) {
+                note(`${key}: smooth normal ${v / 4} is ${x},${y},${z} (len ${len.toFixed(3)})`);
+                break;
+            }
+        }
+        for (let v = 3; v < tile.landAttrs.length; v += 4) {
+            const c = tile.landAttrs[v];
+            if (c >= CLASS_COUNT) {
+                note(`${key}: land vertex ${(v - 3) / 4} has cover class ${c}`);
                 break;
             }
         }

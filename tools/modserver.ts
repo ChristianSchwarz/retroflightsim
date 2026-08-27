@@ -1008,39 +1008,6 @@ app.get('/api/health', (_req: Request, res: Response) => {
     res.json({ ok: true, server: 'modserver', previewMod: true });
 });
 
-/** Same-origin OSM raster proxy for the cockpit MFD (COOP/COEP safe). */
-app.get('/api/osm/:z/:x/:y', async (req: Request, res: Response) => {
-    const z = Number(req.params.z);
-    const x = Number(req.params.x);
-    const y = Number(req.params.y);
-    if (![z, x, y].every(n => Number.isInteger(n) && n >= 0) || z > 18) {
-        return res.status(400).type('text').send('bad tile');
-    }
-    const n = 1 << z;
-    if (x >= n || y >= n) {
-        return res.status(400).type('text').send('out of range');
-    }
-    const url = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
-    try {
-        const upstream = await fetch(url, {
-            headers: {
-                'User-Agent': 'retroflightsim/0.0.1 (local flight sim; contact: local-dev)',
-                Accept: 'image/png',
-            },
-        });
-        if (!upstream.ok) {
-            return res.status(upstream.status).type('text').send(`upstream ${upstream.status}`);
-        }
-        const buf = Buffer.from(await upstream.arrayBuffer());
-        res.setHeader('Content-Type', 'image/png');
-        res.setHeader('Cache-Control', 'public, max-age=86400');
-        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-        return res.send(buf);
-    } catch (err) {
-        return res.status(502).type('text').send((err as Error).message);
-    }
-});
-
 app.get('/api/aircraft-packs', (_req: Request, res: Response) => {
     res.json(listAircraftPacks());
 });

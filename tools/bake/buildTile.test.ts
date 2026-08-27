@@ -3,9 +3,9 @@ import { describe, it } from 'node:test';
 import { ecefToEnu, geodeticToEcef, makeEnuBasis } from '../../src/script/terrain/geodesy';
 import { padBlendWeight } from '../../src/script/terrain/flattenPad';
 import { decodePtm } from '../../src/script/terrain/ptm';
-import { TerrainTone } from '../../src/script/terrain/tones';
+import { TerrainClass } from '../../src/script/terrain/tones';
 import { CoastPolygon, LonLatBounds } from './shoreline';
-import { BuildTileInput, buildTile } from './buildTile';
+import { BuildTileInput, TileCover, buildTile } from './buildTile';
 
 const SIZE = 33;
 const CELLS = SIZE - 1;
@@ -38,6 +38,28 @@ function coastAt(edgeCells: number): CoastPolygon {
         ],
         holes: [],
     };
+}
+
+/** Cover with one class and one colour everywhere. */
+function uniformCover(cls: TerrainClass, rgb: [number, number, number]): TileCover {
+    const classes = new Uint8Array(SIZE * SIZE).fill(cls);
+    const colors = new Uint8Array(SIZE * SIZE * 3);
+    for (let i = 0; i < SIZE * SIZE; i++) {
+        colors[i * 3] = rgb[0];
+        colors[i * 3 + 1] = rgb[1];
+        colors[i * 3 + 2] = rgb[2];
+    }
+    return { size: SIZE, classes, colors };
+}
+
+/** Every distinct class present on the land facets of a decoded tile. */
+function classesIn(bytes: Uint8Array): Set<number> {
+    const tile = decodePtm(bytes);
+    const out = new Set<number>();
+    for (let v = 3; v < tile.landAttrs.length; v += 4) {
+        out.add(tile.landAttrs[v]);
+    }
+    return out;
 }
 
 function base(overrides: Partial<BuildTileInput> = {}): BuildTileInput {
@@ -78,10 +100,9 @@ describe('buildTile', () => {
         assert.equal(r.waterTriangles, 0);
         const tile = decodePtm(r.bytes);
         assert.equal(tile.waterIndices.length, 0);
-        // Single land colour: everything is Grass (see toneForLandHeight).
-        for (let v = 0; v < tile.landTones.length; v++) {
-            assert.equal(tile.landTones[v], TerrainTone.Grass);
-        }
+        // No cover raster: every facet falls back to the unknown class, which
+        // the palette paints as plain grass — what the bake did before cover.
+        assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Unknown]));
     });
 
     it('emits only water for a tile with no land', () => {
@@ -362,5 +383,172 @@ describe('buildTile', () => {
         const tile = decodePtm(r.bytes);
         assert.ok(tile.boundingRadiusM > 100);
         assert.ok(r.bytes.byteLength < 200_000, `${r.bytes.byteLength} bytes is too large`);
+    });
+});
+
+describe('buildTile cover', () => {
+    it('paints every facet with the observed class when cover is uniform', () => {
+        const r = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            cover: uniformCover(TerrainClass.Shrub, [90, 100, 60]),
+        }));
+        assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Shrub]));
+        const tile = decodePtm(r.bytes);
+        for (let v = 0; v < tile.landAttrs.length; v += 4) {
+            assert.equal(tile.landAttrs[v], 90);
+            assert.equal(tile.landAttrs[v + 1], 100);
+            assert.equal(tile.landAttrs[v + 2], 60);
+        }
+    });
+
+    it('takes the majority class over a facet, not whatever is at its centre', () => {
+        // A single stripe of built-up two cells wide down the middle of an
+        // otherwise shrubby tile. Facets here span several cells, so a facet
+        // straddling the stripe must still come out shrub: the stripe is the
+        // minority of the ground it covers.
+        const cover = uniformCover(TerrainClass.Shrub, [90, 100, 60]);
+        for (let y = 0; y < SIZE; y++) {
+            for (let x = 15; x < 17; x++) {
+                cover.classes[y * SIZE + x] = TerrainClass.Built;
+            }
+        }
+        const r = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            maxErrorM: 1e9,       // coarse facets, so each spans many cells
+            cover,
+        }));
+        assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Shrub]));
+    });
+
+    it('turns bare ground near the shore into sand, and leaves inland bare alone', () => {
+        const coastal = buildTile(base({
+            polygons: [coastAt(4)],
+            cover: uniformCover(TerrainClass.Bare, [180, 170, 140]),
+        }));
+        assert.ok(classesIn(coastal.bytes).has(TerrainClass.Sand),
+            'a 150 m-wide strip of land is all beach');
+
+        // The same cover on a tile with no water at all has no shore to be
+        // near, so nothing may be reclassified.
+        const inland = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            cover: uniformCover(TerrainClass.Bare, [180, 170, 140]),
+        }));
+        assert.deepEqual(classesIn(inland.bytes), new Set([TerrainClass.Bare]));
+    });
+
+    it('does not paint sea inland when the two sources disagree about the shore', () => {
+        // The OSM vector says this is all land; the raster says open water.
+        // The vector wins — the alternative is a lake where a hillside is.
+        const r = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            cover: uniformCover(TerrainClass.Water, [20, 40, 90]),
+        }));
+        assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Grass]));
+    });
+
+    it('gives shore walls and skirts the cover of the facet they hang from', () => {
+        // A coastal tile has both. Every land facet, wall and skirt included,
+        // must carry the one class present — a wall in a different colour
+        // reads as a painted stripe along the coast.
+        const r = buildTile(base({
+            polygons: [coastAt(16)],
+            cover: uniformCover(TerrainClass.Tree, [30, 70, 30]),
+        }));
+        assert.ok(r.landTriangles > 0);
+        assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Tree]));
+    });
+
+    it('rejects cover on a different grid than the heights', () => {
+        const cover = uniformCover(TerrainClass.Shrub, [90, 100, 60]);
+        assert.throws(
+            () => buildTile(base({ polygons: [coastAt(16)], cover: { ...cover, size: SIZE + 1 } })),
+            /cover size/,
+        );
+    });
+
+    it('reports the facet colours it emitted, for the swatch histogram', () => {
+        const r = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            cover: uniformCover(TerrainClass.Shrub, [90, 100, 60]),
+        }));
+        assert.equal(r.landColors.length, r.landTriangles * 3);
+        assert.equal(r.landColors[0], 90);
+    });
+});
+
+describe('buildTile smooth normals', () => {
+    /** Every land vertex's [flat, smooth] normal pair from a decoded tile. */
+    function normals(bytes: Uint8Array) {
+        const tile = decodePtm(bytes);
+        const out: Array<{ flat: number[]; smooth: number[] }> = [];
+        for (let v = 0; v < tile.landNormals.length / 4; v++) {
+            out.push({
+                flat: [tile.landNormals[v * 4], tile.landNormals[v * 4 + 1],
+                    tile.landNormals[v * 4 + 2]].map(n => n / 127),
+                smooth: [tile.landSmoothNormals[v * 4], tile.landSmoothNormals[v * 4 + 1],
+                    tile.landSmoothNormals[v * 4 + 2]].map(n => n / 127),
+            });
+        }
+        return out;
+    }
+
+    it('emits a unit-length smooth normal for every land vertex', () => {
+        const r = buildTile(base({ polygons: [coastAt(16)] }));
+        const all = normals(r.bytes);
+        assert.ok(all.length > 0);
+        for (const { smooth } of all) {
+            const len = Math.hypot(smooth[0], smooth[1], smooth[2]);
+            assert.ok(Math.abs(len - 1) < 0.02, `smooth normal length ${len}`);
+        }
+    });
+
+    it('keeps smooth normals pointing up, like the flat ones', () => {
+        const r = buildTile(base({ polygons: [coastAt(CELLS + 2)] }));
+        for (const { smooth } of normals(r.bytes)) {
+            assert.ok(smooth[1] >= 0, `smooth normal points down: ${smooth}`);
+        }
+    });
+
+    it('differs from the flat normal on curved ground', () => {
+        // The heights in `base` are a sine/cosine field, so neighbouring facets
+        // genuinely disagree and averaging has something to do. If these came
+        // out equal the smooth shading path would be a no-op.
+        const r = buildTile(base({ polygons: [coastAt(CELLS + 2)] }));
+        const all = normals(r.bytes);
+        const differing = all.filter(({ flat, smooth }) =>
+            Math.abs(flat[0] - smooth[0]) > 0.02
+            || Math.abs(flat[1] - smooth[1]) > 0.02
+            || Math.abs(flat[2] - smooth[2]) > 0.02);
+        assert.ok(differing.length > all.length * 0.5,
+            `only ${differing.length}/${all.length} vertices got a distinct smooth normal`);
+    });
+
+    it('leaves flat ground with smooth normals equal to the flat ones', () => {
+        // Every facet shares one normal, so the average is that normal.
+        const r = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            heights: heightsFrom(() => 100),
+        }));
+        for (const { flat, smooth } of normals(r.bytes)) {
+            for (let c = 0; c < 3; c++) {
+                assert.ok(Math.abs(flat[c] - smooth[c]) < 0.02,
+                    `flat ground should not be smoothed: ${flat} vs ${smooth}`);
+            }
+        }
+    });
+
+    it('does not round off a shore wall, which is a crease by construction', () => {
+        // Walls hang vertically from the coast. Averaging one into the surface
+        // above it would bend the cliff edge into the sea.
+        const r = buildTile(base({ polygons: [coastAt(16)] }));
+        const walls = normals(r.bytes).filter(({ flat }) => Math.abs(flat[1]) < 0.2);
+        assert.ok(walls.length > 0, 'expected some near-vertical wall facets');
+        for (const { flat, smooth } of walls) {
+            for (let c = 0; c < 3; c++) {
+                assert.ok(Math.abs(flat[c] - smooth[c]) < 0.02,
+                    `a wall must keep its own normal: ${flat} vs ${smooth}`);
+            }
+        }
     });
 });

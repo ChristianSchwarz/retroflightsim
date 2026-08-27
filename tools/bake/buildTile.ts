@@ -7,7 +7,8 @@
  *   3. enforce the triangle budget by coarsening and retrying
  *   4. project grid space -> geodetic -> ECEF -> tile-local ENU
  *   5. apply the airbase flatten pad and the ocean depth bias
- *   6. classify tones, build skirts, split into the land and water streams
+ *   6. sample the cover raster per facet, average vertex normals, build
+ *      skirts, split the streams
  *   7. encode                                              (ptm.ts)
  *
  * Everything the output depends on is fixed at build time, which is the whole
@@ -16,7 +17,7 @@
 
 import { EnuBasis, Ecef, Enu, ecefToEnu, geodeticToEcef } from '../../src/script/terrain/geodesy';
 import { FlattenPad, applyFlattenPad } from '../../src/script/terrain/flattenPad';
-import { TerrainTone } from '../../src/script/terrain/tones';
+import { CLASS_TO_TONE, TerrainClass, TerrainTone } from '../../src/script/terrain/tones';
 import { PtmTileId, encodePtm } from '../../src/script/terrain/ptm';
 import { GridTriangle, decimate } from './decimate';
 import { CoastPolygon, LonLatBounds, buildShoreline } from './shoreline';
@@ -33,8 +34,43 @@ export const WATER_DEPTH_BIAS_M = 0.5;
 /** Water within this distance of the shore is painted as the shallow tone. */
 export const SHALLOW_WATER_COAST_M = 80;
 
+/**
+ * Bare ground within this distance of the shore is beach, not rock.
+ *
+ * WorldCover has no sand class - dune, ash flat and lava field are all class
+ * 60 - so the distinction has to come from geometry the raster does not carry.
+ * Wider than the shallow-water band on purpose: a beach reads as a band from
+ * the air, and 80 m of it disappears at altitude.
+ */
+export const SHORE_SAND_M = 160;
+
+/** Facet colour where the bake has no imagery to sample: honest mid grey. */
+const NO_COVER_RGB: readonly [number, number, number] = [128, 128, 128];
+
+/**
+ * How far past a facet to look for dry ground when every node under it reads
+ * as water. Wide enough to clear the coastline disagreement strip, narrow
+ * enough that the colour still belongs to this stretch of shore.
+ */
+const DRY_SEARCH_CELLS = 4;
+
 /** Skirt tops sit this far below the surface so they cannot z-fight it. */
 export const SKIRT_TOP_EPS_M = 0.05;
+
+/**
+ * Observed ground cover on the tile's own grid, written by
+ * tools/bake_planet_cover.py and decoded by tools/bake/plc.ts.
+ *
+ * Same `size * size` row-major layout as the heights, so a grid coordinate
+ * indexes both without a second projection.
+ */
+export interface TileCover {
+    size: number;
+    /** One {@link TerrainClass} per node. */
+    classes: Uint8Array;
+    /** Three sRGB bytes per node. */
+    colors: Uint8Array;
+}
 
 export interface BuildTileInput {
     id: PtmTileId;
@@ -55,6 +91,8 @@ export interface BuildTileInput {
     triangleBudget?: number;
     /** Baked flatten pad, heightMsl included. */
     pad?: FlattenPad;
+    /** Observed cover. Omit and every land facet falls back to plain grass. */
+    cover?: TileCover;
 }
 
 export interface BuildTileResult {
@@ -68,20 +106,27 @@ export interface BuildTileResult {
     /** How many budget retries were needed. */
     attempts: number;
     centerHeightM: number;
+    /** Three sRGB bytes per land triangle, for the bake's swatch histogram. */
+    landColors: Uint8Array;
 }
 
 const _ecef: Ecef = { x: 0, y: 0, z: 0 };
 const _enu: Enu = { e: 0, n: 0, u: 0 };
 
 /**
- * Multi-source chamfer distance (in cells) from every land node.
- * Used to decide which water is shallow enough for the lighter tone.
+ * Multi-source chamfer distance (in cells) from every seeded node.
+ *
+ * Seeded on land it says how far out to sea a point is, which decides the
+ * shallow-water tone; seeded on water it says how far inland, which decides
+ * where bare ground is beach.
  */
-function landDistanceCells(landNodes: Uint8Array, size: number): Float32Array {
+function chamferDistanceCells(
+    seeds: Uint8Array, size: number, seedWhen: number,
+): Float32Array {
     const INF = 1e9;
     const d = new Float32Array(size * size).fill(INF);
     for (let i = 0; i < d.length; i++) {
-        if (landNodes[i]) {
+        if ((seeds[i] ? 1 : 0) === seedWhen) {
             d[i] = 0;
         }
     }
@@ -234,7 +279,11 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     // --- 4/5. projection, pad, depth bias ---------------------------------
     const lonSpan = bounds.east - bounds.west;
     const latSpan = bounds.north - bounds.south;
-    const distCells = landDistanceCells(shoreline.landNodes, size);
+    const distCells = chamferDistanceCells(shoreline.landNodes, size, 1);
+    // The mirror of the above: how far *inland* a point is, which is what the
+    // beach rule needs. A tile with no water at all seeds nothing, and every
+    // node correctly comes back at the infinity the fill starts from.
+    const inlandCells = chamferDistanceCells(shoreline.landNodes, size, 0);
     // Metres per cell, for the shallow-water distance test. Latitude spacing
     // is used because it does not shrink with longitude towards the poles.
     const metresPerCell = Math.max(1e-6, (latSpan / cells) * 110540);
@@ -271,6 +320,12 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         const x = Math.min(size - 1, Math.max(0, Math.round(gx)));
         const y = Math.min(size - 1, Math.max(0, Math.round(gy)));
         return distCells[y * size + x] * metresPerCell;
+    };
+
+    const sampleInland = (gx: number, gy: number): number => {
+        const x = Math.min(size - 1, Math.max(0, Math.round(gx)));
+        const y = Math.min(size - 1, Math.max(0, Math.round(gy)));
+        return inlandCells[y * size + x] * metresPerCell;
     };
 
     /** Grid -> ENU (absolute), including the pad and the water rules. */
@@ -376,10 +431,164 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     geodeticToEcef(centreLat, centreLon, centerHeightM, _ecef);
     const centre = ecefToEnu(basis, _ecef, { e: 0, n: 0, u: 0 });
 
-    // --- 6. tones, streams, skirts ----------------------------------------
+    // --- 6. cover, streams, skirts ----------------------------------------
+    //
+    // A facet's colour is whatever the cover raster says over the ground the
+    // facet actually covers, not what it says at one point: a single centroid
+    // sample turns a coarse-zoom triangle spanning a whole valley into
+    // whichever pixel happened to sit under its middle, and the result
+    // flickers between LOD levels. So: walk the facet's grid footprint, take
+    // the majority class and the mean colour.
+    const cover = input.cover;
+    if (cover && cover.size !== size) {
+        throw new Error(`cover size ${cover.size} != DEM size ${size}`);
+    }
+
+    // One histogram for the whole tile, cleared per facet. Allocating it
+    // inside classify meant a kilobyte per triangle across five thousand
+    // triangles a tile and fourteen hundred tiles, which measurably dominated
+    // the bake; clearing 256 entries does not.
+    const histogram = new Uint32Array(256);
+
+    /** Facet cover: [class, r, g, b]. */
+    const classify = (
+        p0: { x: number; y: number },
+        p1: { x: number; y: number },
+        p2: { x: number; y: number },
+    ): [number, number, number, number] => {
+        if (!cover) {
+            return [TerrainClass.Unknown, ...NO_COVER_RGB] as [number, number, number, number];
+        }
+        histogram.fill(0);
+        let rs = 0;
+        let gs = 0;
+        let bs = 0;
+        let n = 0;
+        // Colour is accumulated twice: once over every node, once over the dry
+        // ones only. A facet the coast vector kept as land still overlaps water
+        // nodes near the shore, and averaging the sea into it paints a blue
+        // fringe along every beach.
+        let dryRs = 0;
+        let dryGs = 0;
+        let dryBs = 0;
+        let dryN = 0;
+        const add = (x: number, y: number) => {
+            const i = y * size + x;
+            const cls = cover.classes[i];
+            const r = cover.colors[i * 3];
+            const g = cover.colors[i * 3 + 1];
+            const b = cover.colors[i * 3 + 2];
+            histogram[cls]++;
+            rs += r;
+            gs += g;
+            bs += b;
+            n++;
+            if (cls !== TerrainClass.Water) {
+                dryRs += r;
+                dryGs += g;
+                dryBs += b;
+                dryN++;
+            }
+        };
+
+        // Edge functions, once per facet. Sign-agnostic so winding does not
+        // matter: a node is inside when all three have the same sign as the
+        // facet's own area.
+        const area = (p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y);
+        const sign = area >= 0 ? 1 : -1;
+        const x0 = Math.max(0, Math.ceil(Math.min(p0.x, p1.x, p2.x)));
+        const x1 = Math.min(size - 1, Math.floor(Math.max(p0.x, p1.x, p2.x)));
+        const y0 = Math.max(0, Math.ceil(Math.min(p0.y, p1.y, p2.y)));
+        const y1 = Math.min(size - 1, Math.floor(Math.max(p0.y, p1.y, p2.y)));
+        for (let y = y0; y <= y1; y++) {
+            for (let x = x0; x <= x1; x++) {
+                const e0 = ((p1.x - p0.x) * (y - p0.y) - (x - p0.x) * (p1.y - p0.y)) * sign;
+                const e1 = ((p2.x - p1.x) * (y - p1.y) - (x - p1.x) * (p2.y - p1.y)) * sign;
+                const e2 = ((p0.x - p2.x) * (y - p2.y) - (x - p2.x) * (p0.y - p2.y)) * sign;
+                if (e0 >= 0 && e1 >= 0 && e2 >= 0) {
+                    add(x, y);
+                }
+            }
+        }
+        // A facet smaller than a cell can enclose no node at all. Its centroid
+        // is inside it by definition, so that is the honest single sample.
+        if (n === 0) {
+            add(
+                Math.min(size - 1, Math.max(0, Math.round((p0.x + p1.x + p2.x) / 3))),
+                Math.min(size - 1, Math.max(0, Math.round((p0.y + p1.y + p2.y) / 3))),
+            );
+        }
+
+        let best = TerrainClass.Unknown as number;
+        let bestCount = -1;
+        for (let c = 0; c < histogram.length; c++) {
+            if (histogram[c] > bestCount) {
+                bestCount = histogram[c];
+                best = c;
+            }
+        }
+        // The OSM coast vector already decided this facet is land, so a
+        // landcover raster calling it open water is a disagreement between two
+        // sources about where the shore is - not a reason to paint sea inland.
+        if (best === TerrainClass.Water) {
+            best = TerrainClass.Grass;
+        }
+        // WorldCover cannot tell dune from lava field. Proximity to the coast
+        // can, and it is the one that reads from the air.
+        if (best === TerrainClass.Bare) {
+            const inland = Math.min(
+                sampleInland(p0.x, p0.y), sampleInland(p1.x, p1.y), sampleInland(p2.x, p2.y),
+            );
+            if (inland <= SHORE_SAND_M) {
+                best = TerrainClass.Sand;
+            }
+        }
+        // A facet can be land by the coast vector and yet cover nothing but
+        // water nodes - that is precisely the strip the two sources disagree
+        // over, and it runs the length of every coastline. There is no dry
+        // colour inside it to average, so widen the search rather than paint
+        // the sea onto land.
+        if (dryN === 0) {
+            const bx0 = Math.max(0, x0 - DRY_SEARCH_CELLS);
+            const bx1 = Math.min(size - 1, x1 + DRY_SEARCH_CELLS);
+            const by0 = Math.max(0, y0 - DRY_SEARCH_CELLS);
+            const by1 = Math.min(size - 1, y1 + DRY_SEARCH_CELLS);
+            for (let y = by0; y <= by1; y++) {
+                for (let x = bx0; x <= bx1; x++) {
+                    const i = y * size + x;
+                    if (cover.classes[i] === TerrainClass.Water) {
+                        continue;
+                    }
+                    dryRs += cover.colors[i * 3];
+                    dryGs += cover.colors[i * 3 + 1];
+                    dryBs += cover.colors[i * 3 + 2];
+                    dryN++;
+                }
+            }
+        }
+        const cr = dryN > 0 ? dryRs / dryN : rs / n;
+        const cg = dryN > 0 ? dryGs / dryN : gs / n;
+        const cb = dryN > 0 ? dryBs / dryN : bs / n;
+        return [best, Math.round(cr), Math.round(cg), Math.round(cb)];
+    };
+
+    // Shore walls and skirts ask for the same facet's cover as the surface
+    // triangle they hang from, once per edge. Resolve each triangle once.
+    const facetCovers = new Map<GridTriangle, readonly [number, number, number, number]>();
+    const coverOf = (t: GridTriangle): readonly [number, number, number, number] => {
+        let c = facetCovers.get(t);
+        if (!c) {
+            c = classify(t.pts[0], t.pts[1], t.pts[2]);
+            facetCovers.set(t, c);
+        }
+        return c;
+    };
+
     const landPos: number[] = [];
     const landNrm: number[] = [];
-    const landTone: number[] = [];
+    const landSmNrm: number[] = [];
+    const landClass: number[] = [];
+    const landColor: number[] = [];
 
     const waterPos: number[] = [];
     const waterIdx: number[] = [];
@@ -399,8 +608,16 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         return idx;
     };
 
+    /**
+     * `facet` is [class, r, g, b], as returned by classify. `smooth` is the
+     * averaged normal at each of the three corners, 9 floats; omit it and all
+     * three corners take the facet's own normal, which is what a wall or a
+     * skirt wants - they are creases, and averaging across one rounds off the
+     * very edge it exists to draw.
+     */
     const pushLandTriangle = (
-        a: Enu, b: Enu, c: Enu, tone: TerrainTone,
+        a: Enu, b: Enu, c: Enu, facet: readonly [number, number, number, number],
+        smooth?: readonly number[],
     ) => {
         const ax = a.e - centre.e, ay = a.u - centre.u, az = a.n - centre.n;
         const bx = b.e - centre.e, by = b.u - centre.u, bz = b.n - centre.n;
@@ -421,7 +638,78 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         }
         landPos.push(ax, ay, az, bx, by, bz, cx, cy, cz);
         landNrm.push(nx, ny, nz);
-        landTone.push(tone);
+        if (smooth) {
+            landSmNrm.push(...smooth);
+        } else {
+            landSmNrm.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
+        }
+        landClass.push(facet[0]);
+        landColor.push(facet[1], facet[2], facet[3]);
+    };
+
+    /**
+     * Normals averaged over every surface facet meeting at a grid position.
+     *
+     * Accumulated unnormalised, so a facet contributes in proportion to its
+     * area - which is what keeps a decimated tile shading like the terrain
+     * rather than like its triangulation, where one huge facet and one sliver
+     * would otherwise count the same.
+     *
+     * Surface facets only. Walls and skirts are creases by construction and
+     * are excluded from both sides of this: they neither contribute here nor
+     * read from it.
+     *
+     * Vertices are keyed by grid position rather than by ENU, because that is
+     * what adjacent facets actually share - the decimator hands back the same
+     * integer or crossing coordinate to each of them, while the projected
+     * metres are recomputed per facet.
+     */
+    const vertexNormals = new Map<string, [number, number, number]>();
+    const accumulate = (
+        key: string, nx: number, ny: number, nz: number,
+    ) => {
+        const acc = vertexNormals.get(key);
+        if (acc) {
+            acc[0] += nx;
+            acc[1] += ny;
+            acc[2] += nz;
+        } else {
+            vertexNormals.set(key, [nx, ny, nz]);
+        }
+    };
+
+    for (const t of tris) {
+        if (!t.land) {
+            continue;
+        }
+        const [p0, p1, p2] = t.pts;
+        const a = project(p0.x, p0.y, true, p0.shore);
+        const b = project(p1.x, p1.y, true, p1.shore);
+        const c = project(p2.x, p2.y, true, p2.shore);
+        // Unnormalised cross product: its length is twice the facet's area,
+        // which is the weight we want.
+        let nx = (b.u - a.u) * (c.n - a.n) - (b.n - a.n) * (c.u - a.u);
+        let ny = (b.n - a.n) * (c.e - a.e) - (b.e - a.e) * (c.n - a.n);
+        let nz = (b.e - a.e) * (c.u - a.u) - (b.u - a.u) * (c.e - a.e);
+        // Same up-flip pushLandTriangle applies. Without it two facets of
+        // opposite winding cancel instead of reinforcing, and the average
+        // collapses towards zero.
+        if (ny < 0) {
+            nx = -nx; ny = -ny; nz = -nz;
+        }
+        accumulate(gridKey(p0.x, p0.y), nx, ny, nz);
+        accumulate(gridKey(p1.x, p1.y), nx, ny, nz);
+        accumulate(gridKey(p2.x, p2.y), nx, ny, nz);
+    }
+
+    /** The averaged normal at a grid position, unit length. */
+    const smoothAt = (gx: number, gy: number): [number, number, number] => {
+        const acc = vertexNormals.get(gridKey(gx, gy));
+        if (!acc) {
+            return [0, 1, 0];
+        }
+        const len = Math.hypot(acc[0], acc[1], acc[2]);
+        return len > 0 ? [acc[0] / len, acc[1] / len, acc[2] / len] : [0, 1, 0];
     };
 
     for (const t of tris) {
@@ -431,7 +719,8 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
                 project(p0.x, p0.y, true, p0.shore),
                 project(p1.x, p1.y, true, p1.shore),
                 project(p2.x, p2.y, true, p2.shore),
-                TerrainTone.Grass,
+                coverOf(t),
+                [...smoothAt(p0.x, p0.y), ...smoothAt(p1.x, p1.y), ...smoothAt(p2.x, p2.y)],
             );
         } else {
             const shore = Math.min(
@@ -483,8 +772,11 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             if (Math.abs(topA.u - botA.u) < 0.1 && Math.abs(topB.u - botB.u) < 0.1) {
                 continue;
             }
-            pushLandTriangle(topA, topB, botB, TerrainTone.Grass);
-            pushLandTriangle(topA, botB, botA, TerrainTone.Grass);
+            // A wall is the cut face of the facet above it, so it wears that
+            // facet's cover rather than a colour of its own.
+            const facet = coverOf(t);
+            pushLandTriangle(topA, topB, botB, facet);
+            pushLandTriangle(topA, botB, botA, facet);
         }
     }
 
@@ -503,8 +795,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
                 const topB: Enu = { e: pb.e, n: pb.n, u: pb.u - SKIRT_TOP_EPS_M };
                 const botA: Enu = { e: pa.e, n: pa.n, u: pa.u - skirt };
                 const botB: Enu = { e: pb.e, n: pb.n, u: pb.u - skirt };
-                pushLandTriangle(topA, topB, botB, TerrainTone.Grass);
-                pushLandTriangle(topA, botB, botA, TerrainTone.Grass);
+                const facet = coverOf(t);
+                pushLandTriangle(topA, topB, botB, facet);
+                pushLandTriangle(topA, botB, botA, facet);
             } else {
                 const ia = waterVertex(a.x, a.y);
                 const ib = waterVertex(b.x, b.y);
@@ -553,7 +846,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         land: {
             positions: new Float32Array(landPos),
             faceNormals: new Float32Array(landNrm),
-            tones: new Uint8Array(landTone),
+            smoothNormals: new Float32Array(landSmNrm),
+            classes: new Uint8Array(landClass),
+            colors: new Uint8Array(landColor),
         },
         water: {
             positions: new Float32Array(waterPos),
@@ -564,12 +859,13 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
 
     return {
         bytes,
-        triangleCount: landTone.length + waterTone.length,
-        landTriangles: landTone.length,
+        triangleCount: landClass.length + waterTone.length,
+        landTriangles: landClass.length,
         waterTriangles: waterTone.length,
         maxErrorM,
         minLeafSize,
         attempts,
         centerHeightM,
+        landColors: new Uint8Array(landColor),
     };
 }

@@ -2,10 +2,14 @@
  * Bake draw-ready terrain tiles (.ptm) from the DEM height pyramid and the OSM
  * coastline vectors.
  *
- * Reads the existing pyramid written by tools/bake_planet_dem.py and
- * tools/bake_osm_coast.py — .pdm heights, .lvr land polygons — and writes one
- * gzip-compressed PTM1 tile per land tile, plus index_mesh.bin and a manifest
- * describing the mesh stream.
+ * Reads the existing pyramid written by tools/bake_planet_dem.py,
+ * tools/bake_osm_coast.py and tools/bake_planet_cover.py — .pdm heights, .lvr
+ * land polygons, .plc observed cover — and writes one gzip-compressed PTM1
+ * tile per land tile, plus index_mesh.bin and a manifest describing the mesh
+ * stream.
+ *
+ * Cover is optional. Without it every land facet falls back to plain grass,
+ * which is exactly what the bake produced before cover existed.
  *
  * This is the only place terrain geometry is produced. The runtime fetches,
  * decodes and draws; it never triangulates, so there is no fallback path to
@@ -20,6 +24,7 @@
  *     --budget N       triangles per tile       (default 6144)
  *     --only z/x/y     bake a single tile (repeatable), for debugging
  *     --limit N        stop after N tiles, for a quick smoke bake
+ *     --swatches N     colours in the baked swatch table (default 24)
  */
 
 import * as fs from 'node:fs';
@@ -27,6 +32,8 @@ import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { decodePdm } from '../src/script/terrain/demTile';
 import { decodeLvr } from './bake/lvr';
+import { PLC_FLAG_REAL_IMAGERY, decodePlc } from './bake/plc';
+import { accumulateColors, luminanceWindow, medianCut, newColorHistogram } from './bake/swatches';
 import { EnuBasis, enuToGeodeticApprox, makeEnuBasis } from '../src/script/terrain/geodesy';
 import { AIRBASE_FLATTEN_PAD, PLAY_ORIGIN } from '../src/script/state/worldLayout';
 import { buildTile } from './bake/buildTile';
@@ -38,6 +45,15 @@ import { CoastPolygon, LonLatBounds } from './bake/shoreline';
 // a ~34 m shoreline (minLeafSize 2) and lands near 5,300 triangles per tile.
 const DEFAULT_BUDGET = 6144;
 
+/**
+ * Colours in the baked swatch table.
+ *
+ * 24 is the retro end of "enough": a VGA-era scene got by on far fewer, and
+ * past about thirty the mode stops reading as quantised and starts looking
+ * like a muddier version of raw imagery.
+ */
+const DEFAULT_SWATCHES = 24;
+
 interface Args {
     src: string;
     out: string;
@@ -45,6 +61,7 @@ interface Args {
     budget: number;
     only: string[];
     limit?: number;
+    swatches: number;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -53,6 +70,7 @@ function parseArgs(argv: string[]): Args {
         out: 'assets/terrain',
         budget: DEFAULT_BUDGET,
         only: [],
+        swatches: DEFAULT_SWATCHES,
     };
     for (let i = 0; i < argv.length; i++) {
         const k = argv[i];
@@ -63,6 +81,7 @@ function parseArgs(argv: string[]): Args {
         else if (k === '--budget') a.budget = Number(next());
         else if (k === '--only') a.only.push(next());
         else if (k === '--limit') a.limit = Number(next());
+        else if (k === '--swatches') a.swatches = Number(next());
         else throw new Error(`unknown argument ${k}`);
     }
     return a;
@@ -264,6 +283,9 @@ function main(): void {
     let totalTris = 0;
     let maxTris = 0;
     let coarsenedCoast = 0;
+    let coveredTiles = 0;
+    let imageryTiles = 0;
+    const colorHistogram = newColorHistogram();
     const leafHistogram = new Map<number, number>();
     const t0 = Date.now();
 
@@ -279,6 +301,15 @@ function main(): void {
         const lvrPath = `${stem}.lvr`;
         if (fs.existsSync(lvrPath)) {
             polygons = decodeLvr(fs.readFileSync(lvrPath)).polygons as CoastPolygon[];
+        }
+        let cover: ReturnType<typeof decodePlc> | undefined;
+        const plcPath = `${stem}.plc`;
+        if (fs.existsSync(plcPath)) {
+            cover = decodePlc(fs.readFileSync(plcPath));
+            coveredTiles++;
+            if (cover.flags & PLC_FLAG_REAL_IMAGERY) {
+                imageryTiles++;
+            }
         }
 
         const bounds = tileBounds(z, x, y);
@@ -302,7 +333,16 @@ function main(): void {
             simplifyCells,
             triangleBudget: args.budget,
             pad: { ...AIRBASE_FLATTEN_PAD, heightMsl: padHeightMsl },
+            cover,
         });
+        // Only tiles carrying real imagery feed the swatch table. A tile
+        // without it is painted in ESA's landcover map colours - a scarlet for
+        // built-up, a lemon for grassland - which are legible on a map and
+        // absurd on terrain, and letting them into the table hands real ground
+        // the nearest of *those*.
+        if (cover && (cover.flags & PLC_FLAG_REAL_IMAGERY)) {
+            accumulateColors(colorHistogram, r.landColors);
+        }
 
         const outPath = path.join(args.out, String(z), String(x), `${y}.ptm`);
         fs.mkdirSync(path.dirname(outPath), { recursive: true });
@@ -332,6 +372,13 @@ function main(): void {
     console.log(`copied height tiles z0..${heightMaxZoom}: `
         + `${(heightBytes / 1048576).toFixed(1)} MB`);
 
+    const swatches = medianCut(colorHistogram, args.swatches);
+    const luminance = luminanceWindow(colorHistogram);
+    console.log(`cover: ${coveredTiles}/${written.length} tiles, `
+        + `${imageryTiles} with real imagery, ${swatches.length} swatches`);
+    console.log(`  luminance: mid ${luminance.mid.toFixed(3)}, `
+        + `spread ${luminance.spread.toFixed(3)}`);
+
     const minZoom = written.length > 0 ? Math.min(...written.map(t => t.z)) : 0;
     const maxWritten = written.length > 0 ? Math.max(...written.map(t => t.z)) : 0;
     fs.writeFileSync(
@@ -359,6 +406,8 @@ function main(): void {
                 { length: maxWritten + 1 },
                 (_, z) => levelSkirt[z] ?? 0,
             ),
+            swatches,
+            luminance,
         },
         height: {
             path: '{z}/{x}/{y}.pdm',

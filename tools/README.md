@@ -199,7 +199,7 @@ palette/alpha heuristics get it wrong. The value can be either a literal
 `assets/planet` is a **build product**, not a tracked asset. It is gitignored
 and must be generated locally before the sim will show terrain.
 
-The pipeline has three stages:
+The pipeline has four stages:
 
 ```
 # 1. heights: WGS84 GeoTIFF -> .pdm pyramid + index.bin + manifest.json
@@ -210,14 +210,113 @@ python tools/bake_planet_dem.py --input data/output_hh.tif --out assets/planet
 pip install shapely requests
 python tools/bake_osm_coast.py --manifest assets/planet/manifest.json
 
-# 3. meshes: .pdm + .lvr -> draw-ready .ptm tiles + index_mesh.bin
+# 3. cover: landcover + satellite imagery -> .plc per tile   (optional)
+npm run fetch:cover
+npm run bake:cover
+
+# 4. meshes: .pdm + .lvr + .plc -> draw-ready .ptm tiles + index_mesh.bin
 npm run bake:mesh
 npm run verify:planet -- --dir assets/terrain
 ```
 
-Stage 3 is the only place terrain geometry is produced. The runtime fetches,
+Stage 4 is the only place terrain geometry is produced. The runtime fetches,
 decodes and draws — it never triangulates — so there is no fallback path that
 can drift out of sync with the bake.
+
+Stage 3 is optional. Skip it and every land facet comes out plain grass, which
+is what the bake produced before cover existed.
+
+### Terrain colour
+
+A land facet is baked carrying two observations of the ground it covers: a
+**landcover class** and a **satellite colour**. Both travel in the same four
+bytes per vertex, and which of them ends up on screen is a runtime choice —
+the *Terrain colour* setting in the options panel, four modes, one uniform
+write each:
+
+| Mode | Colour |
+| --- | --- |
+| Landcover | class picks a palette tone; the most retro of the four |
+| Swatches | satellite colour snapped to the table the bake derived |
+| Hybrid | palette tone for the hue, satellite luminance for a banded shade |
+| Imagery | the satellite colour itself |
+
+Each has a **smooth** variant in the same list, which shades Gouraud instead of
+flat. Both normals ship with every vertex — the facet's own, and the average of
+the facets meeting there — so this is a uniform too, not a re-bake. Neither can
+be derived from the other at load time: averaging is a per-vertex pass over
+shared positions, which is exactly what PTM1 exists to avoid. That second
+normal is what took the mesh stream from 55.5 MB to 68.7 MB; if it ever needs
+to come back down, octahedral-encoding it into two bytes instead of four would
+recover about half.
+
+Averaging is per tile, so a vertex on a tile border only sees facets on its own
+side. Measured on an adjacent z12 pair that costs 1.2 degrees of normal
+disagreement on average (p90 2.5, max 8.7) — below what the palette's banded
+shading can show, which is why the bake does not read neighbouring tiles.
+Shore walls and skirts are excluded from the averaging in both directions:
+they are creases by construction, and rounding one off bends the cliff edge
+into the sea.
+
+`fetch_cover_sources.py` pulls both sources into `data/cover` (gitignored):
+
+* **ESA WorldCover 2021 v200** — 10 m, 11 classes, CC-BY 4.0, read from the
+  public `esa-worldcover` S3 bucket. Ocean-only 3-degree tiles are not
+  published at all, so 404s during the fetch are expected and skipped.
+* **Sentinel-2 L2A true colour** — scenes found through the Earth Search STAC
+  API, `visual` asset read from the public `sentinel-cogs` bucket. The search
+  pages until it has every MGRS square over the coverage: one busy square
+  fills a page on its own, and a single-page search comes back holding nothing
+  but cloud-free open ocean.
+
+Both are written at a deliberately coarse resolution (`--landcover-m`,
+`--imagery-m`, default 20 m and 40 m). A facet at the finest zoom covers
+30–100 m of ground, so anything sharper is averaged away in stage 4 anyway.
+
+`bake_planet_cover.py` then resamples them onto each tile's own grid and
+writes `.plc` alongside the `.pdm`.
+
+`--patch-m` (default 250) is the one knob worth turning. WorldCover is a 10 m
+product and it is right at 10 m — a single shed really is built-up — but at
+the scale a facet paints, single-pixel truth is noise: the raw raster holds
+1550 separate class regions on one z12 tile, 60% of them four nodes or
+smaller, and the terrain comes out as confetti. A local majority filter over
+the *land* classes, sized from a ground distance rather than a node count,
+merges them into patches that read at the stated size. On tile `12/3744/1411`:
+
+| | regions | median region | area in sub-250 m regions |
+| --- | --- | --- | --- |
+| `--patch-m 0` | 1550 | 33 m across | 23% |
+| `--patch-m 250` | 44 | 260 m across | 2% |
+
+Water and nodata are fixed points — never reassigned, never allowed to vote —
+so the coastline comes through untouched. Without that the sea is the local
+majority along any shore and it swallows headlands whole. Tiles are read with
+a halo (`tools/cover_patches.py`, `halo_nodes`), which makes the result
+identical to filtering the whole coverage at once; it also makes tile edges
+*more* consistent than the unfiltered bake, because a 15-node majority barely
+notices the half-pixel phase difference between two tiles' source reads
+(measured on an adjacent pair: 55 and 29 disagreeing edge nodes unfiltered, 0
+and 5 filtered).
+
+Only the class raster changes. Where imagery exists the facet colours come out
+bit-identical, so `Swatches` and `Imagery` are untouched and only the two
+palette-driven modes get the bigger patches. Changing `--patch-m` means
+re-running `npm run bake:cover` **and** `npm run bake:mesh`.
+
+Two more rules live in the cover bake rather than in the mesh bake, because
+they need something the raster does not carry:
+
+* Bare ground within 160 m of the coast becomes **sand**. WorldCover has no
+  sand class — dune, ash flat and lava field are all class 60 — so the
+  distinction has to come from geometry.
+* Landcover saying *open water* on a facet the OSM coast cut as **land** is a
+  disagreement about where the shore is, and the coast vector wins. The
+  alternative is a lake painted across a hillside.
+
+Where imagery is missing — no scene, or no imagery fetched at all — a node
+takes its class's own WorldCover map colour, so the imagery-driven modes
+degrade to flat-but-plausible rather than to grey.
 
 ### Options
 
@@ -235,6 +334,7 @@ already oversamples it 1.6x.
 | `--max-zoom N` | cap detail |
 | `--only z/x/y` | bake one tile, repeatable, for debugging |
 | `--limit N` | stop after N tiles, for a smoke bake |
+| `--swatches N` | colours in the baked swatch table (default 24) |
 
 ### The triangle budget
 
