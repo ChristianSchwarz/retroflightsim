@@ -241,23 +241,6 @@ write each:
 | Hybrid | palette tone for the hue, satellite luminance for a banded shade |
 | Imagery | the satellite colour itself |
 
-Each has a **smooth** variant in the same list, which shades Gouraud instead of
-flat. Both normals ship with every vertex — the facet's own, and the average of
-the facets meeting there — so this is a uniform too, not a re-bake. Neither can
-be derived from the other at load time: averaging is a per-vertex pass over
-shared positions, which is exactly what PTM1 exists to avoid. That second
-normal is what took the mesh stream from 55.5 MB to 68.7 MB; if it ever needs
-to come back down, octahedral-encoding it into two bytes instead of four would
-recover about half.
-
-Averaging is per tile, so a vertex on a tile border only sees facets on its own
-side. Measured on an adjacent z12 pair that costs 1.2 degrees of normal
-disagreement on average (p90 2.5, max 8.7) — below what the palette's banded
-shading can show, which is why the bake does not read neighbouring tiles.
-Shore walls and skirts are excluded from the averaging in both directions:
-they are creases by construction, and rounding one off bends the cliff edge
-into the sea.
-
 `fetch_cover_sources.py` pulls both sources into `data/cover` (gitignored):
 
 * **ESA WorldCover 2021 v200** — 10 m, 11 classes, CC-BY 4.0, read from the

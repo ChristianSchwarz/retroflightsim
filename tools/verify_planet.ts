@@ -172,16 +172,6 @@ function main(): void {
         if (!(tile.quantScale > 0)) {
             note(`${key}: bad quantisation scale ${tile.quantScale}`);
         }
-        for (let v = 0; v < tile.landSmoothNormals.length; v += 4) {
-            const x = tile.landSmoothNormals[v] / 127;
-            const y = tile.landSmoothNormals[v + 1] / 127;
-            const z = tile.landSmoothNormals[v + 2] / 127;
-            const len = Math.hypot(x, y, z);
-            if (!(Math.abs(len - 1) < 0.05) || y < 0) {
-                note(`${key}: smooth normal ${v / 4} is ${x},${y},${z} (len ${len.toFixed(3)})`);
-                break;
-            }
-        }
         for (let v = 3; v < tile.landAttrs.length; v += 4) {
             const c = tile.landAttrs[v];
             if (c >= CLASS_COUNT) {

@@ -7,8 +7,7 @@
  *   3. enforce the triangle budget by coarsening and retrying
  *   4. project grid space -> geodetic -> ECEF -> tile-local ENU
  *   5. apply the airbase flatten pad and the ocean depth bias
- *   6. sample the cover raster per facet, average vertex normals, build
- *      skirts, split the streams
+ *   6. sample the cover raster per facet, build skirts, split the streams
  *   7. encode                                              (ptm.ts)
  *
  * Everything the output depends on is fixed at build time, which is the whole
@@ -586,7 +585,6 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
 
     const landPos: number[] = [];
     const landNrm: number[] = [];
-    const landSmNrm: number[] = [];
     const landClass: number[] = [];
     const landColor: number[] = [];
 
@@ -608,16 +606,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         return idx;
     };
 
-    /**
-     * `facet` is [class, r, g, b], as returned by classify. `smooth` is the
-     * averaged normal at each of the three corners, 9 floats; omit it and all
-     * three corners take the facet's own normal, which is what a wall or a
-     * skirt wants - they are creases, and averaging across one rounds off the
-     * very edge it exists to draw.
-     */
+    /** `cover` is [class, r, g, b], as returned by classify. */
     const pushLandTriangle = (
         a: Enu, b: Enu, c: Enu, facet: readonly [number, number, number, number],
-        smooth?: readonly number[],
     ) => {
         const ax = a.e - centre.e, ay = a.u - centre.u, az = a.n - centre.n;
         const bx = b.e - centre.e, by = b.u - centre.u, bz = b.n - centre.n;
@@ -638,78 +629,8 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         }
         landPos.push(ax, ay, az, bx, by, bz, cx, cy, cz);
         landNrm.push(nx, ny, nz);
-        if (smooth) {
-            landSmNrm.push(...smooth);
-        } else {
-            landSmNrm.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
-        }
         landClass.push(facet[0]);
         landColor.push(facet[1], facet[2], facet[3]);
-    };
-
-    /**
-     * Normals averaged over every surface facet meeting at a grid position.
-     *
-     * Accumulated unnormalised, so a facet contributes in proportion to its
-     * area - which is what keeps a decimated tile shading like the terrain
-     * rather than like its triangulation, where one huge facet and one sliver
-     * would otherwise count the same.
-     *
-     * Surface facets only. Walls and skirts are creases by construction and
-     * are excluded from both sides of this: they neither contribute here nor
-     * read from it.
-     *
-     * Vertices are keyed by grid position rather than by ENU, because that is
-     * what adjacent facets actually share - the decimator hands back the same
-     * integer or crossing coordinate to each of them, while the projected
-     * metres are recomputed per facet.
-     */
-    const vertexNormals = new Map<string, [number, number, number]>();
-    const accumulate = (
-        key: string, nx: number, ny: number, nz: number,
-    ) => {
-        const acc = vertexNormals.get(key);
-        if (acc) {
-            acc[0] += nx;
-            acc[1] += ny;
-            acc[2] += nz;
-        } else {
-            vertexNormals.set(key, [nx, ny, nz]);
-        }
-    };
-
-    for (const t of tris) {
-        if (!t.land) {
-            continue;
-        }
-        const [p0, p1, p2] = t.pts;
-        const a = project(p0.x, p0.y, true, p0.shore);
-        const b = project(p1.x, p1.y, true, p1.shore);
-        const c = project(p2.x, p2.y, true, p2.shore);
-        // Unnormalised cross product: its length is twice the facet's area,
-        // which is the weight we want.
-        let nx = (b.u - a.u) * (c.n - a.n) - (b.n - a.n) * (c.u - a.u);
-        let ny = (b.n - a.n) * (c.e - a.e) - (b.e - a.e) * (c.n - a.n);
-        let nz = (b.e - a.e) * (c.u - a.u) - (b.u - a.u) * (c.e - a.e);
-        // Same up-flip pushLandTriangle applies. Without it two facets of
-        // opposite winding cancel instead of reinforcing, and the average
-        // collapses towards zero.
-        if (ny < 0) {
-            nx = -nx; ny = -ny; nz = -nz;
-        }
-        accumulate(gridKey(p0.x, p0.y), nx, ny, nz);
-        accumulate(gridKey(p1.x, p1.y), nx, ny, nz);
-        accumulate(gridKey(p2.x, p2.y), nx, ny, nz);
-    }
-
-    /** The averaged normal at a grid position, unit length. */
-    const smoothAt = (gx: number, gy: number): [number, number, number] => {
-        const acc = vertexNormals.get(gridKey(gx, gy));
-        if (!acc) {
-            return [0, 1, 0];
-        }
-        const len = Math.hypot(acc[0], acc[1], acc[2]);
-        return len > 0 ? [acc[0] / len, acc[1] / len, acc[2] / len] : [0, 1, 0];
     };
 
     for (const t of tris) {
@@ -720,7 +641,6 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
                 project(p1.x, p1.y, true, p1.shore),
                 project(p2.x, p2.y, true, p2.shore),
                 coverOf(t),
-                [...smoothAt(p0.x, p0.y), ...smoothAt(p1.x, p1.y), ...smoothAt(p2.x, p2.y)],
             );
         } else {
             const shore = Math.min(
@@ -846,7 +766,6 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         land: {
             positions: new Float32Array(landPos),
             faceNormals: new Float32Array(landNrm),
-            smoothNormals: new Float32Array(landSmNrm),
             classes: new Uint8Array(landClass),
             colors: new Uint8Array(landColor),
         },
