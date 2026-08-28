@@ -3,6 +3,10 @@
 // Serves the built `dist/` folder statically and adds the F10 upload endpoint:
 //   POST /api/preview-mod  (scan a mod .zip and list aircraft + liveries)
 //   POST /api/import-mod   (import selected aircraft from a preview token)
+// and the F9 terrain area import (tools/areaImport.ts):
+//   GET  /api/osm/:z/:x/:y   OpenStreetMap tiles for the area picker
+//   GET  /api/areas          areas the baked pyramid holds
+//   POST /api/import-area    start a bake; GET the same path + /:id for progress
 //
 // Multi-plane mod packs are split by Unity livery material: each aircraft becomes
 // its own .aircraft.pack so liveries stay separate in the spawn menu.
@@ -13,6 +17,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { unzipSync } from 'fflate';
+import {
+    areasHandler, importStream, osmTile, startImport,
+} from './areaImport';
 
 const PROJECT_ROOT = path.dirname(__dirname);
 const DIST_DIR = path.join(PROJECT_ROOT, 'dist');
@@ -1003,6 +1010,12 @@ if (LIVE_RELOAD) {
         res.type('html').send(html.replace('</body>', `${LIVE_RELOAD_SCRIPT}</body>`));
     });
 }
+
+// Terrain area import (F9 in the app). See tools/areaImport.ts.
+app.get('/api/osm/:z/:x/:y', osmTile);
+app.get('/api/areas', areasHandler);
+app.post('/api/import-area', express.json(), startImport);
+app.get('/api/import-area/:id', importStream);
 
 app.get('/api/health', (_req: Request, res: Response) => {
     res.json({ ok: true, server: 'modserver', previewMod: true });

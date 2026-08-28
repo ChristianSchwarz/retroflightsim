@@ -251,6 +251,37 @@ def encode_plc(size: int, flags: int, classes: np.ndarray, colors: np.ndarray) -
     return zlib.compress(header + classes.tobytes() + colors.tobytes(), 6)
 
 
+def glue_negative_bbox(argv: Sequence[str]) -> List[str]:
+    """Rewrite ``--bbox -9.7,...`` into the ``--bbox=-9.7,...`` argparse takes.
+
+    A western bbox starts with a minus, which argparse reads as the next option
+    rather than this one's value.
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--bbox' and i + 1 < len(argv) and argv[i + 1].startswith('-'):
+            out.append(f'--bbox={argv[i + 1]}')
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
+def parse_bbox(text: str) -> Tuple[float, float, float, float]:
+    parts = [p.strip() for p in text.split(',')]
+    if len(parts) != 4:
+        raise ValueError('bbox must be west,south,east,north')
+    return tuple(float(p) for p in parts)  # type: ignore[return-value]
+
+
+def tile_overlaps(z: int, x: int, y: int, bbox: Tuple[float, float, float, float]) -> bool:
+    west, south, east, north = tile_bounds(z, x, y)
+    bw, bs, be, bn = bbox
+    return not (east <= bw or west >= be or north <= bs or south >= bn)
+
+
 def walk_tiles(src: str, max_zoom: int) -> List[Tuple[int, int, int]]:
     out: List[Tuple[int, int, int]] = []
     for z in range(0, max_zoom + 1):
@@ -283,7 +314,9 @@ def main() -> None:
                          f'(default {DEFAULT_PATCH_M:.0f}; 0 disables the filter)')
     ap.add_argument('--max-zoom', type=int)
     ap.add_argument('--only', action='append', default=[], help='z/x/y, repeatable')
-    args = ap.parse_args()
+    ap.add_argument('--bbox', help='west,south,east,north degrees; bake only tiles '
+                                   'overlapping it (default: every tile in the pyramid)')
+    args = ap.parse_args(glue_negative_bbox(sys.argv[1:]))
 
     manifest_path = os.path.join(args.src, 'manifest.json')
     if not os.path.exists(manifest_path):
@@ -329,6 +362,17 @@ def main() -> None:
         tiles = [tuple(int(v) for v in spec.split('/')) for spec in args.only]
     else:
         tiles = walk_tiles(args.src, max_zoom)
+
+    if args.bbox:
+        # The cover rasters were fetched for one area. A tile outside them
+        # reads back nothing, which is not "leave it alone" - it is a .plc of
+        # unknown class and LUT colour, written straight over whatever an
+        # earlier bake produced there. Scope the tile list instead.
+        bbox = parse_bbox(args.bbox)
+        before = len(tiles)
+        tiles = [t for t in tiles if tile_overlaps(t[0], t[1], t[2], bbox)]
+        print(f'bbox: {len(tiles)} of {before} tiles overlap it; '
+              f'{before - len(tiles)} left alone')
 
     out_root = args.out or args.src
     patch = f'{args.patch_m:.0f} m patches' if args.patch_m > 0 else 'raw classes'

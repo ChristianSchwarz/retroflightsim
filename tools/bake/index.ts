@@ -16,6 +16,54 @@ export interface TileKey {
     y: number;
 }
 
+/**
+ * Read a PIX1 index back into its keys.
+ *
+ * `TileIndex` in src/script/terrain answers "is this tile present"; a bake
+ * adding an area to an existing tree needs the other question, "which tiles
+ * were present", so it can union its own output with them instead of writing
+ * an index that silently unlists everything it did not touch this run.
+ */
+export function decodeTileIndex(bytes: Uint8Array): TileKey[] {
+    if (bytes.byteLength < 8) {
+        throw new Error('index too short to hold a PIX1 header');
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (view.getUint32(0, true) !== INDEX_MAGIC) {
+        throw new Error('bad tile index magic');
+    }
+    const minZoom = view.getUint16(4, true);
+    const maxZoom = view.getUint16(6, true);
+    const out: TileKey[] = [];
+    if (maxZoom < minZoom) {
+        return out;
+    }
+    const count = maxZoom - minZoom + 1;
+    const headers: Array<{ z: number; minX: number; minY: number; w: number; h: number }> = [];
+    let o = 8;
+    for (let i = 0; i < count; i++) {
+        headers.push({
+            z: minZoom + i,
+            minX: view.getUint32(o, true),
+            minY: view.getUint32(o + 4, true),
+            w: view.getUint32(o + 8, true),
+            h: view.getUint32(o + 12, true),
+        });
+        o += 16;
+    }
+    for (const h of headers) {
+        const byteCount = Math.ceil((h.w * h.h) / 8);
+        const bits = bytes.subarray(o, o + byteCount);
+        o += byteCount;
+        for (let i = 0; i < h.w * h.h; i++) {
+            if (bits[i >> 3] & (1 << (i & 7))) {
+                out.push({ z: h.z, x: h.minX + (i % h.w), y: h.minY + Math.floor(i / h.w) });
+            }
+        }
+    }
+    return out;
+}
+
 export function encodeTileIndex(
     present: Iterable<TileKey>,
     minZoom: number,

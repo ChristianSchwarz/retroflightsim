@@ -226,6 +226,211 @@ can drift out of sync with the bake.
 Stage 3 is optional. Skip it and every land facet comes out plain grass, which
 is what the bake produced before cover existed.
 
+### Height sources
+
+Stage 1 needs one axis-aligned EPSG:4326 GeoTIFF. `data/output_hh.tif` is the
+tracked one and it only covers the Canaries, so any other part of the world
+has to be fetched first:
+
+```
+# 0. heights for an arbitrary bbox -> a stage 1 input GeoTIFF
+npm run fetch:dem -- --bbox 7.6,45.9,7.8,46.0 --out data/imports/matterhorn.tif
+python tools/bake_planet_dem.py --input data/imports/matterhorn.tif --out assets/planet
+```
+
+`fetch_planet_dem.py` reads the public Copernicus DEM GLO-30 archive on AWS
+Open Data over `/vsicurl/`, so only the windows overlapping the bbox are
+transferred. The archive publishes 1 degree squares only where there is land,
+and the tool caches `tileList.txt` under `data/imports/` so an all-ocean square
+is skipped by name rather than by waiting for a 404.
+
+The 1 arcsec default resolution is load-bearing rather than arbitrary. Stage 1
+derives the pyramid's max zoom from the source pixel, and 1 arcsec lands on
+**z12** — the same depth `data/output_hh.tif` bakes to. Fetch at the default
+and an imported area joins the pyramid at a uniform depth; fetch coarser (say
+`--arcsec 3`, which bakes to z10) and it does not.
+
+| Option | Meaning |
+| --- | --- |
+| `--bbox` | **(required)** `west,south,east,north` in degrees. Spans crossing the antimeridian are refused. |
+| `--out` | Output GeoTIFF (default `data/imports/dem.tif`). |
+| `--arcsec` | Output pixel in arcseconds (default 1.0, the archive spacing). |
+| `--max-span` | Refuse a bbox wider or taller than this (default 3 degrees). Bake cost grows with area. |
+| `--no-snap` | Do not align the box to tiles and the shared lattice. See below — only useful for reproducing the seam bug. |
+| `--refresh-tile-list` | Re-fetch the cached archive tile list. |
+
+`data/imports/` is gitignored — these are fetched inputs, like `data/cover`.
+
+#### Why the box gets snapped
+
+The fetched bbox is grown outwards to whole z12 tile edges, and the pixel step
+is nudged (1 arcsec → 1.0013 at z12) so a whole number of pixels spans a tile.
+
+Both exist because `SourceSampler.sample_grid` resolves nodes outside the
+raster to the sea datum — right for a standalone bake, where the raster edge
+is effectively coast, and wrong the moment a second area is merged in. An area
+whose raster stops halfway across a tile gets that tile half-filled with fake
+ocean, and merging its neighbour later writes that ocean over real ground.
+Measured on two adjacent Alpine areas, unsnapped, that is a **4.1 km** error.
+
+Snapping to tiles alone is not enough: an arcsecond does not divide a tile
+(158.2 of them), so aligning to a lattice anchored at −180 pushes the box a
+sliver past the tile edge, and the bake claims the next tile along and fills
+*it* with sea. Rounding the step so the lattice and the tile grid are the same
+grid removes that. With both in place, neighbouring areas agree on their shared
+tile edge to **0.04 m** — pure quantisation — against **8.3 m** with only the
+tile snap.
+
+### Adding an area to an existing pyramid
+
+`bake_planet_dem.py` owns the whole tree: run it twice and you have the second
+area, not both. `merge_planet_dem.py` is the additive form.
+
+```
+npm run fetch:dem -- --bbox 7.6,45.9,7.8,46.0 --out data/imports/alps.tif
+npm run merge:dem -- --input data/imports/alps.tif --out assets/planet
+python tools/bake_osm_coast.py --bbox 7.6,45.9,7.8,46.0
+npm run fetch:cover -- --bbox 7.6,45.9,7.8,46.0
+npm run bake:cover -- --bbox 7.6,45.9,7.8,46.0
+npm run bake:mesh -- --bbox 7.6,45.9,7.8,46.0
+```
+
+**Pass the same `--bbox` to every stage.** It is what makes each one additive.
+Without it a stage walks the whole pyramid, and since its sources only cover
+the new area, every tile outside gets rewritten from nothing: stage 2 turns
+other coastlines into open ocean, stage 3 writes unknown-class cover over
+real cover, stage 4 re-meshes the world for no reason. With it, each stage
+touches only the tiles that overlap, and merges its pyramid-wide records
+(the index, the swatch table, the level skirts, the coverage box) with what
+the previous bake left rather than replacing them.
+
+Verified on two adjacent Alpine areas: baking them as two scoped runs gives a
+`assets/terrain` byte-identical to one unscoped bake of both — same 60 .ptm
+files, same index, same manifest.
+
+Tiles are a global quadtree, so a new area shares ancestors with everything
+already baked — a z0 tile is the ancestor of a hemisphere. `build_parent` fills
+any quadrant it is not given with sea level, so rebuilding an ancestor from
+only the *new* children would erase the siblings a previous bake wrote. The
+merge loads those siblings back off disk (`decode_tile`) and hands
+`build_parent` all four.
+
+Dequantising a sibling costs half a quantisation step — centimetres — and does
+not compound, since a rebuilt ancestor is written from its children and never
+from its own previous self. Merging Morocco into the Canaries pyramid preserved
+every existing land node at every shared level with a peak drift of 0.04 m.
+
+Where a new area overlaps something already baked, the new data wins.
+`--dry-run` reports what would be written without touching the tree.
+`compare_planet_dem.py --a DIR --b DIR` diffs two pyramids tile by tile, which
+is how the above was checked.
+
+Stage 2 shares the ancestor problem and the same fix: `build_parent_mask`
+leaves any quadrant it is not given as *water*, so it reloads the siblings on
+disk (`read_lwm`) before decimating. Stage 3 has no ancestors — one `.plc` per
+tile, sampled directly — so it only needs the bbox. Stage 4 has no ancestors
+either, but two records describe the whole tree and are merged rather than
+replaced:
+
+* **`index_mesh.bin`** — the runtime reads "not in the index" as "ocean, draw a
+  patch", so an index rewritten from one scoped run would flatten every other
+  area. The bake unions its output with the index already there.
+* **`swatch_histogram.bin`** — the swatch table and luminance window in the
+  manifest quantise *every* tile, whichever bake produced it. The colour counts
+  cannot be recovered from finished `.ptm` files without decoding all of them,
+  so the bake keeps them beside the tiles (32768 bins, 128 KB) and adds to
+  them. **Re-baking the same area counts its colours twice**; run one unscoped
+  bake to reset the table if that ever skews it.
+
+### Importing from inside the app (F9)
+
+Press **F9** while the dev server is running (`npm run serve`) and pick the area
+on an OpenStreetMap map: drag to pan, wheel to zoom, **shift-drag** to draw the
+box. The readout gives the bbox, its size in km and how many terrain tiles the
+bake will touch, and refuses anything over the 3 degree limit. Name it, tick
+*Satellite colour* if you want the imagery stage, and press Import.
+
+That runs exactly the command sequence below, server-side, streaming each
+stage's output back into the dialog — so it is the same bake, not a second
+implementation of one. Closing the dialog does not stop it; the job is on the
+server. Reload when it finishes and pick the area under *Settings -> Area*.
+
+The map is served through `/api/osm/:z/:x/:y`, which proxies
+`tile.openstreetmap.org` with an identifying User-Agent, caches every tile
+under `tools/osm-cache/` and refuses zoom past 12 — enough to stay well inside
+the OSM tile usage policy for picking an area. Point `OSM_TILE_URL` in
+[`tools/areaImport.ts`](areaImport.ts) at your own tile server if you ever need
+more than that.
+
+### Flying somewhere else
+
+Each bake records the area it covered under `areas` in the manifest, named by
+`--name` (default: the input file stem). `coverage` cannot serve here — it is
+the union box of everything baked, so two areas become one rectangle spanning
+the sea between them, with no way back to either.
+
+```
+npm run merge:dem -- --input data/imports/alps.tif --name alps --out assets/planet
+```
+
+The *Area* control in the options panel lists them and reloads into the one you
+pick; it hides itself when there is only one. Picking an area moves the ENU
+origin to that area's box centre, because ENU is a tangent frame — a thousand
+kilometres out, the float32 the GPU gets per vertex is coarse enough to shimmer
+and the ground is below the horizon anyway.
+
+The area holding `PLAY_ORIGIN` is *home*, found by position rather than by name
+so renaming an area cannot strand the scenery somewhere it was not built for.
+Home keeps that origin exactly.
+
+**Every area gets an airbase.** Stage 4 flattens one pad per area — at
+`PLAY_ORIGIN` for home, at the box centre for the rest — and the runtime puts
+the runway, hangars and tower on it. Local ENU (0, 0) *is* the pad centre in
+every area, which is what `airbaseOffset` already measures from, so the
+placement code is the same in all of them. Runway and approach spawns therefore
+work anywhere.
+
+What does not travel is the carrier: it needs the open water ten kilometres east
+of Gran Canaria, which is a fact about that island rather than about airbases,
+so its two spawns fall back to the runway elsewhere. The refinery, SAM site and
+warehouse stay home too — they are the Canaries scenario at offsets chosen for
+that terrain. The spawn you asked for is still what gets saved, so coming home
+restores it.
+
+Each pad is measured in a frame centred on itself. A pad is an axis-aligned box
+in ENU and ENU axes turn with position, so one laid out in the bake's frame
+would sit skewed against the local north the runtime flattens against. Pads are
+also *placed* from their baked lat/lon rather than assumed to sit at the origin:
+at home that resolves to (0, 0) exactly as before, and elsewhere a foreign
+area's pad lands at its real offset — 111 km away for Tenerife — and touches
+nothing.
+
+### Tiles are baked in one frame and drawn in another
+
+A baked tile stores its vertices as offsets from the tile centre **in the frame
+the bake used** (`manifest.enuOrigin`). Drawing it from a rebased origin means
+turning those offsets into the drawing frame's axes first, or every vertex
+lands wrong in proportion to its distance from the tile centre — measured half
+a z12 tile out, **62 m at Tenerife and 2.5 km in the Alps**.
+
+`enuFrameRotation` supplies that rotation. It is one constant for the whole
+scene, exact rather than approximate, and the identity whenever the two frames
+share an origin — which is every session flying at home. Ocean patches are
+built at runtime in the drawing frame already and are left alone.
+
+### What the runtime reads
+
+`manifest.coverage` is the bounding box of everything baked, so with two areas
+far apart it spans the sea between them. Nothing at runtime treats it as the
+authority any more — both tile stores gate on the index (`index.bin`,
+`index_mesh.bin`), and `HeightField.loadCoarse` enumerates the index rather
+than walking the box. A tile missing from the index is never requested, and
+"missing" means ocean, which is what the sea ellipsoid is for.
+
+The box survives only as the fallback when an index cannot be fetched. Even on
+the single-area Canaries pyramid it over-asks: 18 coarse tiles implied by the
+box against the 10 that exist.
+
 ### Terrain colour
 
 A land facet is baked carrying two observations of the ground it covers: a

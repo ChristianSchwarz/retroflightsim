@@ -25,6 +25,9 @@
  *     --only z/x/y     bake a single tile (repeatable), for debugging
  *     --limit N        stop after N tiles, for a quick smoke bake
  *     --swatches N     colours in the baked swatch table (default 24)
+ *     --bbox w,s,e,n   bake only tiles overlapping this box, and merge the
+ *                      index and swatch table with what is already there
+ *                      (see tools/README.md, "Adding an area")
  */
 
 import * as fs from 'node:fs';
@@ -33,11 +36,13 @@ import * as zlib from 'node:zlib';
 import { decodePdm } from '../src/script/terrain/demTile';
 import { decodeLvr } from './bake/lvr';
 import { PLC_FLAG_REAL_IMAGERY, decodePlc } from './bake/plc';
-import { accumulateColors, luminanceWindow, medianCut, newColorHistogram } from './bake/swatches';
+import {
+    HISTOGRAM_BINS, accumulateColors, luminanceWindow, medianCut, newColorHistogram,
+} from './bake/swatches';
 import { EnuBasis, enuToGeodeticApprox, makeEnuBasis } from '../src/script/terrain/geodesy';
 import { AIRBASE_FLATTEN_PAD, PLAY_ORIGIN } from '../src/script/state/worldLayout';
 import { buildTile } from './bake/buildTile';
-import { encodeTileIndex } from './bake/index';
+import { TileKey, decodeTileIndex, encodeTileIndex } from './bake/index';
 import { CoastPolygon, LonLatBounds } from './bake/shoreline';
 
 // Triangles per tile. Measured on real Canary z12 tiles: the coast alone costs
@@ -62,6 +67,31 @@ interface Args {
     only: string[];
     limit?: number;
     swatches: number;
+    bbox?: LonLatBounds;
+}
+
+/**
+ * `west,south,east,north` in degrees.
+ *
+ * Scopes a bake to one area so a second one can be added without re-meshing
+ * everything already there. Every pyramid-wide record the bake writes - the
+ * index, the swatch table, the level skirts - is then merged with what the
+ * previous bake left rather than replacing it.
+ */
+function parseBbox(text: string): LonLatBounds {
+    const parts = text.split(',').map(v => Number(v.trim()));
+    if (parts.length !== 4 || parts.some(v => !Number.isFinite(v))) {
+        throw new Error(`--bbox wants west,south,east,north, got ${text}`);
+    }
+    const [west, south, east, north] = parts;
+    if (west >= east || south >= north) {
+        throw new Error(`--bbox is inside out: ${text}`);
+    }
+    return { west, south, east, north };
+}
+
+function overlaps(a: LonLatBounds, b: LonLatBounds): boolean {
+    return !(a.east <= b.west || a.west >= b.east || a.north <= b.south || a.south >= b.north);
 }
 
 function parseArgs(argv: string[]): Args {
@@ -82,9 +112,41 @@ function parseArgs(argv: string[]): Args {
         else if (k === '--only') a.only.push(next());
         else if (k === '--limit') a.limit = Number(next());
         else if (k === '--swatches') a.swatches = Number(next());
+        else if (k === '--bbox') a.bbox = parseBbox(next());
         else throw new Error(`unknown argument ${k}`);
     }
     return a;
+}
+
+/**
+ * The colour histogram, kept on disk beside the tiles it was built from.
+ *
+ * The swatch table and the luminance window in the manifest describe *the
+ * whole pyramid* - the runtime quantises every tile against them, whichever
+ * bake produced it. Derive them from one area's tiles and every other area is
+ * snapped to colours taken from ground it does not contain. Since the counts
+ * cannot be recovered from the finished .ptm files without decoding all of
+ * them, the bake carries them forward instead: 32768 bins, 128 KB, add and
+ * re-derive.
+ */
+const HISTOGRAM_FILE = 'swatch_histogram.bin';
+
+function loadHistogram(dir: string): Uint32Array {
+    const p = path.join(dir, HISTOGRAM_FILE);
+    if (!fs.existsSync(p)) {
+        return newColorHistogram();
+    }
+    const raw = fs.readFileSync(p);
+    if (raw.byteLength !== HISTOGRAM_BINS * 4) {
+        console.warn(`  ignoring ${HISTOGRAM_FILE}: ${raw.byteLength} bytes, `
+            + `expected ${HISTOGRAM_BINS * 4}`);
+        return newColorHistogram();
+    }
+    return new Uint32Array(raw.buffer, raw.byteOffset, HISTOGRAM_BINS).slice();
+}
+
+function saveHistogram(dir: string, histogram: Uint32Array): void {
+    fs.writeFileSync(path.join(dir, HISTOGRAM_FILE), Buffer.from(histogram.buffer));
 }
 
 /** Geographic quadtree: level z has 2^(z+1) columns by 2^z rows. */
@@ -259,8 +321,25 @@ function main(): void {
     const levelErrors: number[] = src.levelGeometricErrorM ?? [];
     const maxZoom = Math.min(args.maxZoom ?? src.maxZoom, src.maxZoom);
     const basis = makeEnuBasis(PLAY_ORIGIN.lat, PLAY_ORIGIN.lon, PLAY_ORIGIN.height);
-    const padHeightMsl = computePadHeight(args.src, src, basis, AIRBASE_FLATTEN_PAD);
-    console.log(`airbase pad height: ${padHeightMsl.toFixed(2)} m MSL`);
+    // One airbase pad per baked area, so every area has somewhere flat to put
+    // a runway. Each is evaluated in a frame centred on itself: the pad is an
+    // axis-aligned box in ENU, and ENU axes turn with position, so a box laid
+    // out in the bake's frame would sit skewed against the local north the
+    // runtime flattens against. Home's frame is the bake's frame, so its pad
+    // is unchanged to the last decimal.
+    const areas: Array<{ name: string; west: number; south: number; east: number; north: number }> =
+        src.areas?.length ? src.areas : [{ name: 'terrain', ...src.coverage }];
+    const pads = areas.map(area => {
+        const home = PLAY_ORIGIN.lon >= area.west && PLAY_ORIGIN.lon <= area.east
+            && PLAY_ORIGIN.lat >= area.south && PLAY_ORIGIN.lat <= area.north;
+        const lat = home ? PLAY_ORIGIN.lat : (area.south + area.north) / 2;
+        const lon = home ? PLAY_ORIGIN.lon : (area.west + area.east) / 2;
+        const padBasis = home ? basis : makeEnuBasis(lat, lon, 0);
+        const heightMsl = computePadHeight(args.src, src, padBasis, AIRBASE_FLATTEN_PAD);
+        console.log(`pad ${area.name}: ${lat.toFixed(4)}, ${lon.toFixed(4)} -> `
+            + `${heightMsl.toFixed(2)} m MSL${home ? ' (home)' : ''}`);
+        return { ...AIRBASE_FLATTEN_PAD, lat, lon, basis: padBasis, heightMsl };
+    });
 
     let tiles = args.only.length > 0
         ? args.only.map(s => {
@@ -268,6 +347,13 @@ function main(): void {
             return { z, x, y };
         })
         : walkTiles(args.src, maxZoom);
+    if (args.bbox !== undefined) {
+        const before = tiles.length;
+        const box = args.bbox;
+        tiles = tiles.filter(t => overlaps(tileBounds(t.z, t.x, t.y), box));
+        console.log(`bbox: ${tiles.length} of ${before} tiles overlap it; `
+            + `${before - tiles.length} left alone`);
+    }
     tiles.sort((a, b) => a.z - b.z || a.x - b.x || a.y - b.y);
     if (args.limit !== undefined) {
         tiles = tiles.slice(0, args.limit);
@@ -285,7 +371,9 @@ function main(): void {
     let coarsenedCoast = 0;
     let coveredTiles = 0;
     let imageryTiles = 0;
-    const colorHistogram = newColorHistogram();
+    const colorHistogram = args.bbox !== undefined
+        ? loadHistogram(args.out)
+        : newColorHistogram();
     const leafHistogram = new Map<number, number>();
     const t0 = Date.now();
 
@@ -332,7 +420,7 @@ function main(): void {
             polygons,
             simplifyCells,
             triangleBudget: args.budget,
-            pad: { ...AIRBASE_FLATTEN_PAD, heightMsl: padHeightMsl },
+            pads,
             cover,
         });
         // Only tiles carrying real imagery feed the swatch table. A tile
@@ -372,6 +460,9 @@ function main(): void {
     console.log(`copied height tiles z0..${heightMaxZoom}: `
         + `${(heightBytes / 1048576).toFixed(1)} MB`);
 
+    // Counts from every bake so far, this one included, so the table describes
+    // the pyramid rather than the last area added to it.
+    saveHistogram(args.out, colorHistogram);
     const swatches = medianCut(colorHistogram, args.swatches);
     const luminance = luminanceWindow(colorHistogram);
     console.log(`cover: ${coveredTiles}/${written.length} tiles, `
@@ -379,12 +470,43 @@ function main(): void {
     console.log(`  luminance: mid ${luminance.mid.toFixed(3)}, `
         + `spread ${luminance.spread.toFixed(3)}`);
 
-    const minZoom = written.length > 0 ? Math.min(...written.map(t => t.z)) : 0;
-    const maxWritten = written.length > 0 ? Math.max(...written.map(t => t.z)) : 0;
-    fs.writeFileSync(
-        path.join(args.out, 'index_mesh.bin'),
-        encodeTileIndex(written, minZoom, maxWritten),
-    );
+    // The index has to list every .ptm on disk, not just the ones this run
+    // produced. A scoped bake that rewrote it from `written` alone would
+    // unlist every other area, and "not in the index" means "ocean, draw a
+    // patch" to the runtime - so the rest of the world would quietly flatten.
+    const indexPath = path.join(args.out, 'index_mesh.bin');
+    const present = new Map<string, TileKey>();
+    if (args.bbox !== undefined && fs.existsSync(indexPath)) {
+        for (const k of decodeTileIndex(fs.readFileSync(indexPath))) {
+            present.set(`${k.z}/${k.x}/${k.y}`, k);
+        }
+    }
+    const carried = present.size;
+    for (const k of written) {
+        present.set(`${k.z}/${k.x}/${k.y}`, k);
+    }
+    const all = [...present.values()];
+    if (carried > 0) {
+        console.log(`index: ${written.length} baked + ${carried} carried `
+            + `-> ${all.length} tiles`);
+    }
+
+    const minZoom = all.length > 0 ? Math.min(...all.map(t => t.z)) : 0;
+    const maxWritten = all.length > 0 ? Math.max(...all.map(t => t.z)) : 0;
+    fs.writeFileSync(indexPath, encodeTileIndex(all, minZoom, maxWritten));
+
+    // Same for the per-level skirt depths: a scoped bake only touched the
+    // levels it had tiles on, and the rest still need their previous value.
+    const previousManifest = args.bbox !== undefined
+        && fs.existsSync(path.join(args.out, 'manifest.json'))
+        ? JSON.parse(fs.readFileSync(path.join(args.out, 'manifest.json'), 'utf8'))
+        : undefined;
+    const previousSkirt: number[] = previousManifest?.mesh?.levelSkirtDepthM ?? [];
+    for (let z = 0; z <= maxWritten; z++) {
+        if (levelSkirt[z] === undefined && previousSkirt[z] !== undefined) {
+            levelSkirt[z] = previousSkirt[z];
+        }
+    }
 
     const outManifest = {
         version: 4,
@@ -392,6 +514,10 @@ function main(): void {
         ellipsoid: 'WGS84',
         seaLevel: src.seaLevel ?? 0,
         coverage: src.coverage,
+        // Carried through from the height pyramid. `coverage` is the union box
+        // of everything baked, which cannot name the individual areas inside
+        // it, and naming them is what lets the runtime offer one to fly to.
+        areas: src.areas ?? [],
         enuOrigin: { lat: PLAY_ORIGIN.lat, lon: PLAY_ORIGIN.lon, height: PLAY_ORIGIN.height },
         mesh: {
             path: '{z}/{x}/{y}.ptm',
@@ -421,14 +547,14 @@ function main(): void {
             queryZoom: heightMaxZoom,
             coarseZoom: 7,
         },
-        flattenPads: [{
-            lat: PLAY_ORIGIN.lat,
-            lon: PLAY_ORIGIN.lon,
-            halfW: AIRBASE_FLATTEN_PAD.halfW,
-            halfD: AIRBASE_FLATTEN_PAD.halfD,
-            featherM: AIRBASE_FLATTEN_PAD.featherM,
-            heightMsl: padHeightMsl,
-        }],
+        flattenPads: pads.map(p => ({
+            lat: p.lat,
+            lon: p.lon,
+            halfW: p.halfW,
+            halfD: p.halfD,
+            featherM: p.featherM,
+            heightMsl: p.heightMsl,
+        })),
         bake: {
             tool: 'bake_planet_mesh',
             version: '1.0.0',

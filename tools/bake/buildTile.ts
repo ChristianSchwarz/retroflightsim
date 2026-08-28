@@ -88,8 +88,13 @@ export interface BuildTileInput {
     minLeafSize?: number;
     /** Coarsen and retry until the tile fits. Omit to disable. */
     triangleBudget?: number;
-    /** Baked flatten pad, heightMsl included. */
-    pad?: FlattenPad;
+    /**
+     * Baked flatten pads, heightMsl included, each with the ENU frame it is
+     * laid out in. A pad is an axis-aligned box in ENU and ENU axes turn with
+     * position, so a pad far from the bake's origin has to be measured in its
+     * own frame or it sits skewed against the local north the runtime uses.
+     */
+    pads?: Array<FlattenPad & { basis: EnuBasis; lat: number; lon: number }>;
     /** Observed cover. Omit and every land facet falls back to plain grass. */
     cover?: TileCover;
 }
@@ -111,6 +116,24 @@ export interface BuildTileResult {
 
 const _ecef: Ecef = { x: 0, y: 0, z: 0 };
 const _enu: Enu = { e: 0, n: 0, u: 0 };
+const _padEnu: Enu = { e: 0, n: 0, u: 0 };
+
+/**
+ * Half-spans of a pad in degrees, with a margin.
+ *
+ * Only used to reject nodes nowhere near a pad before converting frames, so it
+ * wants to be generous rather than exact - the pad's own blend does the real
+ * work. The longitude span widens with latitude because a degree of longitude
+ * is shorter there.
+ */
+function padLatSpan(pad: { halfD: number; featherM: number }): number {
+    return (pad.halfD + pad.featherM) / 110540 + 1e-4;
+}
+
+function padLonSpan(pad: { halfW: number; featherM: number; lat: number }): number {
+    const shrink = Math.max(0.05, Math.cos(pad.lat * Math.PI / 180));
+    return (pad.halfW + pad.featherM) / (111320 * shrink) + 1e-4;
+}
 
 /**
  * Multi-source chamfer distance (in cells) from every seeded node.
@@ -388,10 +411,20 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         if (land) {
             // The pad blend is in ENU, so we need a first ENU pass to know
             // where we are before we can decide how much to flatten.
-            geodeticToEcef(lat, lon, h, _ecef);
-            ecefToEnu(basis, _ecef, _enu);
-            if (input.pad) {
-                h = applyFlattenPad(h, _enu.e, _enu.n, input.pad);
+            if (input.pads) {
+                for (const pad of input.pads) {
+                    // Cheap geodetic reject first: a pad is a kilometre or two
+                    // across and there is one per baked area, so almost every
+                    // node is outside almost every pad and must not pay for a
+                    // frame conversion to find that out.
+                    if (Math.abs(lat - pad.lat) > padLatSpan(pad)
+                        || Math.abs(lon - pad.lon) > padLonSpan(pad)) {
+                        continue;
+                    }
+                    geodeticToEcef(lat, lon, h, _ecef);
+                    ecefToEnu(pad.basis, _ecef, _padEnu);
+                    h = applyFlattenPad(h, _padEnu.e, _padEnu.n, pad);
+                }
             }
         } else if (!onShore) {
             h -= WATER_DEPTH_BIAS_M;

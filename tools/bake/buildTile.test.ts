@@ -266,6 +266,10 @@ describe('buildTile', () => {
             centerX: 0, centerZ: 0, halfW: 500, halfD: 2000,
             featherM: 80, heightMsl: 41.7,
         };
+        // A pad now carries the frame it is laid out in, so that one far from
+        // the bake origin is measured against its own local north. Here that
+        // frame is the bake's, which is what home always is.
+        const pads = [{ ...pad, basis: BASIS, lat: 28.0015, lon: -15.3937 }];
 
         it('flattens the runway footprint to the pad height', () => {
             const bumpy = heightsFrom((x, y) => 40 + ((x * 7 + y * 11) % 23));
@@ -275,7 +279,7 @@ describe('buildTile', () => {
             // Drop them here; the skirt tests below cover them separately.
             const r = buildTile(base({
                 heights: bumpy, polygons: [coastAt(CELLS + 2)],
-                pad, skirtDepthM: 0,
+                pads, skirtDepthM: 0,
             }));
             const tile = decodePtm(r.bytes);
 
@@ -312,7 +316,7 @@ describe('buildTile', () => {
             const bumpy = heightsFrom((x, y) => 40 + ((x * 7 + y * 11) % 23));
             const withPad = buildTile(base({
                 heights: bumpy, polygons: [coastAt(CELLS + 2)],
-                pad,
+                pads,
             })).bytes;
             const without = buildTile(base({
                 heights: bumpy, polygons: [coastAt(CELLS + 2)],
@@ -323,7 +327,7 @@ describe('buildTile', () => {
         it('is a no-op when no pad is supplied', () => {
             const a = buildTile(base({ polygons: [coastAt(CELLS + 2)] })).bytes;
             const b = buildTile(base({
-                polygons: [coastAt(CELLS + 2)], pad: undefined,
+                polygons: [coastAt(CELLS + 2)], pads: undefined,
             })).bytes;
             assert.deepEqual(Array.from(a), Array.from(b));
         });

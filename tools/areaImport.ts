@@ -1,0 +1,410 @@
+// In-app terrain area import: the server half.
+//
+//   GET  /api/osm/:z/:x/:y   OpenStreetMap raster tile, cached on disk
+//   GET  /api/areas          the areas the baked pyramid already holds
+//   POST /api/import-area    start a bake for a bbox; returns a job id
+//   GET  /api/import-area/:id  server-sent progress for that job
+//
+// The bake is the same command line documented in tools/README.md, run stage by
+// stage with one bbox. It takes minutes at best and half an hour when the
+// satellite imagery is included, which is why this streams rather than making
+// the browser hold a request open.
+
+import { Request, Response } from 'express';
+import * as fs from 'fs';
+import * as path from 'path';
+import { spawn } from 'child_process';
+
+const PROJECT_ROOT = path.dirname(__dirname);
+const PYTHON = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+const IMPORTS_DIR = path.join(PROJECT_ROOT, 'data', 'imports');
+const OSM_CACHE = path.join(PROJECT_ROOT, 'tools', 'osm-cache');
+const TERRAIN_MANIFEST = path.join(PROJECT_ROOT, 'assets', 'terrain', 'manifest.json');
+
+// openstreetmap.org asks for a real identifying User-Agent and no bulk
+// downloading. An area picker browses a few hundred tiles at most and every one
+// is cached on disk after the first fetch, which keeps this well inside the
+// tile usage policy — but point OSM_TILE_URL at your own or a commercial tile
+// server if this ever gets used in anger.
+const OSM_TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const OSM_USER_AGENT = 'retroflightsim/0.0.1 (+https://github.com/ruben3d/retroflightsim; local dev area picker)';
+
+// Deep zoom is for looking at streets, and an area is picked at the scale of an
+// island or a valley. Capping it also caps how much of OSM this can ever pull.
+const OSM_MAX_ZOOM = 12;
+
+/** Matches --max-span in tools/fetch_planet_dem.py. */
+const MAX_SPAN_DEG = 3;
+
+export interface Area {
+    name: string;
+    west: number;
+    south: number;
+    east: number;
+    north: number;
+}
+
+type JobState = 'running' | 'done' | 'failed';
+
+interface Job {
+    id: string;
+    name: string;
+    bbox: [number, number, number, number];
+    state: JobState;
+    log: string[];
+    step: string;
+    stepIndex: number;
+    stepCount: number;
+    /** Progress within the current step, 0..100, when the tool reports it. */
+    percent: number;
+    error?: string;
+    subscribers: Set<Response>;
+}
+
+const jobs = new Map<string, Job>();
+
+function slug(name: string): string {
+    return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+}
+
+// --- OSM tiles -------------------------------------------------------------
+
+export async function osmTile(req: Request, res: Response): Promise<void> {
+    const z = Number(req.params.z);
+    const x = Number(req.params.x);
+    const y = Number(req.params.y);
+    if (!Number.isInteger(z) || !Number.isInteger(x) || !Number.isInteger(y)
+        || z < 0 || z > OSM_MAX_ZOOM) {
+        res.status(400).send('bad tile');
+        return;
+    }
+    const span = 1 << z;
+    if (x < 0 || x >= span || y < 0 || y >= span) {
+        res.status(400).send('tile out of range');
+        return;
+    }
+
+    const cached = path.join(OSM_CACHE, String(z), String(x), `${y}.png`);
+    if (fs.existsSync(cached)) {
+        res.type('png').send(fs.readFileSync(cached));
+        return;
+    }
+
+    const url = OSM_TILE_URL.replace('{z}', String(z)).replace('{x}', String(x)).replace('{y}', String(y));
+    try {
+        const upstream = await fetch(url, { headers: { 'User-Agent': OSM_USER_AGENT } });
+        if (!upstream.ok) {
+            res.status(upstream.status).send('tile fetch failed');
+            return;
+        }
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        fs.mkdirSync(path.dirname(cached), { recursive: true });
+        fs.writeFileSync(cached, buf);
+        res.type('png').send(buf);
+    } catch (err) {
+        res.status(502).send(`tile fetch failed: ${(err as Error).message}`);
+    }
+}
+
+// --- areas already baked ---------------------------------------------------
+
+export function readAreas(): { areas: Area[]; coverage?: Area } {
+    if (!fs.existsSync(TERRAIN_MANIFEST)) {
+        return { areas: [] };
+    }
+    try {
+        const m = JSON.parse(fs.readFileSync(TERRAIN_MANIFEST, 'utf8'));
+        const areas: Area[] = Array.isArray(m.areas) ? m.areas : [];
+        // A pyramid baked before areas were recorded still has coverage, and
+        // that is one area by construction.
+        if (areas.length === 0 && m.coverage) {
+            return { areas: [{ name: 'home', ...m.coverage }], coverage: m.coverage };
+        }
+        return { areas, coverage: m.coverage };
+    } catch {
+        return { areas: [] };
+    }
+}
+
+export function areasHandler(_req: Request, res: Response): void {
+    res.json(readAreas());
+}
+
+// --- the import job --------------------------------------------------------
+
+/**
+ * Percent complete out of a tool's own progress line, or undefined.
+ *
+ * Each stage already prints where it is; this reads those rather than
+ * inventing a second progress model that could disagree with what the log
+ * plainly says. Unrecognised lines simply carry no percentage.
+ */
+export function parseProgress(line: string): number | undefined {
+    // `  123/456 (27.0%)  1.2 MB` — the mesh and cover bakes.
+    const pct = /\((\d+(?:\.\d+)?)%\)/.exec(line);
+    if (pct) {
+        return clampPercent(Number(pct[1]));
+    }
+    // `  merged NAME -> 42.0% covered` — the DEM and cover-source fetches.
+    const covered = /->\s*(\d+(?:\.\d+)?)%\s+covered/.exec(line);
+    if (covered) {
+        return clampPercent(Number(covered[1]));
+    }
+    // `  sampling 12/18` and `  rasterize 12/23`.
+    const ratio = /^\s*(?:sampling|rasterize)\s+(\d+)\s*\/\s*(\d+)/.exec(line);
+    if (ratio) {
+        const total = Number(ratio[2]);
+        return total > 0 ? clampPercent(100 * Number(ratio[1]) / total) : undefined;
+    }
+    return undefined;
+}
+
+function clampPercent(v: number): number | undefined {
+    return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : undefined;
+}
+
+/** True for a line that is only a progress update, so the log can replace it. */
+export function isProgressLine(line: string): boolean {
+    return /^\s*\d+\s*\/\s*\d+\s*\(/.test(line)
+        || /^\s*(?:sampling|rasterize)\s+\d+\s*\/\s*\d+/.test(line);
+}
+
+function frameFor(job: Job, event: Record<string, unknown>): string {
+    // Overall progress treats every stage as an equal slice. They are not
+    // equal — the imagery fetch dwarfs the rest — but a bar that moves
+    // steadily and reaches 100 beats one weighted by guesswork.
+    const overall = job.stepCount > 0
+        ? (100 * (job.stepIndex + job.percent / 100)) / job.stepCount
+        : 0;
+    return `data: ${JSON.stringify({
+        ...event,
+        step: job.step,
+        state: job.state,
+        stepIndex: job.stepIndex,
+        stepCount: job.stepCount,
+        percent: Math.round(job.percent),
+        overall: Math.round(Math.min(100, overall)),
+    })}\n\n`;
+}
+
+function emit(job: Job, event: Record<string, unknown>): void {
+    const frame = frameFor(job, event);
+    for (const sub of job.subscribers) {
+        sub.write(frame);
+    }
+}
+
+function line(job: Job, text: string): void {
+    const progress = parseProgress(text);
+    if (progress !== undefined) {
+        job.percent = progress;
+    }
+    // A progress line supersedes the previous one rather than stacking: the
+    // mesh bake alone emits one every hundred tiles.
+    if (isProgressLine(text) && job.log.length > 0 && isProgressLine(job.log[job.log.length - 1])) {
+        job.log[job.log.length - 1] = text;
+        emit(job, { line: text, replace: true });
+        return;
+    }
+    job.log.push(text);
+    // The log is only ever read back for a job that is still running; capping
+    // it stops a half-hour imagery fetch from becoming a memory leak.
+    if (job.log.length > 4000) {
+        job.log.splice(0, job.log.length - 4000);
+    }
+    emit(job, { line: text });
+}
+
+/**
+ * Split a chunk of child output into whole lines, keeping the remainder.
+ *
+ * A bare carriage return counts as a line break. The mesh and cover bakes
+ * redraw one progress line with `\r` and no newline at all, so splitting on
+ * newlines alone means their progress never reaches the browser until the
+ * stage is already over.
+ */
+export function splitStream(tail: string, chunk: string): { lines: string[]; tail: string } {
+    const parts = (tail + chunk).split(/\r\n|\n|\r/);
+    return { tail: parts.pop() ?? '', lines: parts.filter(l => l.trim().length > 0) };
+}
+
+function runStep(
+    job: Job, label: string, index: number, cmd: string, args: string[],
+): Promise<void> {
+    return new Promise((resolve, reject) => {
+        job.step = label;
+        job.stepIndex = index;
+        job.percent = 0;
+        line(job, `\n[${index + 1}/${job.stepCount}] ${label}`);
+        line(job, `$ ${cmd} ${args.join(' ')}`);
+        const child = spawn(cmd, args, { cwd: PROJECT_ROOT });
+        let tail = '';
+        const feed = (d: Buffer) => {
+            // Split on a bare carriage return as well as a newline. The mesh
+            // and cover bakes redraw a single progress line with \r and no
+            // newline at all, so splitting on newlines alone means their
+            // progress never arrives until the stage is already over.
+            const split = splitStream(tail, d.toString());
+            tail = split.tail;
+            for (const l of split.lines) {
+                line(job, l);
+            }
+        };
+        child.stdout.on('data', feed);
+        child.stderr.on('data', feed);
+        child.on('error', err => reject(new Error(`${label}: ${err.message}`)));
+        child.on('close', code => {
+            if (tail.trim()) {
+                line(job, tail);
+            }
+            if (code === 0) {
+                resolve();
+            } else {
+                reject(new Error(`${label} exited with code ${code}`));
+            }
+        });
+    });
+}
+
+interface Step { label: string; cmd: string; args: string[] }
+
+/** The stages, in order — the same command line as tools/README.md. */
+function plan(job: Job, withCover: boolean): Step[] {
+    const bbox = job.bbox.join(',');
+    const tif = path.join('data', 'imports', `${slug(job.name)}.tif`);
+    const steps: Step[] = [
+        {
+            label: 'fetching heights', cmd: PYTHON,
+            args: ['tools/fetch_planet_dem.py', `--bbox=${bbox}`, '--out', tif],
+        },
+        {
+            label: 'merging into the pyramid', cmd: PYTHON,
+            args: ['tools/merge_planet_dem.py', '--input', tif, '--name', job.name],
+        },
+        {
+            label: 'baking coastline', cmd: PYTHON,
+            args: ['tools/bake_osm_coast.py', `--bbox=${bbox}`],
+        },
+    ];
+    if (withCover) {
+        steps.push({
+            label: 'fetching cover sources', cmd: PYTHON,
+            args: ['tools/fetch_cover_sources.py', `--bbox=${bbox}`],
+        });
+        steps.push({
+            label: 'baking cover', cmd: PYTHON,
+            args: ['tools/bake_planet_cover.py', `--bbox=${bbox}`],
+        });
+    }
+    steps.push({
+        label: 'baking meshes', cmd: process.execPath,
+        args: ['--import', 'tsx', 'tools/bake_planet_mesh.ts', '--bbox', bbox],
+    });
+    return steps;
+}
+
+async function runImport(job: Job, withCover: boolean): Promise<void> {
+    fs.mkdirSync(IMPORTS_DIR, { recursive: true });
+    // One bbox throughout: it is what scopes every stage to this area instead
+    // of rewriting everything already baked.
+    const steps = plan(job, withCover);
+    job.stepCount = steps.length;
+    for (let i = 0; i < steps.length; i++) {
+        await runStep(job, steps[i].label, i, steps[i].cmd, steps[i].args);
+    }
+}
+
+export function startImport(req: Request, res: Response): void {
+    for (const j of jobs.values()) {
+        if (j.state === 'running') {
+            res.status(409).json({ ok: false, error: `an import is already running (${j.name})` });
+            return;
+        }
+    }
+
+    const body = req.body ?? {};
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const bbox = Array.isArray(body.bbox) ? body.bbox.map(Number) : [];
+    const withCover = body.withCover === true;
+
+    if (!name || slug(name).length === 0) {
+        res.status(400).json({ ok: false, error: 'give the area a name' });
+        return;
+    }
+    if (bbox.length !== 4 || bbox.some((v: number) => !Number.isFinite(v))) {
+        res.status(400).json({ ok: false, error: 'bbox must be west,south,east,north' });
+        return;
+    }
+    const [west, south, east, north] = bbox as [number, number, number, number];
+    if (west >= east || south >= north) {
+        res.status(400).json({ ok: false, error: 'bbox is inside out' });
+        return;
+    }
+    if (Math.max(east - west, north - south) > MAX_SPAN_DEG) {
+        res.status(400).json({
+            ok: false,
+            error: `bbox spans ${(east - west).toFixed(2)} x ${(north - south).toFixed(2)} deg, `
+                + `over the ${MAX_SPAN_DEG} deg limit`,
+        });
+        return;
+    }
+    if (readAreas().areas.some(a => a.name === name)) {
+        res.status(409).json({ ok: false, error: `an area called "${name}" already exists` });
+        return;
+    }
+
+    const id = `${slug(name)}-${jobs.size}-${process.hrtime.bigint().toString(36)}`;
+    const job: Job = {
+        id, name, bbox: [west, south, east, north],
+        state: 'running', log: [], step: 'starting',
+        stepIndex: 0, stepCount: withCover ? 6 : 4, percent: 0,
+        subscribers: new Set(),
+    };
+    jobs.set(id, job);
+    res.json({ ok: true, id });
+
+    runImport(job, withCover).then(() => {
+        job.state = 'done';
+        job.step = 'done';
+        // Stay on the last step rather than running past it: percent 100 is
+        // what carries overall to 100, and `stepIndex + 1` stays in range.
+        job.stepIndex = Math.max(0, job.stepCount - 1);
+        job.percent = 100;
+        line(job, '\nimport complete — reload to fly there');
+    }).catch((err: Error) => {
+        job.state = 'failed';
+        job.error = err.message;
+        line(job, `\nFAILED: ${err.message}`);
+    }).finally(() => {
+        emit(job, { line: '' });
+        for (const sub of job.subscribers) {
+            sub.end();
+        }
+        job.subscribers.clear();
+    });
+}
+
+export function importStream(req: Request, res: Response): void {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const job = jobs.get(String(id));
+    if (!job) {
+        res.status(404).end();
+        return;
+    }
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    // Replay whatever already happened, so a reconnect is not a blank screen.
+    for (const l of job.log) {
+        res.write(frameFor(job, { line: l }));
+    }
+    if (job.state !== 'running') {
+        res.write(frameFor(job, { line: '' }));
+        res.end();
+        return;
+    }
+    job.subscribers.add(res);
+    req.on('close', () => { job.subscribers.delete(res); });
+}

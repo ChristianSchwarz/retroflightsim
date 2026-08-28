@@ -103,6 +103,27 @@ def tile_range_for_bounds(z: int, b: Bounds) -> Tuple[int, int, int, int]:
     return (max(0, x0), max(0, y0), min(nx - 1, max(0, x1)), min(ny - 1, max(0, y1)))
 
 
+def glue_negative_bbox(argv: Sequence[str]) -> List[str]:
+    """Rewrite ``--bbox -18.66,...`` into the ``--bbox=-18.66,...`` argparse takes.
+
+    Every western-hemisphere bbox starts with a minus, and argparse reads that
+    as the next option rather than this one's value - including the Canaries
+    example in this file's own docstring, which could not be run as written.
+    Its negative-number escape hatch only recognises a bare number, and a bbox
+    has commas in it.
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--bbox' and i + 1 < len(argv) and argv[i + 1].startswith('-'):
+            out.append(f'--bbox={argv[i + 1]}')
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
 def parse_bbox(text: str) -> Bounds:
     parts = [float(p.strip()) for p in text.split(',')]
     if len(parts) != 4:
@@ -315,7 +336,14 @@ def _polygons_from_osm(data: dict, bbox: Bounds) -> Tuple[MultiPolygon, MultiPol
         (bbox.west, bbox.south), (bbox.east, bbox.south),
         (bbox.east, bbox.north), (bbox.west, bbox.north), (bbox.west, bbox.south),
     ])
-    linework = coastline_lines + [bbox_ring]
+    # Node the linework before polygonizing. `polygonize` does not split lines
+    # where they cross; it only closes rings out of segments that already share
+    # endpoints. An island whose coastline closes on itself inside the bbox
+    # needs no help - which is why the Canaries baked correctly - but a
+    # mainland coast runs off the edge, and its crossing with the bbox ring is
+    # not a shared endpoint until something nodes it. Unnoded, the crossings
+    # never close and the whole bbox comes out as ocean.
+    linework = unary_union(coastline_lines + [bbox_ring])
     pieces = list(polygonize(linework))
 
     # Corner probe: assume southwest corner is open ocean for regional bboxes.
@@ -464,6 +492,31 @@ def encode_lwm(grid: bytes, n: int) -> bytes:
     return zlib.compress(payload, 6)
 
 
+def decode_lwm(blob: bytes) -> Tuple[bytearray, int]:
+    """Inverse of :func:`encode_lwm`: returns (grid, n)."""
+    payload = zlib.decompress(blob)
+    magic, n, _f0, _f1 = struct.unpack('<4sHBB', payload[:8])
+    if magic != LWM_MAGIC:
+        raise ValueError(f'not a {LWM_MAGIC.decode()} tile: {magic!r}')
+    return bytearray(payload[8:8 + n * n]), n
+
+
+def read_lwm(out_dir: str, z: int, x: int, y: int) -> Optional[bytearray]:
+    """A previously baked mask, or None if this tile was never written.
+
+    Needed because a coarse mask is decimated from its four children, and
+    :func:`build_parent_mask` leaves any quadrant it is not given as water. Bake
+    one area and the ancestors it shares with an area baked earlier would come
+    back with that earlier land drowned.
+    """
+    path = os.path.join(out_dir, str(z), str(x), f'{y}.lwm')
+    if not os.path.isfile(path):
+        return None
+    with open(path, 'rb') as fh:
+        grid, _n = decode_lwm(fh.read())
+    return grid
+
+
 def vector_simplify_tol(z: int, max_zoom: int, tile_size: int) -> float:
     """Degrees — ~15% of a grid cell, scaled coarser at lower zoom."""
     span = 180.0 / (1 << z)
@@ -594,15 +647,21 @@ def bake(args: argparse.Namespace) -> int:
     for z, coords in pdm_tiles.items():
         if z == max_zoom:
             max_tiles.update(coords)
-    if not max_tiles:
-        x0, y0, x1, y1 = tile_range_for_bounds(max_zoom, bbox)
-        for y in range(y0, y1 + 1):
-            for x in range(x0, x1 + 1):
-                max_tiles.add((x, y))
-    elif args.include_ocean_tiles:
-        x0, y0, x1, y1 = tile_range_for_bounds(max_zoom, bbox)
-        for y in range(y0, y1 + 1):
-            for x in range(x0, x1 + 1):
+
+    # ...but only inside the bbox. `land` was assembled for the bbox and
+    # nothing else, so rasterising a tile outside it does not produce "no data
+    # here", it produces open ocean - and writes that over a coast baked
+    # earlier. Scoping the tile set is what makes a second area addable
+    # without re-fetching OSM for the first.
+    bx0, by0, bx1, by1 = tile_range_for_bounds(max_zoom, bbox)
+    outside = {t for t in max_tiles if not (bx0 <= t[0] <= bx1 and by0 <= t[1] <= by1)}
+    max_tiles -= outside
+    if outside:
+        print(f'bbox        {len(outside)} PDM tiles outside it left alone')
+
+    if not max_tiles or args.include_ocean_tiles:
+        for y in range(by0, by1 + 1):
+            for x in range(bx0, bx1 + 1):
                 max_tiles.add((x, y))
 
     level_grids: Dict[Tuple[int, int], bytearray] = {}
@@ -642,22 +701,45 @@ def bake(args: argparse.Namespace) -> int:
         for (x, y), grid in level_grids.items():
             key = (x >> 1, y >> 1)
             parent_children.setdefault(key, {})[(x & 1, y & 1)] = grid
+        reloaded = 0
         for key, children in parent_children.items():
+            # Top the quadrants up from disk before decimating, or the coast of
+            # every area baked before this one is replaced with open water in
+            # the ancestors they share.
+            for qx, qy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                if (qx, qy) in children:
+                    continue
+                sibling = read_lwm(out_dir, z, key[0] * 2 + qx, key[1] * 2 + qy)
+                if sibling is not None:
+                    children[(qx, qy)] = sibling
+                    reloaded += 1
             parents[key] = build_parent_mask(children, tile_size)
+        if reloaded:
+            print(f'            {reloaded} siblings reloaded for {len(parents)} ancestors')
         level_grids = parents
 
+    # Union with whatever was already masked, not a replacement: this run only
+    # looked at its own bbox, and the tiles baked outside it are still there.
+    previous = (manifest.get('coastMask') or {}).get('coverage')
+    if previous:
+        masked = {
+            'west': min(previous['west'], bbox.west),
+            'south': min(previous['south'], bbox.south),
+            'east': max(previous['east'], bbox.east),
+            'north': max(previous['north'], bbox.north),
+        }
+    else:
+        masked = {
+            'west': bbox.west, 'south': bbox.south,
+            'east': bbox.east, 'north': bbox.north,
+        }
     manifest['version'] = 3
     manifest['coastMask'] = {
         'enabled': True,
         'path': '{z}/{x}/{y}.lwm',
         'vectorPath': '{z}/{x}/{y}.lvr',
         'source': 'osm',
-        'coverage': {
-            'west': bbox.west,
-            'south': bbox.south,
-            'east': bbox.east,
-            'north': bbox.north,
-        },
+        'coverage': masked,
     }
     with open(manifest_path, 'w', encoding='utf-8') as fh:
         json.dump(manifest, fh, indent=2)
@@ -680,7 +762,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument('--land-shp', help='pre-built land polygons shapefile (osmcoastline output)')
     parser.add_argument('--include-ocean-tiles', action='store_true',
                         help='also bake every tile in the bbox at max zoom (slow; default: PDM tiles only)')
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(glue_negative_bbox(raw))
     return bake(args)
 
 

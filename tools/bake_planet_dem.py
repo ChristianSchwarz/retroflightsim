@@ -110,6 +110,51 @@ def tile_range_for_bounds(z: int, b: Bounds) -> Tuple[int, int, int, int]:
     return (max(0, x0), max(0, y0), min(nx - 1, max(0, x1)), min(ny - 1, max(0, y1)))
 
 
+CLAIM_TAG = 'RETRO_CLAIM_BBOX'
+
+
+def area_name_for(input_path: str, override: Optional[str]) -> str:
+    """What to call this area in the manifest's `areas` list."""
+    if override:
+        return override.strip()
+    return os.path.splitext(os.path.basename(input_path))[0]
+
+
+def merge_area(areas: List[dict], name: str, b: Bounds) -> List[dict]:
+    """Add or replace one entry in the `areas` list.
+
+    The list is what lets the runtime offer somewhere to fly to. `coverage` on
+    its own cannot: it is the union box of everything baked, so two areas
+    become one rectangle spanning the sea between them, with no way back to
+    either. Re-baking an area replaces its entry rather than duplicating it.
+    """
+    entry = {
+        'name': name,
+        'west': b.west, 'south': b.south, 'east': b.east, 'north': b.north,
+    }
+    kept = [a for a in areas if a.get('name') != name]
+    kept.append(entry)
+    kept.sort(key=lambda a: a['name'])
+    return kept
+
+
+def read_claim_tag(dataset) -> Optional[Bounds]:
+    """The tile box a fetched raster declares it is authoritative for.
+
+    None when the raster carries no tag, which is every hand-made source
+    including data/output_hh.tif - those own whatever they cover.
+    """
+    raw = dataset.tags().get(CLAIM_TAG)
+    if not raw:
+        return None
+    try:
+        west, south, east, north = (float(v) for v in raw.split(','))
+    except ValueError:
+        print(f'warning: ignoring unreadable {CLAIM_TAG}: {raw!r}', file=sys.stderr)
+        return None
+    return Bounds(west, south, east, north)
+
+
 def auto_max_zoom(deg_per_pixel: float, tile_size: int) -> int:
     """Smallest level whose node spacing resolves the source raster."""
     intervals = tile_size - 1
@@ -268,6 +313,38 @@ def encode_tile(grid: np.ndarray, geometric_error: float) -> bytes:
     return zlib.compress(payload, 6)
 
 
+def decode_tile(blob: bytes) -> Tuple[np.ndarray, float]:
+    """Inverse of :func:`encode_tile`: returns (grid, geometric_error).
+
+    Dequantising is lossy by exactly one quantisation step, which is why the
+    bake never round-trips a tile it still holds in memory. It exists so a
+    *later* bake can rebuild a shared ancestor out of children it did not
+    produce itself - the only copy of those is the one on disk.
+
+    Voids come back as NaN, matching what the sampler produces, so a decoded
+    grid can be fed straight back into :func:`build_parent`.
+    """
+    payload = zlib.decompress(blob)
+    magic, n, _flags, _pad, lo, _hi, scale, error = struct.unpack(
+        '<4sHBBffff', payload[:TILE_HEADER_BYTES])
+    if magic != TILE_MAGIC:
+        raise ValueError(f'not a {TILE_MAGIC.decode()} tile: {magic!r}')
+    q = np.frombuffer(payload, dtype='<u2', count=n * n,
+                      offset=TILE_HEADER_BYTES).reshape(n, n)
+    grid = lo + q.astype(np.float64) * scale
+    grid[q == NODATA_U16] = np.nan
+    return grid, float(error)
+
+
+def read_tile(out_dir: str, z: int, x: int, y: int) -> Optional[Tuple[np.ndarray, float]]:
+    """Decode a baked tile, or None when it was never written."""
+    path = os.path.join(out_dir, str(z), str(x), f'{y}.pdm')
+    if not os.path.exists(path):
+        return None
+    with open(path, 'rb') as fh:
+        return decode_tile(fh.read())
+
+
 def upsample_parent_quadrant(parent: np.ndarray, qx: int, qy: int, n: int) -> np.ndarray:
     """Bilinear 2x upsample of one parent quadrant onto the child node grid."""
     half = (n - 1) // 2
@@ -342,6 +419,48 @@ def pack_index(levels: List[Tuple[int, int, int, int, int, List[Tuple[int, int]]
     return bytes(head + masks)
 
 
+def unpack_index(blob: bytes) -> Dict[int, set]:
+    """Inverse of :func:`pack_index`: ``{z: {(x, y), ...}}``.
+
+    A merge has to know which tiles a previous bake already wrote, and the
+    index is the only record of that which does not mean walking the tree.
+    """
+    if len(blob) < 8 or blob[:4] != INDEX_MAGIC:
+        raise ValueError('bad planet index.bin magic')
+    min_zoom, max_zoom = struct.unpack('<HH', blob[4:8])
+    levels: Dict[int, set] = {}
+    if max_zoom < min_zoom:
+        return levels
+    count = max_zoom - min_zoom + 1
+    headers = []
+    o = 8
+    for i in range(count):
+        headers.append((min_zoom + i, *struct.unpack('<IIII', blob[o:o + 16])))
+        o += 16
+    for z, min_x, min_y, w, h in headers:
+        bits = blob[o:o + (w * h + 7) // 8]
+        o += (w * h + 7) // 8
+        coords = set()
+        for idx in range(w * h):
+            if bits[idx >> 3] & (1 << (idx & 7)):
+                coords.add((min_x + idx % w, min_y + idx // w))
+        levels[z] = coords
+    return levels
+
+
+def index_levels(tiles: Dict[int, set]) -> List[Tuple[int, int, int, int, int, List[Tuple[int, int]]]]:
+    """``{z: {(x, y)}}`` -> the level tuples :func:`pack_index` wants."""
+    out = []
+    for z in sorted(tiles):
+        coords = sorted(tiles[z])
+        if not coords:
+            continue
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        out.append((z, min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1, coords))
+    return out
+
+
 def bake(args: argparse.Namespace) -> int:
     started = time.time()
     dataset = rasterio.open(args.input)
@@ -357,6 +476,12 @@ def bake(args: argparse.Namespace) -> int:
         sampler = SourceSampler(dataset, args.sea_level)
 
     src_bounds = sampler.bounds
+    # A raster from fetch_planet_dem.py reaches a couple of pixels past the
+    # tiles it owns, so that nodes on a tile edge interpolate instead of
+    # clamping to the first pixel centre. Claim the tiles it declares, not
+    # every tile the margin touches - otherwise the neighbours get baked from
+    # two pixels of real data and a tileful of sea.
+    claim = read_claim_tag(dataset) or src_bounds
     tile_size = args.tile_size
     if (tile_size - 1) & (tile_size - 2) != 0:
         print(f'error: --tile-size must be 2^k+1 (got {tile_size})', file=sys.stderr)
@@ -371,8 +496,8 @@ def bake(args: argparse.Namespace) -> int:
     node_spacing = (180.0 / (1 << max_zoom)) / (tile_size - 1)
     print(f'source      {args.input}')
     print(f'raster      {sampler.width} x {sampler.height} @ {sampler.deg_per_pixel:.8f} deg/px')
-    print(f'coverage    lon [{src_bounds.west:.5f}, {src_bounds.east:.5f}] '
-          f'lat [{src_bounds.south:.5f}, {src_bounds.north:.5f}]')
+    print(f'coverage    lon [{claim.west:.5f}, {claim.east:.5f}] '
+          f'lat [{claim.south:.5f}, {claim.north:.5f}]')
     print(f'zoom        {min_zoom}..{max_zoom} (node spacing {node_spacing:.8f} deg '
           f'~ {node_spacing * 111320.0:.1f} m)')
 
@@ -384,7 +509,7 @@ def bake(args: argparse.Namespace) -> int:
     print(f'land mask   {mask.shape[1]} x {mask.shape[0]} cells, {int(mask.sum())} with land')
 
     # --- finest level -----------------------------------------------------
-    x0, y0, x1, y1 = tile_range_for_bounds(max_zoom, src_bounds)
+    x0, y0, x1, y1 = tile_range_for_bounds(max_zoom, claim)
     candidates = [(x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)
                   if mask_has_land(mask, src_bounds, cell_lon, cell_lat, tile_bounds(max_zoom, x, y))]
     print(f'level {max_zoom:2d}    {len(candidates)} candidate tiles '
@@ -457,8 +582,8 @@ def bake(args: argparse.Namespace) -> int:
     with open(os.path.join(args.out, 'index.bin'), 'wb') as fh:
         fh.write(pack_index(level_index))
 
-    center_lat = 0.5 * (src_bounds.south + src_bounds.north)
-    center_lon = 0.5 * (src_bounds.west + src_bounds.east)
+    center_lat = 0.5 * (claim.south + claim.north)
+    center_lon = 0.5 * (claim.west + claim.east)
     manifest = {
         'version': 2,
         'scheme': 'geographic-quadtree',
@@ -473,15 +598,16 @@ def bake(args: argparse.Namespace) -> int:
         'heightMax': None if height_max == -math.inf else height_max,
         'seaLevel': args.sea_level,
         'coverage': {
-            'west': src_bounds.west,
-            'south': src_bounds.south,
-            'east': src_bounds.east,
-            'north': src_bounds.north,
+            'west': claim.west,
+            'south': claim.south,
+            'east': claim.east,
+            'north': claim.north,
         },
         'enuOrigin': {'lat': center_lat, 'lon': center_lon, 'height': 0.0},
         'tilePath': '{z}/{x}/{y}.pdm',
         'indexPath': 'index.bin',
         'levelGeometricErrorM': [level_errors.get(z, 0.0) for z in range(0, max_zoom + 1)],
+        'areas': merge_area([], area_name_for(args.input, args.name), claim),
     }
     with open(os.path.join(args.out, 'manifest.json'), 'w', encoding='utf-8') as fh:
         json.dump(manifest, fh, indent=2)
@@ -506,6 +632,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument('--min-zoom', type=int, default=0)
     parser.add_argument('--max-zoom', type=int, default=None, help='default: derived from source resolution')
     parser.add_argument('--sea-level', type=float, default=DEFAULT_SEA_LEVEL)
+    parser.add_argument('--name', help='name for this area in the manifest '
+                                       '(default: the input file stem)')
     parser.add_argument('--clean', action='store_true', help='delete the output directory first')
     args = parser.parse_args(list(argv) if argv is not None else None)
     return bake(args)
