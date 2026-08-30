@@ -28,6 +28,8 @@ Optional: ``osmcoastline`` binary for robust coastline assembly from PBF.
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
 import json
 import math
 import os
@@ -45,6 +47,7 @@ import numpy as np
 try:
     import requests
     from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box, mapping, shape
+    from shapely.affinity import scale as affine_scale
     from shapely.ops import polygonize, unary_union
     from shapely.prepared import prep
 except ImportError:
@@ -65,6 +68,44 @@ LAND = 1
 WATER = 0
 
 LVR_MAGIC = b'LVR1'
+LVR2_MAGIC = b'LVR2'
+LVR3_MAGIC = b'LVR3'
+
+# Inland water bodies whose surface is flat: a lake sits at one elevation, and
+# the eye reads a non-level water surface as broken instantly. Flowing water
+# does not - a river descends across a tile - so it follows the DEM instead.
+# OSM's `water=*` subtag separates the two; an untagged `natural=water` is
+# overwhelmingly a lake or a pond, so absence means flat.
+FLOWING_WATER_SUBTYPES = frozenset((
+    'river', 'stream', 'canal', 'ditch', 'drain', 'tidal_channel',
+))
+
+# Perimeter percentile used for a flat body's surface height. See
+# :func:`flat_body_height` for why it is a low one.
+SURFACE_PERCENTILE = 5.0
+
+# Below this share of the bbox, assembled land is treated as a failed coastline
+# assembly rather than as open sea. See the check in :func:`bake`.
+MIN_PLAUSIBLE_LAND_FRACTION = 0.005
+
+# Overpass responses are cached by query hash. The public endpoints refuse
+# large queries often enough that without this a single 500 costs another full
+# fetch, and a bake that fails at a later stage re-downloads everything.
+OSM_CACHE_DIR = os.path.join('data', 'osm-cache')
+
+# Width to assume for a watercourse OSM maps as a bare centreline with no
+# `width` tag on it, which is most of them. Used for two things: the water
+# polygon it is buffered into, and the stroke the overlay draws it with.
+WATERWAY_FALLBACK_WIDTH_M = {'river': 30.0, 'canal': 12.0}
+
+# Douglas-Peucker tolerance for a watercourse centreline, in grid cells of the
+# level being written.
+#
+# Generous next to the 0.15 cells the coast gets, because these lines are not
+# cut against anything: they are drawn as a stroke, so a vertex dropped here
+# costs a little shape and no continuity at all. It is what keeps a z8 tile
+# from carrying every bend the z12 one does.
+LINE_SIMPLIFY_CELLS = 0.5
 
 OVERPASS_URLS = (
     'https://overpass.kumi.systems/api/interpreter',
@@ -101,6 +142,40 @@ def tile_range_for_bounds(z: int, b: Bounds) -> Tuple[int, int, int, int]:
     y0 = int(math.floor((90.0 - b.north) / span))
     y1 = int(math.ceil((90.0 - b.south) / span)) - 1
     return (max(0, x0), max(0, y0), min(nx - 1, max(0, x1)), min(ny - 1, max(0, y1)))
+
+
+def snap_bounds_to_tiles(b: Bounds, zoom: int) -> Bounds:
+    """Grow a bbox outwards until it lands on whole tile edges at `zoom`.
+
+    Every tile this bake writes is written *whole*, from land assembled for the
+    bbox and nothing else. A tile the bbox cuts through therefore comes out land
+    on one side of the cut and open ocean on the other — and it is written over
+    whatever a previous area baked there.
+
+    That is the seam between two imported areas. Measured on two overlapping
+    Crimea imports: the second area's raw southern edge fell at lat 45.204449,
+    a third of the way down tile row 1019, and the bake rewrote that whole row
+    with the lower two thirds as sea. A 3.5 km strip of Black Sea straight
+    across the middle of the peninsula, over ground the first area had baked
+    correctly.
+
+    Snapping is the same fix `fetch_planet_dem.py` already applies to the DEM,
+    and for the same reason: a stage whose sources stop mid-tile cannot write
+    that tile. Outwards rather than inwards, so nothing the caller asked for is
+    dropped; the cost is at most one extra tile ring, baked with real data.
+    """
+    span = 180.0 / (1 << zoom)
+    # A bbox already on an edge must not grow: floating point lands a whole
+    # number a hair either side of itself, and ceil() of 1020.0000001 is a tile
+    # further out than asked for.
+    lo = lambda v: math.floor(v + 1e-9)
+    hi = lambda v: math.ceil(v - 1e-9)
+    return Bounds(
+        west=lo((b.west + 180.0) / span) * span - 180.0,
+        south=90.0 - hi((90.0 - b.south) / span) * span,
+        east=hi((b.east + 180.0) / span) * span - 180.0,
+        north=90.0 - lo((90.0 - b.north) / span) * span,
+    )
 
 
 def glue_negative_bbox(argv: Sequence[str]) -> List[str]:
@@ -187,22 +262,23 @@ def scan_pdm_tiles(out_dir: str, min_zoom: int, max_zoom: int) -> Dict[int, Set[
     return tiles
 
 
-def overpass_query(b: Bounds) -> dict:
-    query = f'''[out:json][timeout:240];
-(
-  way["natural"="coastline"]({b.as_overpass()});
-  relation["natural"="coastline"]({b.as_overpass()});
-  way["natural"="water"]({b.as_overpass()});
-  relation["natural"="water"]({b.as_overpass()});
-  way["natural"="bay"]({b.as_overpass()});
-  relation["natural"="bay"]({b.as_overpass()});
-  way["waterway"="riverbank"]({b.as_overpass()});
-  relation["place"="island"]({b.as_overpass()});
-);
-out body;
->;
-out skel qt;
-'''
+def overpass_cache_path(query: str) -> str:
+    key = hashlib.sha1(query.encode('utf-8')).hexdigest()[:16]
+    return os.path.join(OSM_CACHE_DIR, f'{key}.json.gz')
+
+
+def _overpass_fetch(query: str, label: str, refresh: bool) -> dict:
+    """One Overpass request, cached by query hash."""
+    cache = overpass_cache_path(query)
+    if not refresh and os.path.isfile(cache):
+        try:
+            with gzip.open(cache, 'rt', encoding='utf-8') as fh:
+                data = json.load(fh)
+            print(f'using cached OSM {label} ({cache})')
+            return data
+        except Exception:
+            print(f'  cached {label} unreadable, re-fetching', file=sys.stderr)
+
     headers = {
         'User-Agent': 'retroflightsim-coast-bake/1.0',
         'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
@@ -210,15 +286,69 @@ out skel qt;
     body = ('data=' + requests.utils.quote(query)).encode('utf-8')
     last_err: Optional[Exception] = None
     for url in OVERPASS_URLS:
-        print(f'fetching OSM via Overpass ({url})…')
+        print(f'fetching OSM {label} via Overpass ({url})…')
         try:
             resp = requests.post(url, data=body, headers=headers, timeout=300)
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if data.get('remark'):
+                print(f'  overpass remark: {data["remark"]}', file=sys.stderr)
+            try:
+                os.makedirs(OSM_CACHE_DIR, exist_ok=True)
+                with gzip.open(cache, 'wt', encoding='utf-8') as fh:
+                    json.dump(data, fh)
+                print(f'  cached to {cache}')
+            except Exception as err:
+                print(f'  could not cache the response: {err}', file=sys.stderr)
+            return data
         except Exception as err:
             last_err = err
             print(f'  overpass failed: {err}', file=sys.stderr)
     raise RuntimeError(f'all Overpass endpoints failed: {last_err}')
+
+
+def overpass_query(b: Bounds, refresh: bool = False) -> dict:
+    """Fetch the coastline and the water features as two separate requests.
+
+    Two requests, not one union of many clauses, because Overpass quietly
+    returns fewer elements when it is asked for everything at once. On the
+    Crimea bbox the combined query came back with 504 coastline ways and the
+    coastline-only query with 667 - no `remark`, no error, no missing nodes,
+    just 163 ways short. 504 does not close the chain, so `polygonize` returned
+    one face the size of the bbox and the whole peninsula baked as open sea.
+
+    Splitting them also makes the cache finer: a change to which water features
+    are wanted no longer forces the coastline to be downloaded again.
+    """
+    coastline = f'''[out:json][timeout:240];
+(
+  way["natural"="coastline"]({b.as_overpass()});
+  relation["natural"="coastline"]({b.as_overpass()});
+  relation["place"="island"]({b.as_overpass()});
+);
+out body;
+>;
+out skel qt;
+'''
+    features = f'''[out:json][timeout:240];
+(
+  way["natural"="water"]({b.as_overpass()});
+  relation["natural"="water"]({b.as_overpass()});
+  way["natural"="bay"]({b.as_overpass()});
+  relation["natural"="bay"]({b.as_overpass()});
+  way["waterway"="riverbank"]({b.as_overpass()});
+  way["waterway"~"^(river|canal)$"]({b.as_overpass()});
+  way["landuse"="reservoir"]({b.as_overpass()});
+  relation["landuse"="reservoir"]({b.as_overpass()});
+);
+out body;
+>;
+out skel qt;
+'''
+    elements: List[dict] = []
+    for label, query in (('coastline', coastline), ('water features', features)):
+        elements.extend(_overpass_fetch(query, label, refresh).get('elements', []))
+    return {'elements': elements}
 
 
 def _nodes_map(elements: Sequence[dict]) -> Dict[int, Tuple[float, float]]:
@@ -282,16 +412,160 @@ def _relation_rings(relation: dict, ways: Dict[int, dict], nodes: Dict[int, Tupl
     return rings
 
 
-def _polygons_from_osm(data: dict, bbox: Bounds) -> Tuple[MultiPolygon, MultiPolygon]:
-    """Return (land_multipolygon, water_multipolygon) clipped to bbox."""
+@dataclass
+class Watercourse:
+    """One river or canal as OSM maps it: a centreline and a true width.
+
+    Kept as a line all the way to the tile, because that is the only form a
+    watercourse survives in. Cut into the terrain it has to be at least a
+    couple of grid cells across to land on a node at all, and most of them are
+    not: a 12 m canal is under one cell at Potsdam z12 and a fifth of one at
+    z10. As a line it has no width to lose, and the renderer strokes it.
+    """
+    line: object
+    width_m: float
+
+
+@dataclass
+class WaterBody:
+    """One inland body, with the surface height the mesh bake will sit it at.
+
+    `height` is None until :func:`resolve_body_heights` fills it in, and stays
+    None for flowing water, which follows the DEM per-node instead.
+    """
+    geom: object
+    flat: bool
+    height: Optional[float] = None
+
+
+def _ways_map(elements: Sequence[dict]) -> Dict[int, dict]:
+    """Ways by id, keeping the tagged copy when an id appears more than once.
+
+    Overpass answers `out body; >; out skel qt;` by printing the matched
+    elements with their tags and then everything reached by recursion *without*
+    them. A coastline way that is also a member of, say, a water relation comes
+    back twice - once tagged, once as a bare skeleton - and a plain
+    `{el['id']: el}` lets whichever arrives last win.
+
+    On the Crimea bbox that silently untagged 163 of 667 coastline ways. The
+    remaining 504 could not close the chain, `polygonize` returned a single
+    face the size of the bbox, and the entire peninsula baked as open sea.
+    """
+    out: Dict[int, dict] = {}
+    for el in elements:
+        if el.get('type') != 'way':
+            continue
+        prev = out.get(el['id'])
+        if prev is None or (not prev.get('tags') and el.get('tags')):
+            out[el['id']] = el
+    return out
+
+
+def _tagged_width_m(tags: dict) -> Optional[float]:
+    """Metres from a `width` tag, tolerating the usual '12 m' / '12,5' forms."""
+    raw = tags.get('width') or tags.get('est_width')
+    if not raw:
+        return None
+    text = str(raw).strip().replace(',', '.')
+    number = ''
+    for ch in text:
+        if ch.isdigit() or ch == '.':
+            number += ch
+        else:
+            break
+    try:
+        value = float(number)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def waterway_width_m(tags: dict) -> Optional[float]:
+    """A centreline watercourse's true width in metres, or None if it is not one.
+
+    The tagged `width` where OSM has one, and a per-kind fallback where it does
+    not, because most watercourses are mapped as a bare line with no width on
+    them at all.
+
+    True width, with no floor. A floor was tried - drawn at 2.5 grid cells,
+    which is 48 m at Potsdam - and it is the wrong place to solve this: a 12 m
+    canal has to be drawn wide enough to see from 20 km and no wider than it is
+    from 200 m, and no single number in metres is both. The minimum width is a
+    *screen* quantity, so it belongs in the stroke that draws the centreline -
+    see WATERCOURSE_MIN_PIXELS in the renderer.
+    """
+    kind = tags.get('waterway', '')
+    if kind not in WATERWAY_FALLBACK_WIDTH_M:
+        return None
+    return _tagged_width_m(tags) or WATERWAY_FALLBACK_WIDTH_M[kind]
+
+
+def buffer_waterway(line: LineString, width_m: float, lat: float) -> Optional[Polygon]:
+    """Widen a centreline into a polygon, in metres rather than in degrees.
+
+    Buffering lon/lat directly would make the river narrower east-west than
+    north-south — by a factor of cos(lat), which is 1.6 at Berlin. So the line
+    is squeezed by that factor, buffered round, and stretched back.
+    """
+    shrink = max(0.05, math.cos(math.radians(lat)))
+    try:
+        squeezed = affine_scale(line, xfact=shrink, yfact=1.0, origin=(0.0, 0.0))
+        buffered = squeezed.buffer((width_m / 2.0) / 110540.0, resolution=4)
+        widened = affine_scale(buffered, xfact=1.0 / shrink, yfact=1.0, origin=(0.0, 0.0))
+    except Exception:
+        return None
+    if widened.is_empty or not isinstance(widened, Polygon):
+        return None
+    return widened
+
+
+def _water_kind(tags: dict) -> Optional[str]:
+    """'ocean', 'flat' or 'flowing' - or None when these tags are not water.
+
+    A bay is the sea reaching inland, so it belongs to the ocean surface at sea
+    level and must keep being subtracted from land exactly as it always was.
+    Everything else tagged as water is an inland body carrying its own
+    elevation, which is the whole point of this split.
+    """
+    natural = tags.get('natural', '')
+    if natural == 'bay':
+        return 'ocean'
+    if tags.get('waterway', '') == 'riverbank':
+        return 'flowing'
+    if tags.get('landuse', '') == 'reservoir':
+        return 'flat'
+    if natural == 'water':
+        return 'flowing' if tags.get('water', '') in FLOWING_WATER_SUBTYPES else 'flat'
+    return None
+
+
+def _polygons_from_osm(
+    data: dict, bbox: Bounds,
+) -> Tuple[MultiPolygon, List[WaterBody], List[Watercourse]]:
+    """Return (land_multipolygon, inland_bodies, watercourses) clipped to bbox.
+
+    Land is assembled exactly as it always was - every water polygon, inland
+    ones included, is still subtracted from it - so the ocean shoreline this
+    produces is unchanged. The inland bodies are reported *alongside* it, which
+    is what lets the mesh bake tell a lake at 900 m from open sea at 0 m
+    instead of drowning both at sea level.
+
+    The watercourse centrelines are reported alongside both, at true width, and
+    are the *only* thing that can carry a narrow canal: it is far too thin for
+    the node grid to hold, so it reaches the screen as a stroke drawn over the
+    terrain rather than as water cut into it.
+    """
     elements = data.get('elements', [])
     nodes = _nodes_map(elements)
-    ways = {el['id']: el for el in elements if el.get('type') == 'way'}
+    ways = _ways_map(elements)
     relations = [el for el in elements if el.get('type') == 'relation']
 
     coastline_lines: List[LineString] = []
     water_polys: List[Polygon] = []
     land_polys: List[Polygon] = []
+    inland_parts: List[Tuple[Polygon, bool]] = []
+    courses: List[Watercourse] = []
+    widened_lines = 0
 
     for way in ways.values():
         tags = way.get('tags', {})
@@ -299,22 +573,48 @@ def _polygons_from_osm(data: dict, bbox: Bounds) -> Tuple[MultiPolygon, MultiPol
         if line is None:
             continue
         natural = tags.get('natural', '')
-        waterway = tags.get('waterway', '')
+        kind = _water_kind(tags)
         if natural == 'coastline':
             coastline_lines.append(line)
-        elif natural in ('water', 'bay') or waterway == 'riverbank':
+        elif kind is not None:
             coords = list(line.coords)
             if len(coords) >= 4 and coords[0] == coords[-1]:
                 try:
-                    water_polys.append(Polygon(coords))
+                    poly = Polygon(coords)
                 except Exception:
-                    pass
+                    continue
+                water_polys.append(poly)
+                if kind != 'ocean':
+                    inland_parts.append((poly, kind == 'flat'))
+        else:
+            # A watercourse mapped as a centreline, which is how OSM maps most
+            # of them: on one Berlin tile there were 36 water areas and 20
+            # waterway lines. Kept twice over.
+            #
+            # As a line, because that is what the overlay strokes and it is the
+            # only form that survives a grid too coarse to hold the river.
+            #
+            # And, buffered to true width, as water like any other polygon - so
+            # a wide river still gets a real water surface with a shoreline cut
+            # around it, and the land under it is still subtracted.
+            width = waterway_width_m(tags)
+            if width is None:
+                continue
+            courses.append(Watercourse(line, width))
+            widened = buffer_waterway(line, width, line.centroid.y)
+            if widened is None:
+                continue
+            water_polys.append(widened)
+            # Flowing, never flat: a river descends across a tile, so it takes
+            # its surface from the DEM.
+            inland_parts.append((widened, False))
+            widened_lines += 1
 
     for rel in relations:
         tags = rel.get('tags', {})
         natural = tags.get('natural', '')
         place = tags.get('place', '')
-        waterway = tags.get('waterway', '')
+        kind = _water_kind(tags)
         rings = _relation_rings(rel, ways, nodes)
         for ring in rings:
             if len(ring) < 4:
@@ -325,8 +625,10 @@ def _polygons_from_osm(data: dict, bbox: Bounds) -> Tuple[MultiPolygon, MultiPol
                 continue
             if not poly.is_valid:
                 poly = poly.buffer(0)
-            if natural in ('water', 'bay') or waterway == 'riverbank':
+            if kind is not None:
                 water_polys.append(poly)
+                if kind != 'ocean':
+                    inland_parts.append((poly, kind == 'flat'))
             elif natural == 'coastline' or place == 'island':
                 land_polys.append(poly)
 
@@ -381,10 +683,29 @@ def _polygons_from_osm(data: dict, bbox: Bounds) -> Tuple[MultiPolygon, MultiPol
     land_mp = land_union if isinstance(land_union, MultiPolygon) else (
         MultiPolygon([land_union]) if isinstance(land_union, Polygon) and not land_union.is_empty else MultiPolygon()
     )
-    water_mp = water_union if isinstance(water_union, MultiPolygon) else (
-        MultiPolygon([water_union]) if isinstance(water_union, Polygon) and not water_union.is_empty else MultiPolygon()
-    )
-    return land_mp, water_mp
+    # One body per connected piece: two lakes that touch are one surface, and
+    # a lake mapped twice (as a way and again in a relation) must not become
+    # two bodies fighting over the same water at two different heights.
+    def bodies_of(parts: List[Polygon], flat: bool) -> List[WaterBody]:
+        if not parts:
+            return []
+        merged = unary_union(parts).intersection(clip)
+        if merged.is_empty:
+            return []
+        if isinstance(merged, Polygon):
+            geoms: Sequence[Polygon] = [merged]
+        elif isinstance(merged, MultiPolygon):
+            geoms = list(merged.geoms)
+        else:
+            geoms = [g for g in getattr(merged, 'geoms', []) if isinstance(g, Polygon)]
+        return [WaterBody(g, flat) for g in geoms if not g.is_empty and g.area > 0]
+
+    if widened_lines:
+        print(f'  {widened_lines} centreline watercourses kept as strokes '
+              f'and buffered into water')
+    inland = (bodies_of([p for p, flat in inland_parts if flat], True)
+              + bodies_of([p for p, flat in inland_parts if not flat], False))
+    return land_mp, inland, courses
 
 
 def load_land_shp(path: str, bbox: Bounds) -> MultiPolygon:
@@ -435,29 +756,186 @@ def run_osmcoastline(pbf: str, out_shp: str) -> bool:
     return False
 
 
-def assemble_land(bbox: Bounds, args: argparse.Namespace) -> MultiPolygon:
+PDM_MAGIC = b'PDM1'
+PDM_HEADER_BYTES = 24
+PDM_NODATA = 0xFFFF
+
+# Perimeter samples per body. A cap, not a target: a lake with a 400 km shore
+# does not need a sample every 20 m to place a percentile.
+MAX_PERIMETER_SAMPLES = 2048
+MIN_PERIMETER_SAMPLES = 8
+# Decoded .pdm tiles held at once. 257x257 float32 is 264 KB, so this is a
+# ~70 MB ceiling on a bake that would otherwise cache the whole pyramid.
+DEM_CACHE_TILES = 256
+
+
+def decode_pdm(blob: bytes) -> np.ndarray:
+    """Heights from a .pdm tile as float32, voids as NaN.
+
+    A local reader rather than an import of tools/bake_planet_dem.py: that
+    module requires rasterio at import time and this one deliberately treats
+    rasterio as optional. The on-disk format is fixed, so the duplication is
+    cheap where the dependency would not be.
+    """
+    payload = zlib.decompress(blob)
+    magic, n, _flags, _pad, lo, _hi, scale, _err = struct.unpack_from(
+        '<4sHBBffff', payload, 0)
+    if magic != PDM_MAGIC:
+        raise ValueError(f'not a {PDM_MAGIC.decode()} tile: {magic!r}')
+    q = np.frombuffer(payload, dtype='<u2', count=n * n,
+                      offset=PDM_HEADER_BYTES).reshape(n, n)
+    grid = (lo + q.astype(np.float32) * scale).astype(np.float32)
+    grid[q == PDM_NODATA] = np.nan
+    return grid
+
+
+class DemSampler:
+    """Nearest-node lookups into the .pdm pyramid at one zoom level."""
+
+    def __init__(self, out_dir: str, zoom: int, tile_size: int):
+        self.out_dir = out_dir
+        self.zoom = zoom
+        self.n = tile_size
+        self.span = 180.0 / (1 << zoom)
+        self._cache: Dict[Tuple[int, int], Optional[np.ndarray]] = {}
+
+    def _tile(self, x: int, y: int) -> Optional[np.ndarray]:
+        key = (x, y)
+        if key not in self._cache:
+            if len(self._cache) >= DEM_CACHE_TILES:
+                self._cache.clear()
+            path = os.path.join(self.out_dir, str(self.zoom), str(x), f'{y}.pdm')
+            grid: Optional[np.ndarray] = None
+            if os.path.isfile(path):
+                try:
+                    with open(path, 'rb') as fh:
+                        grid = decode_pdm(fh.read())
+                except Exception:
+                    grid = None
+            self._cache[key] = grid
+        return self._cache[key]
+
+    def sample(self, lon: float, lat: float) -> float:
+        """Height at lon/lat, or NaN where the pyramid holds no data."""
+        x = int(math.floor((lon + 180.0) / self.span))
+        y = int(math.floor((90.0 - lat) / self.span))
+        grid = self._tile(x, y)
+        if grid is None:
+            return float('nan')
+        b = tile_bounds(self.zoom, x, y)
+        cells = self.n - 1
+        col = int(round((lon - b.west) / (b.east - b.west) * cells))
+        row = int(round((b.north - lat) / (b.north - b.south) * cells))
+        return float(grid[min(cells, max(0, row)), min(cells, max(0, col))])
+
+
+def flat_body_height(
+    body: WaterBody, dem: DemSampler, cell_deg: float, sea_level: float = 0.0,
+) -> Optional[float]:
+    """Surface height for a flat body: a low percentile of the DEM around it.
+
+    Measured from the body's *perimeter*, one step outside it - not from its
+    interior. Both choices were forced by real tiles:
+
+    - The interior is not the water surface. Where a reservoir has dropped
+      below its mapped extent the DEM under the polygon is dry canyon; on Lake
+      Powell it spans 442 m with no plateau anywhere in it to find.
+    - What reads as broken from the air is water standing *above* the ground
+      beside it. Land above water is simply a shore. So the height that matters
+      is the one the shoreline agrees with, and it has to sit under the lowest
+      part of that shore rather than at its average - taking the perimeter
+      median leaves half the shoreline leaking.
+
+    A low percentile rather than the minimum, because the minimum is one bad
+    DEM sample away from sinking the whole lake: on Powell that is 895 m
+    against the 927 m the 5th percentile gives.
+
+    Samples below the sea datum are set aside first. A coastal lagoon tagged
+    `natural=water` has open sea along part of its perimeter, and sampling the
+    sea floor there dragged the percentile under water: measured on the African
+    coast in the Canary bake, 31 bodies came out at up to -49.5 m and one of
+    them was 4.9 km across, which is a pit rather than a lagoon.
+
+    Set aside, not clamped, and only when something is left. A lake that genuinely
+    sits below sea level - the Dead Sea, the Salton Sea, the Caspian - has a
+    perimeter that is below it too, so nothing survives the filter and the raw
+    percentile is used. Those are real elevations and must come through intact.
+    """
+    try:
+        outline = body.geom.buffer(cell_deg)
+    except Exception:
+        return None
+    if outline.is_empty:
+        return None
+    if isinstance(outline, Polygon):
+        rings = [outline.exterior]
+    else:
+        rings = [g.exterior for g in getattr(outline, 'geoms', []) if isinstance(g, Polygon)]
+    samples: List[float] = []
+    for ring in rings:
+        length = ring.length
+        if length <= 0:
+            continue
+        count = int(min(MAX_PERIMETER_SAMPLES, max(8, length / max(cell_deg, 1e-9))))
+        for i in range(count):
+            p = ring.interpolate(i / count, normalized=True)
+            h = dem.sample(p.x, p.y)
+            if math.isfinite(h):
+                samples.append(h)
+    if len(samples) < MIN_PERIMETER_SAMPLES:
+        return None
+    dry = [h for h in samples if h > sea_level]
+    if len(dry) >= MIN_PERIMETER_SAMPLES:
+        samples = dry
+    return float(np.percentile(samples, SURFACE_PERCENTILE))
+
+
+def resolve_body_heights(
+    bodies: Sequence[WaterBody], dem: DemSampler, cell_deg: float, sea_level: float = 0.0,
+) -> int:
+    """Fill in `height` for every flat body. Returns how many resolved.
+
+    A body the DEM cannot answer for keeps `height = None` and is baked as
+    flowing water, following the terrain. That is never flat, but it is never
+    broken either, which is the right way round for a fallback.
+    """
+    resolved = 0
+    for body in bodies:
+        if not body.flat:
+            continue
+        body.height = flat_body_height(body, dem, cell_deg, sea_level)
+        if body.height is not None:
+            resolved += 1
+    return resolved
+
+
+def assemble_land(
+    bbox: Bounds, args: argparse.Namespace,
+) -> Tuple[MultiPolygon, List[WaterBody], List[Watercourse]]:
+    # osmcoastline emits the ocean shoreline and nothing else, so those two
+    # paths carry no inland water and no watercourses. They still bake
+    # correctly - a lake simply stays part of the land it sits in, which is
+    # what they did before.
+    def as_mp(geom) -> MultiPolygon:
+        if isinstance(geom, Polygon):
+            return MultiPolygon([geom]) if not geom.is_empty else MultiPolygon()
+        return geom
+
     if args.land_shp:
         print(f'loading land polygons from {args.land_shp}')
-        land = load_land_shp(args.land_shp, bbox)
-        if isinstance(land, Polygon):
-            return MultiPolygon([land]) if not land.is_empty else MultiPolygon()
-        return land
+        return as_mp(load_land_shp(args.land_shp, bbox)), [], []
 
     if args.pbf:
         with tempfile.TemporaryDirectory() as tmp:
             shp = os.path.join(tmp, 'land_polygons.shp')
             if run_osmcoastline(args.pbf, shp):
                 print(f'osmcoastline produced {shp}')
-                land = load_land_shp(shp, bbox)
-                if isinstance(land, Polygon):
-                    return MultiPolygon([land]) if not land.is_empty else MultiPolygon()
-                return land
+                return as_mp(load_land_shp(shp, bbox)), [], []
             print('osmcoastline not available — falling back to Overpass', file=sys.stderr)
 
-    data = overpass_query(bbox)
+    data = overpass_query(bbox, getattr(args, 'refresh_osm', False))
     print(f'  {len(data.get("elements", []))} OSM elements')
-    land, _water = _polygons_from_osm(data, bbox)
-    return land
+    return _polygons_from_osm(data, bbox)
 
 
 def rasterize_tile(land_prep, land_geom, b: Bounds, n: int) -> bytearray:
@@ -539,24 +1017,52 @@ def clip_vector_polys(
     elif isinstance(clipped, MultiPolygon):
         geoms = list(clipped.geoms)
     else:
-        return []
+        # A GeometryCollection, which is what an intersection returns when the
+        # land also touches the tile along an edge or at a corner: polygons
+        # plus a stray line or point. Returning nothing here discarded every
+        # scrap of land on the tile, and it came out as open water from edge to
+        # edge - 12/4391/856 in the Berlin bake, 77.6% land by area.
+        geoms = [g for g in getattr(clipped, 'geoms', []) if isinstance(g, Polygon)]
     out: List[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]] = []
     for geom in geoms:
         if geom.is_empty:
             continue
-        poly = geom.simplify(tolerance, preserve_topology=True) if tolerance > 0 else geom
-        if poly.is_empty or not isinstance(poly, Polygon):
-            continue
-        ext = [(float(x), float(y)) for x, y in poly.exterior.coords[:-1]]
-        if len(ext) < 3:
-            continue
-        holes: List[List[Tuple[float, float]]] = []
-        for interior in poly.interiors:
-            ring = [(float(x), float(y)) for x, y in interior.coords[:-1]]
-            if len(ring) >= 3:
-                holes.append(ring)
-        out.append((ext, holes))
+        for poly in _simplified_parts(geom, tolerance):
+            rings = _rings_of(poly)
+            if rings is not None:
+                out.append(rings)
     return out
+
+
+def _simplified_parts(geom: Polygon, tolerance: float) -> List[Polygon]:
+    """Simplify a clipped piece, as a list of polygons.
+
+    A list rather than one polygon because `simplify` may hand back a
+    MultiPolygon - a shape that touches itself at a point comes apart when the
+    tolerance pulls it open, and `preserve_topology` keeps the pieces rather
+    than the join. The old code tested `isinstance(..., Polygon)` and dropped
+    anything else on the floor, which threw away the entire land polygon of a
+    tile whenever it happened: on the Berlin bake that was 12/4391/856, which
+    came out as open water from edge to edge.
+    """
+    simplified = geom.simplify(tolerance, preserve_topology=True) if tolerance > 0 else geom
+    if simplified.is_empty:
+        return []
+    if isinstance(simplified, Polygon):
+        return [simplified]
+    return [g for g in getattr(simplified, 'geoms', []) if isinstance(g, Polygon) and not g.is_empty]
+
+
+def _rings_of(poly: Polygon) -> Optional[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]]:
+    ext = [(float(x), float(y)) for x, y in poly.exterior.coords[:-1]]
+    if len(ext) < 3:
+        return None
+    holes: List[List[Tuple[float, float]]] = []
+    for interior in poly.interiors:
+        ring = [(float(x), float(y)) for x, y in interior.coords[:-1]]
+        if len(ring) >= 3:
+            holes.append(ring)
+    return ext, holes
 
 
 def _encode_ring(ring: Sequence[Tuple[float, float]]) -> bytes:
@@ -566,16 +1072,125 @@ def _encode_ring(ring: Sequence[Tuple[float, float]]) -> bytes:
     return out
 
 
-def encode_lvr(
+def clip_inland_bodies(
+    bodies: Sequence[WaterBody],
+    b: Bounds,
+    tolerance: float,
+) -> List[Tuple[Optional[float], List[Tuple[float, float]], List[List[Tuple[float, float]]]]]:
+    """Clip inland bodies to a tile, carrying each body's surface height along.
+
+    The height is resolved once per body, over its whole perimeter, and then
+    stamped onto every clipped piece. That is what keeps a lake spanning four
+    tiles - or the same lake rebuilt at four zoom levels - at a single height,
+    so it cannot step or crack along a seam.
+    """
+    tile_box = box(b.west, b.south, b.east, b.north)
+    out: List[Tuple[Optional[float], List[Tuple[float, float]], List[List[Tuple[float, float]]]]] = []
+    for body in bodies:
+        minx, miny, maxx, maxy = body.geom.bounds
+        if maxx < b.west or minx > b.east or maxy < b.south or miny > b.north:
+            continue
+        clipped = body.geom.intersection(tile_box)
+        if clipped.is_empty:
+            continue
+        if isinstance(clipped, Polygon):
+            geoms: Sequence[Polygon] = [clipped]
+        elif isinstance(clipped, MultiPolygon):
+            geoms = list(clipped.geoms)
+        else:
+            geoms = [g for g in getattr(clipped, 'geoms', []) if isinstance(g, Polygon)]
+        for geom in geoms:
+            if geom.is_empty:
+                continue
+            for poly in _simplified_parts(geom, tolerance):
+                rings = _rings_of(poly)
+                if rings is not None:
+                    out.append((body.height, rings[0], rings[1]))
+    return out
+
+
+def clip_watercourses(
+    courses: Sequence[Watercourse],
+    b: Bounds,
+    tolerance: float,
+) -> List[Tuple[float, List[Tuple[float, float]]]]:
+    """Clip watercourse centrelines to a tile as (width_m, points) runs.
+
+    A line crossing a tile corner comes back as several runs, and each is kept
+    separately rather than joined: they are strokes, and a stroke joined across
+    ground it does not cover would draw a river through the land between.
+
+    The clip is to the tile box exactly, with no margin. The stroke is drawn on
+    the tile's own mesh, so a run reaching past the border would be drawn twice
+    - once by each tile - at two different terrain heights.
+    """
+    tile_box = box(b.west, b.south, b.east, b.north)
+    out: List[Tuple[float, List[Tuple[float, float]]]] = []
+    for course in courses:
+        minx, miny, maxx, maxy = course.line.bounds
+        if maxx < b.west or minx > b.east or maxy < b.south or miny > b.north:
+            continue
+        try:
+            clipped = course.line.intersection(tile_box)
+        except Exception:
+            continue
+        if clipped.is_empty:
+            continue
+        parts = ([clipped] if isinstance(clipped, LineString)
+                 else [g for g in getattr(clipped, 'geoms', [])
+                       if isinstance(g, LineString)])
+        for part in parts:
+            if tolerance > 0:
+                part = part.simplify(tolerance, preserve_topology=False)
+            pts = [(float(x), float(y)) for x, y in part.coords]
+            if len(pts) >= 2:
+                out.append((course.width_m, pts))
+    return out
+
+
+def _encode_polys(
     polys: Sequence[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]],
 ) -> bytes:
-    payload = bytearray(LVR_MAGIC)
-    payload += struct.pack('<H', len(polys))
+    out = struct.pack('<H', len(polys))
     for ext, holes in polys:
+        out += struct.pack('<H', 1 + len(holes))
+        out += _encode_ring(ext)
+        for hole in holes:
+            out += _encode_ring(hole)
+    return out
+
+
+def encode_lvr(
+    polys: Sequence[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]],
+    inland: Sequence[Tuple[Optional[float], List[Tuple[float, float]], List[List[Tuple[float, float]]]]] = (),
+    lines: Sequence[Tuple[float, List[Tuple[float, float]]]] = (),
+) -> bytes:
+    """LVR3 with watercourses, LVR2 with inland water, LVR1 with neither.
+
+    The version is the highest layer the tile actually has something in, so a
+    tile with no lake and no river stays LVR1 and byte-identical to what is
+    already baked - adding a layer re-writes only the tiles it has something to
+    say about.
+
+    A body with no resolved height writes NaN, which the mesh bake reads as
+    "follow the DEM" - the same treatment flowing water gets.
+    """
+    if not inland and not lines:
+        return zlib.compress(bytes(bytearray(LVR_MAGIC) + _encode_polys(polys)), 6)
+    payload = bytearray(LVR3_MAGIC if lines else LVR2_MAGIC)
+    payload += _encode_polys(polys)
+    payload += struct.pack('<H', len(inland))
+    for height, ext, holes in inland:
+        payload += struct.pack('<f', float('nan') if height is None else float(height))
         payload += struct.pack('<H', 1 + len(holes))
         payload += _encode_ring(ext)
         for hole in holes:
             payload += _encode_ring(hole)
+    if lines:
+        payload += struct.pack('<H', len(lines))
+        for width_m, pts in lines:
+            payload += struct.pack('<f', float(width_m))
+            payload += _encode_ring(pts)
     return zlib.compress(bytes(payload), 6)
 
 
@@ -617,20 +1232,65 @@ def bake(args: argparse.Namespace) -> int:
     min_zoom = manifest.get('minZoom', 0)
     max_zoom = manifest.get('maxZoom', 12)
     cov = manifest.get('coverage', {})
-    bbox = parse_bbox(args.bbox) if args.bbox else Bounds(
+    asked = parse_bbox(args.bbox) if args.bbox else Bounds(
         cov['west'], cov['south'], cov['east'], cov['north'],
     )
+    # Whole tiles only: a tile the bbox cuts through would be written land on
+    # one side and open sea on the other, over whatever was baked there before.
+    bbox = snap_bounds_to_tiles(asked, max_zoom)
 
     print(f'coverage    lon [{bbox.west:.5f}, {bbox.east:.5f}] '
           f'lat [{bbox.south:.5f}, {bbox.north:.5f}]')
+    if bbox != asked:
+        print(f'            snapped out to whole zoom-{max_zoom} tiles from '
+              f'lon [{asked.west:.5f}, {asked.east:.5f}] '
+              f'lat [{asked.south:.5f}, {asked.north:.5f}]')
     print(f'zoom        {min_zoom}..{max_zoom}  tileSize={tile_size}')
 
-    land = assemble_land(bbox, args)
+    land, inland, courses = assemble_land(bbox, args)
     if land.is_empty:
         print('error: no land polygons assembled — check bbox / OSM data', file=sys.stderr)
         return 2
+
+    # A mainland coast that fails to close comes out as a handful of islets
+    # rather than as nothing, so `is_empty` above does not catch it and the
+    # bake writes an entire region as open ocean.
+    #
+    # It happens because Overpass returns only the coastline ways that touch
+    # the bbox: a chain that leaves and re-enters loses the segment between,
+    # and `polygonize` cannot close a face across the gap. Crimea landed at
+    # 0.000005 of 4.797 deg² this way - 504 coastline ways in, one polygon the
+    # size of the whole bbox out, every tile open water.
+    #
+    # Islands close on themselves and are unaffected, which is why the Canaries
+    # have always baked correctly through this path.
+    land_fraction = land.area / max(bbox.as_box().area, 1e-12)
+    if land_fraction < MIN_PLAUSIBLE_LAND_FRACTION and not args.allow_tiny_land:
+        print(f'error: assembled land covers {land_fraction * 100:.4f}% of the bbox, which',
+              file=sys.stderr)
+        print('       reads as a coastline that did not close rather than an empty sea.',
+              file=sys.stderr)
+        print('       Build land polygons with osmcoastline and pass --land-shp or --pbf;',
+              file=sys.stderr)
+        print("       see the priority order in this file's docstring.", file=sys.stderr)
+        print('       Pass --allow-tiny-land if the bbox really is almost all water.',
+              file=sys.stderr)
+        return 2
     land_prep = prep(land)
     print(f'land area   {land.area:.6f} deg²')
+
+    # Inland surface heights come off the DEM that was merged in before this
+    # stage ran, so the pyramid is already on disk to read.
+    if inland:
+        cell_deg = (180.0 / (1 << max_zoom)) / max(1, tile_size - 1)
+        dem = DemSampler(out_dir, max_zoom, tile_size)
+        flat_count = sum(1 for b in inland if b.flat)
+        resolved = resolve_body_heights(inland, dem, cell_deg, manifest.get('seaLevel', 0.0))
+        print(f'inland      {len(inland)} bodies ({flat_count} flat, '
+              f'{len(inland) - flat_count} flowing), {resolved} heights resolved')
+        if resolved < flat_count:
+            print(f'            {flat_count - resolved} flat bodies had no DEM '
+                  f'underneath — baked as flowing water')
 
     index_path = os.path.join(out_dir, manifest.get('indexPath', 'index.bin'))
     pdm_tiles = scan_pdm_tiles(out_dir, min_zoom, max_zoom)
@@ -669,6 +1329,7 @@ def bake(args: argparse.Namespace) -> int:
     total_lvr_bytes = 0
     total_tiles = 0
     total_lvr_tiles = 0
+    total_lines = 0
 
     for i, (x, y) in enumerate(sorted(max_tiles)):
         b = tile_bounds(max_zoom, x, y)
@@ -683,17 +1344,23 @@ def bake(args: argparse.Namespace) -> int:
         written = 0
         lvr_written = 0
         tol = vector_simplify_tol(z, max_zoom, tile_size)
+        line_tol = ((180.0 / (1 << z)) / max(1, tile_size - 1)) * LINE_SIMPLIFY_CELLS
         for (x, y), grid in sorted(level_grids.items()):
             b = tile_bounds(z, x, y)
             total_bytes += write_lwm(out_dir, z, x, y, encode_lwm(bytes(grid), tile_size))
             polys = clip_vector_polys(land, b, tol)
-            if polys:
-                total_lvr_bytes += write_lvr(out_dir, z, x, y, encode_lvr(polys))
+            inland_polys = clip_inland_bodies(inland, b, tol) if inland else []
+            lines = clip_watercourses(courses, b, line_tol) if courses else []
+            if polys or inland_polys or lines:
+                total_lvr_bytes += write_lvr(
+                    out_dir, z, x, y, encode_lvr(polys, inland_polys, lines))
                 lvr_written += 1
+                total_lines += len(lines)
             total_tiles += 1
             written += 1
         total_lvr_tiles += lvr_written
-        print(f'level {z:2d}    wrote {written} .lwm + {lvr_written} .lvr tiles', flush=True)
+        print(f'level {z:2d}    wrote {written} .lwm + {lvr_written} .lvr tiles',
+              flush=True)
         if z == min_zoom:
             break
         parents: Dict[Tuple[int, int], bytearray] = {}
@@ -747,6 +1414,8 @@ def bake(args: argparse.Namespace) -> int:
 
     print(f'\nwrote {total_tiles} coast tiles, {total_bytes / (1024 * 1024):.1f} MB (.lwm)')
     print(f'wrote {total_lvr_tiles} vector tiles, {total_lvr_bytes / (1024 * 1024):.1f} MB (.lvr)')
+    if courses:
+        print(f'wrote {total_lines} watercourse strokes from {len(courses)} centrelines')
     print(f'updated {manifest_path} (version 3 + coastMask)')
     print(f'done in {time.time() - started:.1f}s')
     return 0
@@ -760,6 +1429,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument('--bbox', help='west,south,east,north degrees (default: manifest coverage)')
     parser.add_argument('--pbf', help='regional OSM PBF for osmcoastline')
     parser.add_argument('--land-shp', help='pre-built land polygons shapefile (osmcoastline output)')
+    parser.add_argument('--allow-tiny-land', action='store_true',
+                        help='accept a bbox that really is almost all water')
+    parser.add_argument('--refresh-osm', action='store_true',
+                        help='ignore the cached Overpass response and re-fetch')
     parser.add_argument('--include-ocean-tiles', action='store_true',
                         help='also bake every tile in the bbox at max zoom (slow; default: PDM tiles only)')
     raw = list(argv) if argv is not None else sys.argv[1:]

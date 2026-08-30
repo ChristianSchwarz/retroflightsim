@@ -224,3 +224,219 @@ describe('shoreline feeding the decimator', () => {
         }
     });
 });
+
+describe('inland water classification', () => {
+    /** A rectangle in grid space, as an inland body at the given height. */
+    function inlandRect(
+        x0: number, y0: number, x1: number, y1: number, surfaceHeightM?: number,
+    ) {
+        const { exterior } = ringFromGrid([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
+        return { exterior, holes: [], surfaceHeightM };
+    }
+
+    it('marks nodes inside a body, and leaves everything else alone', () => {
+        const s = buildShoreline({
+            polygons: [],
+            inland: [inlandRect(8, 8, 16, 16, 912.5)],
+            bounds: BOUNDS,
+            size: SIZE,
+        });
+        const wet = s.inlandNodes.reduce((n, v) => n + v, 0);
+        assert.ok(wet > 0, 'no nodes classified as inland water');
+        // Interior of the rect is wet; a corner of the tile is not.
+        assert.equal(s.inlandNodes[12 * SIZE + 12], 1);
+        assert.equal(s.inlandNodes[0], 0);
+        assert.equal(s.inlandHeights[12 * SIZE + 12], 912.5);
+    });
+
+    it('gives a body with no measured height a NaN surface, not zero', () => {
+        // NaN is what tells the mesh bake to follow the terrain. Zero would be
+        // sea level, which is the bug this layer exists to fix.
+        const s = buildShoreline({
+            polygons: [],
+            inland: [inlandRect(8, 8, 16, 16)],
+            bounds: BOUNDS,
+            size: SIZE,
+        });
+        assert.equal(s.inlandNodes[12 * SIZE + 12], 1);
+        assert.ok(Number.isNaN(s.inlandHeights[12 * SIZE + 12]));
+    });
+
+    it('keeps two bodies at their own heights instead of merging them', () => {
+        const s = buildShoreline({
+            polygons: [],
+            inland: [inlandRect(2, 2, 10, 10, 100), inlandRect(20, 20, 30, 30, 500)],
+            bounds: BOUNDS,
+            size: SIZE,
+        });
+        assert.equal(s.inlandHeights[6 * SIZE + 6], 100);
+        assert.equal(s.inlandHeights[25 * SIZE + 25], 500);
+    });
+
+    it('reports no inland water when none is supplied', () => {
+        const s = buildShoreline({ polygons: [], bounds: BOUNDS, size: SIZE });
+        assert.equal(s.inlandNodes.reduce((n, v) => n + v, 0), 0);
+    });
+});
+
+describe('inland water against a simplified land ring', () => {
+    /**
+     * A many-sided circle in grid space, as lon/lat.
+     *
+     * `n` and `phase` exist so the same shore can be produced as two different
+     * vertex lists. That is what the real bake hands us: the land ring's hole
+     * comes out of a shapely difference and the body's exterior comes straight
+     * off OSM, so they describe one boundary with different vertices — and
+     * Douglas-Peucker then moves them apart.
+     */
+    function circle(cx: number, cy: number, r: number, n = 64, phase = 0) {
+        const cells = SIZE - 1;
+        return Array.from({ length: n }, (_, i) => {
+            const a = (i / n) * Math.PI * 2 + phase;
+            const gx = cx + Math.cos(a) * r;
+            const gy = cy + Math.sin(a) * r;
+            return {
+                lon: BOUNDS.west + (gx / cells) * (BOUNDS.east - BOUNDS.west),
+                lat: BOUNDS.north - (gy / cells) * (BOUNDS.north - BOUNDS.south),
+            };
+        });
+    }
+
+    it('leaves no node inside the body unclaimed when the rings are simplified', () => {
+        // The regression this guards. A lake's shore reaches buildShoreline
+        // twice — as a hole in the land ring and as the body's own exterior.
+        // Simplifying both independently moved them apart, and every node in
+        // the band between fell through to the open-ocean default and was baked
+        // at sea level. On the Colorado that split a 750 m river into segments
+        // with 750 m holes between them.
+        const lake = circle(16, 16, 8, 64);
+        // The same circle, discretised differently — as the two stages do.
+        const lakeAsHole = circle(16, 16, 8, 51, 0.03);
+        const land: CoastPolygon = {
+            exterior: [
+                { lon: BOUNDS.west - 1, lat: BOUNDS.north + 1 },
+                { lon: BOUNDS.east + 1, lat: BOUNDS.north + 1 },
+                { lon: BOUNDS.east + 1, lat: BOUNDS.south - 1 },
+                { lon: BOUNDS.west - 1, lat: BOUNDS.south - 1 },
+            ],
+            holes: [lakeAsHole],
+        };
+        const s = buildShoreline({
+            polygons: [land],
+            inland: [{ exterior: lake, holes: [], surfaceHeightM: 800 }],
+            bounds: BOUNDS,
+            size: SIZE,
+            simplifyCells: 2,
+        });
+        let unclaimed = 0;
+        for (let i = 0; i < SIZE * SIZE; i++) {
+            if (!s.landNodes[i] && !s.inlandNodes[i]) {
+                unclaimed++;
+            }
+        }
+        assert.equal(unclaimed, 0,
+            `${unclaimed} nodes are neither land nor inland water; each one bakes at sea level`);
+    });
+
+    it('keeps water where a simplified land ring swallowed it', () => {
+        // Simplifying a *hole* shrinks it, so bands of a lake get taken back
+        // into the land polygon and the tile grows no water there at all. While
+        // inland water sat at sea level this hid inside a 750 m slot; at its
+        // own height the body reads as chopped into pieces by terrain.
+        const lake = circle(16, 16, 8, 64);
+        const lakeAsHole = circle(16, 16, 8, 51, 0.03);
+        const s = buildShoreline({
+            polygons: [{
+                exterior: [
+                    { lon: BOUNDS.west - 1, lat: BOUNDS.north + 1 },
+                    { lon: BOUNDS.east + 1, lat: BOUNDS.north + 1 },
+                    { lon: BOUNDS.east + 1, lat: BOUNDS.south - 1 },
+                    { lon: BOUNDS.west - 1, lat: BOUNDS.south - 1 },
+                ],
+                holes: [lakeAsHole],
+            }],
+            inland: [{ exterior: lake, holes: [], surfaceHeightM: 800 }],
+            bounds: BOUNDS,
+            size: SIZE,
+            simplifyCells: 2,
+        });
+        // Every node the body claims must be water, or the mesh has a hole in
+        // the lake that the terrain shows through.
+        let claimedButLand = 0;
+        for (let i = 0; i < SIZE * SIZE; i++) {
+            if (s.inlandNodes[i] && s.landNodes[i]) {
+                claimedButLand++;
+            }
+        }
+        assert.equal(claimedButLand, 0,
+            `${claimedButLand} inland-water nodes are also land; each one is a gap in the body`);
+    });
+
+    it('still gives every claimed node the body height', () => {
+        const lake = circle(16, 16, 8);
+        const s = buildShoreline({
+            polygons: [{
+                exterior: [
+                    { lon: BOUNDS.west - 1, lat: BOUNDS.north + 1 },
+                    { lon: BOUNDS.east + 1, lat: BOUNDS.north + 1 },
+                    { lon: BOUNDS.east + 1, lat: BOUNDS.south - 1 },
+                    { lon: BOUNDS.west - 1, lat: BOUNDS.south - 1 },
+                ],
+                holes: [lake],
+            }],
+            inland: [{ exterior: lake, holes: [], surfaceHeightM: 800 }],
+            bounds: BOUNDS,
+            size: SIZE,
+            simplifyCells: 2,
+        });
+        for (let i = 0; i < SIZE * SIZE; i++) {
+            if (s.inlandNodes[i]) {
+                assert.equal(s.inlandHeights[i], 800);
+            }
+        }
+    });
+
+    it('resolves a block centred on a lake as water, not land', () => {
+        // The land ring here has no hole at all — the state the simplification
+        // leaves behind when it swallows a small body. The node grid says water
+        // and centreIsLand must agree, because the decimator uses it to break
+        // the tie on saddle cells and would otherwise cut the shoreline against
+        // the answer the classification already rejected.
+        const lake = circle(16, 16, 6);
+        const s = buildShoreline({
+            polygons: [{
+                exterior: [
+                    { lon: BOUNDS.west - 1, lat: BOUNDS.north + 1 },
+                    { lon: BOUNDS.east + 1, lat: BOUNDS.north + 1 },
+                    { lon: BOUNDS.east + 1, lat: BOUNDS.south - 1 },
+                    { lon: BOUNDS.west - 1, lat: BOUNDS.south - 1 },
+                ],
+                holes: [],
+            }],
+            inland: [{ exterior: lake, holes: [], surfaceHeightM: 800 }],
+            bounds: BOUNDS,
+            size: SIZE,
+            simplifyCells: 2,
+        });
+        // Block (14,14) of size 4 has its centre exactly on the lake centre.
+        assert.equal(s.centreIsLand(14, 14, 4), false);
+        // ...and dry ground well away from it is still land.
+        assert.equal(s.centreIsLand(1, 1, 2), true);
+    });
+
+    it('does not walk a lake height out across open water', () => {
+        // The gap fill reads from a snapshot, so it cannot cascade. An ocean
+        // tile with one lake in it must stay mostly ocean.
+        const lake = circle(16, 16, 4);
+        const s = buildShoreline({
+            polygons: [],
+            inland: [{ exterior: lake, holes: [], surfaceHeightM: 800 }],
+            bounds: BOUNDS,
+            size: SIZE,
+            simplifyCells: 2,
+        });
+        const wet = s.inlandNodes.reduce((n, v) => n + v, 0);
+        assert.ok(wet < SIZE * SIZE / 4,
+            `${wet} of ${SIZE * SIZE} nodes claimed by one small lake; the fill cascaded`);
+    });
+});

@@ -5,21 +5,27 @@
  *   1. classify nodes and locate shoreline crossings   (shoreline.ts)
  *   2. decimate into a restricted quadtree and cut the coast  (decimate.ts)
  *   3. enforce the triangle budget by coarsening and retrying
- *   4. project grid space -> geodetic -> ECEF -> tile-local ENU
- *   5. apply the airbase flatten pad and the ocean depth bias
+ *   4. project grid space -> geodetic -> ECEF -> tile-local scene axes
+ *   5. apply the airbase flatten pad, the water surface and the depth bias
  *   6. sample the cover raster per facet, build skirts, split the streams
  *   7. encode                                              (ptm.ts)
  *
  * Everything the output depends on is fixed at build time, which is the whole
  * point: there is no runtime equivalent of this file, and no fallback path.
+ *
+ * Step 4 lands in *scene* axes, not raw ENU: x = east, y = up, z = **south**.
+ * The runtime binds these vertices to the GPU untouched, so the frame they are
+ * written in is the frame they are drawn in, and a left-handed one would draw
+ * the whole planet as its own mirror image. See `sceneFromEnu` in geodesy.ts.
  */
 
 import { EnuBasis, Ecef, Enu, ecefToEnu, geodeticToEcef } from '../../src/script/terrain/geodesy';
 import { FlattenPad, applyFlattenPad } from '../../src/script/terrain/flattenPad';
 import { CLASS_TO_TONE, TerrainClass, TerrainTone } from '../../src/script/terrain/tones';
-import { PtmTileId, encodePtm } from '../../src/script/terrain/ptm';
+import { PTM_MAX_RIVER_VERTS, PtmTileId, encodePtm } from '../../src/script/terrain/ptm';
 import { GridTriangle, decimate } from './decimate';
-import { CoastPolygon, LonLatBounds, buildShoreline } from './shoreline';
+import { CoastPolygon, InlandPolygon, LonLatBounds, buildShoreline } from './shoreline';
+import { Watercourse } from './lvr';
 
 /** Heights at or below seaLevel + this are open water. Matches the old bake. */
 export const WATER_HEIGHT_EPS_M = 0.5;
@@ -56,6 +62,30 @@ const DRY_SEARCH_CELLS = 4;
 /** Skirt tops sit this far below the surface so they cannot z-fight it. */
 export const SKIRT_TOP_EPS_M = 0.05;
 
+/** How far past the triangle budget the shoreline may push before coarsening. */
+export const COAST_BUDGET_CEILING = 3;
+
+/**
+ * Spacing, in grid cells, at which a watercourse centreline is resampled
+ * before it is draped.
+ *
+ * One cell, because that is the finest the terrain under it can vary: sampling
+ * closer buys nothing the surface can show, and sampling coarser lets the
+ * stroke cut a chord across a valley the river actually goes round.
+ */
+const RIVER_SAMPLE_CELLS = 1;
+
+/**
+ * Cap on the subdivisions one OSM segment may produce.
+ *
+ * A backstop, not a budget: a way with two nodes a degree apart would
+ * otherwise resample into tens of thousands of points on a coarse tile.
+ */
+const RIVER_MAX_SUBDIVISIONS = 512;
+
+/** How far a watercourse stroke floats above the surface, in grid cells. */
+const RIVER_LIFT_CELLS = 0.05;
+
 /**
  * Observed ground cover on the tile's own grid, written by
  * tools/bake_planet_cover.py and decoded by tools/bake/plc.ts.
@@ -83,6 +113,12 @@ export interface BuildTileInput {
     skirtDepthM: number;
     basis: EnuBasis;
     polygons?: CoastPolygon[];
+    /**
+     * Inland water for this tile. Omit and every non-land node is open ocean,
+     * which is what the bake did before lakes and rivers had a height of their
+     * own — and what still happens for an LVR1 tile.
+     */
+    inland?: InlandPolygon[];
     /** Douglas-Peucker tolerance in grid cells. */
     simplifyCells?: number;
     minLeafSize?: number;
@@ -97,6 +133,14 @@ export interface BuildTileInput {
     pads?: Array<FlattenPad & { basis: EnuBasis; lat: number; lon: number }>;
     /** Observed cover. Omit and every land facet falls back to plain grass. */
     cover?: TileCover;
+    /**
+     * Watercourse centrelines for this tile, at true width.
+     *
+     * Drawn as a stroke over the finished surface rather than cut into it —
+     * see section 6b — which is what lets a canal far narrower than a grid
+     * cell reach the screen at all.
+     */
+    watercourses?: Watercourse[];
 }
 
 export interface BuildTileResult {
@@ -104,6 +148,7 @@ export interface BuildTileResult {
     triangleCount: number;
     landTriangles: number;
     waterTriangles: number;
+    riverTriangles: number;
     /** Tolerance actually used after any budget coarsening. */
     maxErrorM: number;
     minLeafSize: number;
@@ -117,6 +162,19 @@ export interface BuildTileResult {
 const _ecef: Ecef = { x: 0, y: 0, z: 0 };
 const _enu: Enu = { e: 0, n: 0, u: 0 };
 const _padEnu: Enu = { e: 0, n: 0, u: 0 };
+
+/**
+ * Offsets around a node, nearest first, as flat x,y pairs.
+ *
+ * Used to find the inland body a shoreline vertex belongs to. One ring is
+ * enough: a crossing is always on an edge of the cell it was cut from, so the
+ * body it borders is never more than one node away.
+ */
+const NEIGHBOURHOOD = [
+    0, 0,
+    1, 0, -1, 0, 0, 1, 0, -1,
+    1, 1, 1, -1, -1, 1, -1, -1,
+];
 
 /**
  * Half-spans of a pad in degrees, with a margin.
@@ -210,6 +268,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
 
     const shoreline = buildShoreline({
         polygons: input.polygons ?? [],
+        inland: input.inland,
         bounds,
         size,
         simplifyCells: input.simplifyCells,
@@ -231,6 +290,20 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     const HUGE_ERROR_M = 1e9;
     /** Fraction of the budget the coast may claim before interior detail. */
     const COAST_SHARE = 0.8;
+    /*
+     * How far past the budget the shoreline may push before it is coarsened.
+     *
+     * The cut is worth overspending on - coarsening it is what turned rivers
+     * into dashed lines - but not without limit. The runtime governs frame time
+     * by coarsening LOD globally (TARGET_FRAME_MS, DETAIL_SCALE_MAX) and paces
+     * uploads by time rather than count (TILE_UPLOAD_BUDGET_MS), so one
+     * enormous tile does not merely cost itself: it coarsens the whole scene
+     * around it and slows everything into view behind it.
+     *
+     * Unbounded, a Crimea bake put a tile at 60386 triangles, ten times the
+     * budget. At 3x, every river tile measured (11970-15439) keeps its full
+     * resolution cut and only the pathological ones give way.
+     */
 
     let attempts = 0;
     const run = (err: number, leaf: number) => {
@@ -254,9 +327,27 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     if (!budget) {
         tris = run(maxErrorM, minLeafSize).triangles;
     } else {
-        // 1. Finest shoreline that leaves room for some interior.
+        // 1. The shoreline is cut at full resolution, at every zoom level, and
+        //    the budget is met out of the interior alone.
+        //
+        //    It used to coarsen the leaf size here until the coast fitted, and
+        //    that is what broke the rivers. A watercourse two or three nodes
+        //    across sits inside a four- or eight-cell leaf without reaching its
+        //    corners, so `cutCell` resolves the leaf as land and the river comes
+        //    out as a dashed line. Measured on Crimea: the classification is
+        //    perfect at every level - 100% of every river's nodes wet, one piece
+        //    per body - and it is decimation alone that breaks it, into a mean
+        //    of 5.5 pieces with 52% of the area drawn.
+        //
+        //    Widening the rivers cannot fix that, and made it worse: the extra
+        //    shoreline bought more coarsening, so the rivers came out in more
+        //    pieces than before. The cut is the thing that has to survive.
+        //
+        //    A tile whose shoreline alone exceeds the budget goes over it
+        //    rather than dropping detail the water needs - up to
+        //    COAST_BUDGET_CEILING, past which even the cut has to give way.
         let coastOnly = run(HUGE_ERROR_M, minLeafSize);
-        while (costWithSkirts(coastOnly.triangles, cells) > budget * COAST_SHARE
+        while (costWithSkirts(coastOnly.triangles, cells) > budget * COAST_BUDGET_CEILING
             && minLeafSize < cells) {
             minLeafSize *= 2;
             coastOnly = run(HUGE_ERROR_M, minLeafSize);
@@ -294,6 +385,47 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
                 }
             }
             maxErrorM = hi;
+        }
+        // Spend whatever the interior did not need back on the coast.
+        //
+        // COAST_SHARE is a *reservation*, not a cap, and treating it as a cap
+        // wastes the budget wherever the terrain is flat and the water complex.
+        // Measured on a Berlin lake tile: the coast fits at a 4-cell leaf for
+        // 5794 triangles, but that is over the 80% gate, so it was cut at an
+        // 8-cell leaf instead — a 96 m shoreline on 12 m cells — and the tile
+        // came out at 2942 triangles, using 48% of the budget it was given.
+        //
+        // So: having reserved room for the interior, walk back down as long as
+        // the *total* still fits. The shoreline is the visible half.
+        while (minLeafSize > 1) {
+            const finer = minLeafSize / 2;
+            const candidate = run(maxErrorM, finer);
+            if (costWithSkirts(candidate.triangles, cells) <= budget) {
+                best = candidate;
+                minLeafSize = finer;
+                continue;
+            }
+            // The interior cannot come along at this tolerance. Coarsen it
+            // until it can rather than dropping it: on mountainous coast the
+            // height detail is worth something, and going straight to a
+            // coast-only tile would throw all of it away for one step of
+            // shoreline.
+            let err = maxErrorM > 0 && Number.isFinite(maxErrorM) ? maxErrorM : 1;
+            let fitted: ReturnType<typeof run> | undefined;
+            for (let i = 0; i < 24 && !fitted; i++) {
+                err *= 2;
+                const r = run(err, finer);
+                if (costWithSkirts(r.triangles, cells) <= budget) {
+                    fitted = r;
+                }
+            }
+            if (fitted) {
+                best = fitted;
+                minLeafSize = finer;
+                maxErrorM = err;
+                continue;
+            }
+            break;
         }
         tris = best.triangles;
     }
@@ -350,6 +482,69 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         return inlandCells[y * size + x] * metresPerCell;
     };
 
+    /**
+     * The inland body under a grid point, given as its surface height.
+     *
+     * undefined where there is no inland water; NaN where there is a body that
+     * follows the DEM rather than sitting at one height.
+     *
+     * Searched over the nodes *around* the point, nearest first, rather than at
+     * the point itself. A water vertex is either an interior node - which
+     * answers for itself - or a shoreline crossing sitting on a cell edge
+     * between a wet node and a dry one. Crossings within SNAP_EPS of a corner
+     * are snapped onto it, and that corner can be the dry one, on the far side
+     * of the body from any wet node the cell contains. Looking only at the cell
+     * would then answer "no inland water here" and drop the rim of the lake to
+     * sea level - which is the exact bug this code exists to remove.
+     *
+     * Nearest first so that a vertex between two bodies takes the height of the
+     * one it is actually on.
+     */
+    const inlandSurfaceAt = (gx: number, gy: number): number | undefined => {
+        const cx = Math.min(size - 1, Math.max(0, Math.round(gx)));
+        const cy = Math.min(size - 1, Math.max(0, Math.round(gy)));
+        for (let k = 0; k < NEIGHBOURHOOD.length; k += 2) {
+            const x = cx + NEIGHBOURHOOD[k];
+            const y = cy + NEIGHBOURHOOD[k + 1];
+            if (x < 0 || y < 0 || x >= size || y >= size) {
+                continue;
+            }
+            const i = y * size + x;
+            if (shoreline.inlandNodes[i]) {
+                return shoreline.inlandHeights[i];
+            }
+        }
+        return undefined;
+    };
+
+    /**
+     * Height of the water surface at a grid point.
+     *
+     * Open ocean is the sea datum, as it always was. Inland water is either a
+     * measured flat surface — a lake sits at one elevation, and water that is
+     * not level reads as broken from the air — or, where the bake had no single
+     * height to give, the terrain itself. Never sea level: dropping a lake at
+     * 900 m to the sea datum punches a slot through the world, which is the
+     * whole reason this exists.
+     *
+     * At the shoreline a flat body is clamped down to the ground it meets. The
+     * height is chosen to sit under the lowest part of the body's own shore,
+     * but "lowest" is a percentile over the whole perimeter, so a little of
+     * that shore still comes out below the water. Clamping costs the rim its
+     * flatness and buys the one thing that must never happen: water standing
+     * above the ground beside it.
+     */
+    const waterSurfaceAt = (gx: number, gy: number, onShore: boolean): number => {
+        const surface = inlandSurfaceAt(gx, gy);
+        if (surface === undefined) {
+            return seaLevel;
+        }
+        if (!Number.isFinite(surface)) {
+            return sampleHeight(gx, gy);
+        }
+        return onShore ? Math.min(surface, sampleHeight(gx, gy)) : surface;
+    };
+
     /** Grid -> ENU (absolute), including the pad and the water rules. */
     const gridKey = (gx: number, gy: number) => `${gx.toFixed(4)},${gy.toFixed(4)}`;
 
@@ -363,8 +558,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
      * sea level, and OSM coastlines do not follow the DEM's zero contour. On
      * real Canary tiles that was 48 m of mismatch on average and up to 815 m.
      *
-     * Both sides now use sea level at a tagged point, and the ocean depth bias
-     * is skipped there so it cannot reopen the gap by half a metre.
+     * Both sides now use the same water surface at a tagged point — sea level
+     * on the coast, the body's own height inland — and the depth bias is
+     * skipped there so it cannot reopen the gap by half a metre.
      */
     /**
      * Positions of every tagged shoreline vertex.
@@ -400,11 +596,13 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
      * built below. Only the water side changes here, skipping its depth bias at
      * the shoreline so the wall has a single height to meet.
      */
-    const project = (gx: number, gy: number, land: boolean, tagged = false): Enu => {
+    const project = (
+        gx: number, gy: number, land: boolean, tagged = false, dropM = 0,
+    ): Enu => {
         const onShore = isShore(gx, gy, tagged);
         const lon = bounds.west + (gx / cells) * lonSpan;
         const lat = bounds.north - (gy / cells) * latSpan;
-        let h = land ? sampleHeight(gx, gy) : seaLevel;
+        let h = land ? sampleHeight(gx, gy) : waterSurfaceAt(gx, gy, onShore);
         if (!Number.isFinite(h)) {
             h = seaLevel;
         }
@@ -429,16 +627,27 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         } else if (!onShore) {
             h -= WATER_DEPTH_BIAS_M;
         }
+        // Dropped *before* the projection, so the vertex falls along the local
+        // ellipsoid normal. Subtracting from the resulting ENU u instead only
+        // means "down" near the frame's own origin — see the skirt loop.
+        h -= dropM;
         geodeticToEcef(lat, lon, h, _ecef);
         ecefToEnu(basis, _ecef, _enu);
         return { e: _enu.e, n: _enu.n, u: _enu.u };
     };
 
-    /** Sea-level ENU at a grid point: the foot of a shore wall. */
-    const projectSeaLevel = (gx: number, gy: number): Enu => {
+    /**
+     * Water-surface ENU at a grid point: the foot of a shore wall.
+     *
+     * Walls are built along shore chords, so this asks for the shoreline
+     * height — the same clamped value the water vertex at that point gets, and
+     * with the depth bias skipped on both sides, which is what lets the wall
+     * and the water meet exactly instead of leaving a half-metre crack.
+     */
+    const projectWaterSurface = (gx: number, gy: number): Enu => {
         const lon = bounds.west + (gx / cells) * lonSpan;
         const lat = bounds.north - (gy / cells) * latSpan;
-        geodeticToEcef(lat, lon, seaLevel, _ecef);
+        geodeticToEcef(lat, lon, waterSurfaceAt(gx, gy, true), _ecef);
         ecefToEnu(basis, _ecef, _enu);
         return { e: _enu.e, n: _enu.n, u: _enu.u };
     };
@@ -462,6 +671,30 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     const centreLat = (bounds.south + bounds.north) / 2;
     geodeticToEcef(centreLat, centreLon, centerHeightM, _ecef);
     const centre = ecefToEnu(basis, _ecef, { e: 0, n: 0, u: 0 });
+
+    // Local up, in this tile's own axes.
+    //
+    // The frame's y axis is the u of an ENU basis centred once at the play
+    // origin, and u is the vertical only near that origin: Berlin is 3400 km
+    // away, where it is ~31 deg off, and the Grand Canyon 9000 km, where it is
+    // ~81 deg off and the sign of y says almost nothing about which way is up.
+    // Orienting normals on that sign turned a large share of them into the
+    // ground, and the fixed-sun shading went with them.
+    //
+    // One direction per tile: across a few kilometres the vertical turns by a
+    // fraction of a degree, far below anything the shading can show.
+    const upAbove = ecefToEnu(
+        basis,
+        geodeticToEcef(centreLat, centreLon, centerHeightM + 1000, { x: 0, y: 0, z: 0 }),
+        { e: 0, n: 0, u: 0 },
+    );
+    const upXRaw = upAbove.e - centre.e;
+    const upYRaw = upAbove.u - centre.u;
+    const upZRaw = centre.n - upAbove.n;
+    const upLen = Math.hypot(upXRaw, upYRaw, upZRaw) || 1;
+    const localUpX = upXRaw / upLen;
+    const localUpY = upYRaw / upLen;
+    const localUpZ = upZRaw / upLen;
 
     // --- 6. cover, streams, skirts ----------------------------------------
     //
@@ -634,7 +867,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         }
         const p = project(gx, gy, false, tagged);
         idx = waterPos.length / 3;
-        waterPos.push(p.e - centre.e, p.u - centre.u, p.n - centre.n);
+        waterPos.push(p.e - centre.e, p.u - centre.u, centre.n - p.n);
         waterKey.set(key, idx);
         return idx;
     };
@@ -643,9 +876,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     const pushLandTriangle = (
         a: Enu, b: Enu, c: Enu, facet: readonly [number, number, number, number],
     ) => {
-        const ax = a.e - centre.e, ay = a.u - centre.u, az = a.n - centre.n;
-        const bx = b.e - centre.e, by = b.u - centre.u, bz = b.n - centre.n;
-        const cx = c.e - centre.e, cy = c.u - centre.u, cz = c.n - centre.n;
+        const ax = a.e - centre.e, ay = a.u - centre.u, az = centre.n - a.n;
+        const bx = b.e - centre.e, by = b.u - centre.u, bz = centre.n - b.n;
+        const cx = c.e - centre.e, cy = c.u - centre.u, cz = centre.n - c.n;
         let nx = (by - ay) * (cz - az) - (bz - az) * (cy - ay);
         let ny = (bz - az) * (cx - ax) - (bx - ax) * (cz - az);
         let nz = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
@@ -656,8 +889,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             nx = 0; ny = 1; nz = 0;
         }
         // Terrain is drawn double-sided, but keep normals pointing up so the
-        // fixed-sun shading is stable.
-        if (ny < 0) {
+        // fixed-sun shading is stable. "Up" is the tile's local vertical, not
+        // the frame's y axis — see localUp above.
+        if (nx * localUpX + ny * localUpY + nz * localUpZ < 0) {
             nx = -nx; ny = -ny; nz = -nz;
         }
         landPos.push(ax, ay, az, bx, by, bz, cx, cy, cz);
@@ -700,13 +934,16 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         (a.x === 0 && b.x === 0) || (a.x === cells && b.x === cells)
         || (a.y === 0 && b.y === 0) || (a.y === cells && b.y === cells);
 
-    // Shore walls. Land keeps its DEM height and water sits at sea level, so
-    // wherever they meet there is a vertical step — often large, because OSM
-    // coastlines and the DEM disagree about where the shore is. Closing it by
-    // moving terrain destroys real geography; closing it with a wall does not.
+    // Shore walls. Land keeps its DEM height while water sits on its own
+    // surface, so wherever they meet there is a vertical step — often large,
+    // because OSM coastlines and the DEM disagree about where the shore is.
+    // Closing it by moving terrain destroys real geography; closing it with a
+    // wall does not.
     //
     // A land triangle edge whose *both* ends are shoreline points is exactly a
-    // shore chord, so drop a quad from it to sea level.
+    // shore chord, so drop a quad from it to the water surface below. Inland
+    // that step is usually small — a lake is measured against its own shore —
+    // and the "nothing to close" test below drops the wall entirely.
     for (const t of tris) {
         if (!t.land) {
             continue;
@@ -719,9 +956,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             }
             const topA = project(a.x, a.y, true, a.shore);
             const topB = project(b.x, b.y, true, b.shore);
-            const botA = projectSeaLevel(a.x, a.y);
-            const botB = projectSeaLevel(b.x, b.y);
-            // Nothing to close where the coast really is at sea level.
+            const botA = projectWaterSurface(a.x, a.y);
+            const botB = projectWaterSurface(b.x, b.y);
+            // Nothing to close where the land already meets the water.
             if (Math.abs(topA.u - botA.u) < 0.1 && Math.abs(topB.u - botB.u) < 0.1) {
                 continue;
             }
@@ -733,6 +970,14 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         }
     }
 
+    // Skirts hang along the local vertical, which means re-projecting the
+    // vertex at a lower geodetic height — not subtracting from its ENU u.
+    //
+    // The ENU frame is built once, at the play origin, and the whole planet is
+    // laid out in it. Its u axis is local up only near that origin. Measured on
+    // a Grand Canyon tile, 9000 km away, subtracting skirtDepthM from u moved
+    // the vertex 34 m down and 174 m sideways — the skirt was flung across nine
+    // cells of terrain instead of hanging under the tile edge it seals.
     const skirt = input.skirtDepthM;
     for (const t of tris) {
         for (let e = 0; e < 3; e++) {
@@ -742,12 +987,10 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
                 continue;
             }
             if (t.land) {
-                const pa = project(a.x, a.y, true);
-                const pb = project(b.x, b.y, true);
-                const topA: Enu = { e: pa.e, n: pa.n, u: pa.u - SKIRT_TOP_EPS_M };
-                const topB: Enu = { e: pb.e, n: pb.n, u: pb.u - SKIRT_TOP_EPS_M };
-                const botA: Enu = { e: pa.e, n: pa.n, u: pa.u - skirt };
-                const botB: Enu = { e: pb.e, n: pb.n, u: pb.u - skirt };
+                const topA = project(a.x, a.y, true, false, SKIRT_TOP_EPS_M);
+                const topB = project(b.x, b.y, true, false, SKIRT_TOP_EPS_M);
+                const botA = project(a.x, a.y, true, false, skirt);
+                const botB = project(b.x, b.y, true, false, skirt);
                 const facet = coverOf(t);
                 pushLandTriangle(topA, topB, botB, facet);
                 pushLandTriangle(topA, botB, botA, facet);
@@ -755,23 +998,21 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
                 const ia = waterVertex(a.x, a.y);
                 const ib = waterVertex(b.x, b.y);
                 const key = (gx: number, gy: number) => `skirt:${gx.toFixed(4)},${gy.toFixed(4)}`;
-                const bottom = (gx: number, gy: number, src: number): number => {
+                const bottom = (gx: number, gy: number): number => {
                     const k = key(gx, gy);
                     let idx = waterKey.get(k);
                     if (idx !== undefined) {
                         return idx;
                     }
+                    const p = project(gx, gy, false, false, skirt);
                     idx = waterPos.length / 3;
-                    waterPos.push(
-                        waterPos[src * 3],
-                        waterPos[src * 3 + 1] - skirt,
-                        waterPos[src * 3 + 2],
-                    );
+                    // z is South, not North — see the PTM1 layout in ptm.ts.
+                    waterPos.push(p.e - centre.e, p.u - centre.u, centre.n - p.n);
                     waterKey.set(k, idx);
                     return idx;
                 };
-                const ja = bottom(a.x, a.y, ia);
-                const jb = bottom(b.x, b.y, ib);
+                const ja = bottom(a.x, a.y);
+                const jb = bottom(b.x, b.y);
                 const shore = Math.min(sampleDist(a.x, a.y), sampleDist(b.x, b.y));
                 const tone = shore <= SHALLOW_WATER_COAST_M
                     ? TerrainTone.ShallowWater
@@ -781,6 +1022,215 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
                 waterIdx.push(ia, jb, ja);
                 waterTone.push(tone);
             }
+        }
+    }
+
+    // --- 6b. watercourse strokes ------------------------------------------
+    //
+    // Rivers and canals are drawn as a stroke over the surface rather than cut
+    // into it, because a cut cannot carry them: the shoreline cut samples the
+    // node grid, and a 12 m canal is under one cell at Potsdam z12 and a fifth
+    // of one at z10. Widening it until the grid could hold it was tried and is
+    // the wrong trade — a canal has to read from 20 km and be no wider than it
+    // is from 200 m, and no single width in metres is both.
+    //
+    // So the geometry baked here is the *true* width, and the minimum is left
+    // to the renderer, which knows how many pixels the offset came out as. See
+    // RiverVertProgram.
+    //
+    // Two vertices per centreline point, sharing a position and carrying
+    // opposite unit offsets: the shader is what turns them into a ribbon, so
+    // the ribbon's width is not baked into the positions at all.
+    const riverPos: number[] = [];
+    const riverDir: number[] = [];
+    const riverHalf: number[] = [];
+    const riverIdx: number[] = [];
+
+    /**
+     * The finished triangles, bucketed by grid cell.
+     *
+     * A stroke has to sit on the surface that is *drawn*, not on the DEM it
+     * came from, and those are not the same surface: the interior is decimated
+     * to a vertical tolerance which is 1 m at z12 and 529 m at z10. Draped on
+     * the DEM, a stroke would be buried under half a kilometre of simplified
+     * hillside on a coarse tile.
+     *
+     * Built only for a tile that has a watercourse on it, which is a small
+     * minority of them.
+     */
+    const surfaceBuckets = new Map<number, number[]>();
+    if ((input.watercourses?.length ?? 0) > 0) {
+        for (let t = 0; t < tris.length; t++) {
+            const [a, b, c] = tris[t].pts;
+            const x0 = Math.max(0, Math.floor(Math.min(a.x, b.x, c.x)));
+            const x1 = Math.min(cells - 1, Math.floor(Math.max(a.x, b.x, c.x)));
+            const y0 = Math.max(0, Math.floor(Math.min(a.y, b.y, c.y)));
+            const y1 = Math.min(cells - 1, Math.floor(Math.max(a.y, b.y, c.y)));
+            for (let row = y0; row <= y1; row++) {
+                for (let col = x0; col <= x1; col++) {
+                    const key = row * cells + col;
+                    const list = surfaceBuckets.get(key);
+                    if (list) {
+                        list.push(t);
+                    } else {
+                        surfaceBuckets.set(key, [t]);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The drawn surface at a grid point, or undefined where nothing covers it.
+     *
+     * The highest of the triangles containing the point, because land and water
+     * overlap along the shoreline and a stroke crossing it belongs on top of
+     * whichever is uppermost — a canal running into a lake must not dive under
+     * the lake's surface at the join.
+     */
+    const surfaceAt = (gx: number, gy: number): Enu | undefined => {
+        const col = Math.min(cells - 1, Math.max(0, Math.floor(gx)));
+        const row = Math.min(cells - 1, Math.max(0, Math.floor(gy)));
+        // The cell the point is in, then its neighbours. Defensive rather
+        // than measured — the Potsdam bake misses none — but a miss is not a
+        // cheap failure: it drops the stroke back onto the DEM, which on a
+        // coarse tile is hundreds of metres under the surface being drawn. The
+        // ring is what covers a centreline clipped to the tile border, where
+        // the conversion back into grid space can land outside the cell that
+        // holds the triangle.
+        const candidates: number[] = [];
+        for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+                const cx = col + dx;
+                const cy = row + dy;
+                if (cx < 0 || cy < 0 || cx >= cells || cy >= cells) {
+                    continue;
+                }
+                const list = surfaceBuckets.get(cy * cells + cx);
+                if (list !== undefined) {
+                    candidates.push(...list);
+                }
+            }
+        }
+        if (candidates.length === 0) {
+            return undefined;
+        }
+        let best: Enu | undefined;
+        let bestUp = -Infinity;
+        // Generous on the barycentric test for the same reason: a point a
+        // rounding error outside its triangle belongs on it, not under it.
+        const EDGE_EPS = 1e-4;
+        for (const t of candidates) {
+            const tri = tris[t];
+            const [p0, p1, p2] = tri.pts;
+            const det = (p1.y - p2.y) * (p0.x - p2.x) + (p2.x - p1.x) * (p0.y - p2.y);
+            if (Math.abs(det) < 1e-12) {
+                continue;
+            }
+            const l0 = ((p1.y - p2.y) * (gx - p2.x) + (p2.x - p1.x) * (gy - p2.y)) / det;
+            const l1 = ((p2.y - p0.y) * (gx - p2.x) + (p0.x - p2.x) * (gy - p2.y)) / det;
+            const l2 = 1 - l0 - l1;
+            if (l0 < -EDGE_EPS || l1 < -EDGE_EPS || l2 < -EDGE_EPS) {
+                continue;
+            }
+            const a = project(p0.x, p0.y, tri.land, p0.shore);
+            const b = project(p1.x, p1.y, tri.land, p1.shore);
+            const c = project(p2.x, p2.y, tri.land, p2.shore);
+            const hit = {
+                e: a.e * l0 + b.e * l1 + c.e * l2,
+                n: a.n * l0 + b.n * l1 + c.n * l2,
+                u: a.u * l0 + b.u * l1 + c.u * l2,
+            };
+            // "Highest" along the tile's own vertical, not the frame's y: see
+            // localUp above for why the two part company far from the origin.
+            const up = (hit.e - centre.e) * localUpX
+                + (hit.u - centre.u) * localUpY
+                + (centre.n - hit.n) * localUpZ;
+            if (up > bestUp) {
+                bestUp = up;
+                best = hit;
+            }
+        }
+        return best;
+    };
+
+    // How far a stroke floats above the surface it lies on.
+    //
+    // Coplanar is not good enough: the stroke and the facet under it are
+    // projected by different vertex programs, so their depths differ by noise
+    // and the pair speckles. A twentieth of a cell is far below anything
+    // visible at the scale the tile is drawn at and far above that noise.
+    const riverLiftM = metresPerCell * RIVER_LIFT_CELLS;
+
+    for (const course of input.watercourses ?? []) {
+        const halfWidthM = Math.max(0.5, course.widthM / 2);
+        // Grid coordinates, resampled so the stroke follows the terrain. An
+        // OSM way can run straight for kilometres between vertices, and a
+        // stroke hung off those two points alone would fly over every valley
+        // in between.
+        const grid: Array<{ x: number; y: number }> = [];
+        const clamp = (v: number) => (v < 0 ? 0 : v > cells ? cells : v);
+        for (const pt of course.points) {
+            // Clamped: the centreline was clipped to the tile in degrees, and
+            // the conversion back can leave an endpoint a rounding error
+            // outside the grid it has to be looked up in.
+            const gx = clamp(((pt.lon - bounds.west) / lonSpan) * cells);
+            const gy = clamp(((bounds.north - pt.lat) / latSpan) * cells);
+            const prev = grid[grid.length - 1];
+            if (prev === undefined) {
+                grid.push({ x: gx, y: gy });
+                continue;
+            }
+            const steps = Math.min(
+                RIVER_MAX_SUBDIVISIONS,
+                Math.ceil(Math.hypot(gx - prev.x, gy - prev.y) / RIVER_SAMPLE_CELLS),
+            );
+            for (let s = 1; s <= steps; s++) {
+                const t = s / steps;
+                grid.push({ x: prev.x + (gx - prev.x) * t, y: prev.y + (gy - prev.y) * t });
+            }
+        }
+        if (grid.length < 2 || riverHalf.length + grid.length * 2 > PTM_MAX_RIVER_VERTS) {
+            continue;
+        }
+        const base = riverHalf.length;
+        for (let i = 0; i < grid.length; i++) {
+            // Tangent from the neighbours, so a bend gets the average of the
+            // two segments meeting there and the ribbon does not kink open.
+            const a = grid[Math.max(0, i - 1)];
+            const b = grid[Math.min(grid.length - 1, i + 1)];
+            const pa = project(a.x, a.y, true);
+            const pb = project(b.x, b.y, true);
+            let tx = (pb.e - pa.e);
+            let ty = (pb.u - pa.u);
+            let tz = (pa.n - pb.n);
+            // Perpendicular in the tile's local horizontal plane: across the
+            // flow, never up it, so the stroke lies on the ground.
+            let px = ty * localUpZ - tz * localUpY;
+            let py = tz * localUpX - tx * localUpZ;
+            let pz = tx * localUpY - ty * localUpX;
+            const plen = Math.hypot(px, py, pz);
+            if (!(plen > 1e-6)) {
+                // A zero-length segment: two OSM nodes at the same place.
+                px = 1; py = 0; pz = 0;
+            } else {
+                px /= plen; py /= plen; pz /= plen;
+            }
+            const p = surfaceAt(grid[i].x, grid[i].y)
+                ?? project(grid[i].x, grid[i].y, true);
+            const ex = p.e - centre.e + localUpX * riverLiftM;
+            const ey = p.u - centre.u + localUpY * riverLiftM;
+            const ez = centre.n - p.n + localUpZ * riverLiftM;
+            riverPos.push(ex, ey, ez, ex, ey, ez);
+            riverDir.push(px, py, pz, -px, -py, -pz);
+            riverHalf.push(halfWidthM, halfWidthM);
+        }
+        for (let i = 0; i + 1 < grid.length; i++) {
+            const l0 = base + i * 2;
+            const r0 = l0 + 1;
+            const l1 = l0 + 2;
+            const r1 = l0 + 3;
+            riverIdx.push(l0, r0, r1, l0, r1, l1);
         }
     }
 
@@ -807,13 +1257,20 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             indices: new Uint32Array(waterIdx),
             tones: new Uint8Array(waterTone),
         },
+        rivers: {
+            positions: new Float32Array(riverPos),
+            directions: new Float32Array(riverDir),
+            halfWidthsM: new Float32Array(riverHalf),
+            indices: new Uint32Array(riverIdx),
+        },
     });
 
     return {
         bytes,
-        triangleCount: landClass.length + waterTone.length,
+        triangleCount: landClass.length + waterTone.length + riverIdx.length / 3,
         landTriangles: landClass.length,
         waterTriangles: waterTone.length,
+        riverTriangles: riverIdx.length / 3,
         maxErrorM,
         minLeafSize,
         attempts,

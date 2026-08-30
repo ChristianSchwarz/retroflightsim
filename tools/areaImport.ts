@@ -36,6 +36,50 @@ const OSM_MAX_ZOOM = 12;
 /** Matches --max-span in tools/fetch_planet_dem.py. */
 const MAX_SPAN_DEG = 3;
 
+/**
+ * Zoom whose tile edges an import is snapped to.
+ *
+ * The finest the pyramid goes. `fetch_planet_dem.py` derives max zoom from the
+ * source pixel and its 1 arcsec default lands on 12, which is also what the
+ * tracked Canaries DEM bakes to.
+ */
+const SNAP_ZOOM = 12;
+
+/**
+ * Grow a hand-drawn box outwards onto whole tile edges.
+ *
+ * Every stage writes whole tiles. A stage whose sources stop halfway across one
+ * still writes all of it, and what it writes over the half it has no data for
+ * is not "nothing" — it is open ocean for the coast bake and unknown cover for
+ * the cover bake, on top of whatever a neighbouring area baked there.
+ *
+ * That is the seam between two overlapping imports. Measured on two Crimea
+ * areas: the second box's southern edge fell a third of the way down tile row
+ * 1019 and the coast bake rewrote the whole row, the lower two thirds as sea —
+ * a 3.5 km strip of Black Sea straight across the peninsula.
+ *
+ * `fetch_planet_dem.py` already snaps its own box for the same reason. Doing it
+ * here as well is what keeps every stage on the same box, which is the property
+ * the whole scoped-bake design rests on.
+ */
+export function snapBboxToTiles(
+    [west, south, east, north]: [number, number, number, number],
+    zoom = SNAP_ZOOM,
+): [number, number, number, number] {
+    const span = 180 / (1 << zoom);
+    // A box already on an edge must not grow: floating point puts a whole
+    // number a hair either side of itself, and one ceil() the wrong way spreads
+    // every re-bake of that area a tile wider.
+    const lo = (v: number) => Math.floor(v + 1e-9);
+    const hi = (v: number) => Math.ceil(v - 1e-9);
+    return [
+        lo((west + 180) / span) * span - 180,
+        90 - hi((90 - south) / span) * span,
+        hi((east + 180) / span) * span - 180,
+        90 - lo((90 - north) / span) * span,
+    ];
+}
+
 export interface Area {
     name: string;
     west: number;
@@ -355,7 +399,7 @@ export function startImport(req: Request, res: Response): void {
 
     const id = `${slug(name)}-${jobs.size}-${process.hrtime.bigint().toString(36)}`;
     const job: Job = {
-        id, name, bbox: [west, south, east, north],
+        id, name, bbox: snapBboxToTiles([west, south, east, north]),
         state: 'running', log: [], step: 'starting',
         stepIndex: 0, stepCount: withCover ? 6 : 4, percent: 0,
         subscribers: new Set(),

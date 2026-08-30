@@ -34,7 +34,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { decodePdm } from '../src/script/terrain/demTile';
-import { decodeLvr } from './bake/lvr';
+import { Watercourse, decodeLvr } from './bake/lvr';
 import { PLC_FLAG_REAL_IMAGERY, decodePlc } from './bake/plc';
 import {
     HISTOGRAM_BINS, accumulateColors, luminanceWindow, medianCut, newColorHistogram,
@@ -43,7 +43,7 @@ import { EnuBasis, enuToGeodeticApprox, makeEnuBasis } from '../src/script/terra
 import { AIRBASE_FLATTEN_PAD, PLAY_ORIGIN } from '../src/script/state/worldLayout';
 import { buildTile } from './bake/buildTile';
 import { TileKey, decodeTileIndex, encodeTileIndex } from './bake/index';
-import { CoastPolygon, LonLatBounds } from './bake/shoreline';
+import { CoastPolygon, InlandPolygon, LonLatBounds } from './bake/shoreline';
 
 // Triangles per tile. Measured on real Canary z12 tiles: the coast alone costs
 // ~18k at full resolution and roughly halves per coarsening step, so this buys
@@ -371,6 +371,10 @@ function main(): void {
     let coarsenedCoast = 0;
     let coveredTiles = 0;
     let imageryTiles = 0;
+    let inlandTiles = 0;
+    let inlandBodies = 0;
+    let riverTiles = 0;
+    let riverTriangles = 0;
     const colorHistogram = args.bbox !== undefined
         ? loadHistogram(args.out)
         : newColorHistogram();
@@ -386,9 +390,23 @@ function main(): void {
         }
         const dem = decodePdm(fs.readFileSync(pdmPath));
         let polygons: CoastPolygon[] | undefined;
+        let inland: InlandPolygon[] | undefined;
+        let watercourses: Watercourse[] | undefined;
         const lvrPath = `${stem}.lvr`;
         if (fs.existsSync(lvrPath)) {
-            polygons = decodeLvr(fs.readFileSync(lvrPath)).polygons as CoastPolygon[];
+            const vec = decodeLvr(fs.readFileSync(lvrPath));
+            polygons = vec.polygons as CoastPolygon[];
+            // Empty on an LVR1 tile, which is most of them.
+            if (vec.inland.length > 0) {
+                inland = vec.inland;
+                inlandTiles++;
+                inlandBodies += vec.inland.length;
+            }
+            // Empty below LVR3.
+            if (vec.watercourses.length > 0) {
+                watercourses = vec.watercourses;
+                riverTiles++;
+            }
         }
         let cover: ReturnType<typeof decodePlc> | undefined;
         const plcPath = `${stem}.plc`;
@@ -418,10 +436,12 @@ function main(): void {
             skirtDepthM,
             basis,
             polygons,
+            inland,
             simplifyCells,
             triangleBudget: args.budget,
             pads,
             cover,
+            watercourses,
         });
         // Only tiles carrying real imagery feed the swatch table. A tile
         // without it is painted in ESA's landcover map colours - a scarlet for
@@ -440,6 +460,7 @@ function main(): void {
         written.push({ z, x, y });
         totalBytes += gz.byteLength;
         totalTris += r.triangleCount;
+        riverTriangles += r.riverTriangles;
         maxTris = Math.max(maxTris, r.triangleCount);
         if (r.minLeafSize > 1) {
             coarsenedCoast++;
@@ -469,6 +490,12 @@ function main(): void {
         + `${imageryTiles} with real imagery, ${swatches.length} swatches`);
     console.log(`  luminance: mid ${luminance.mid.toFixed(3)}, `
         + `spread ${luminance.spread.toFixed(3)}`);
+    if (inlandTiles > 0) {
+        console.log(`inland water: ${inlandBodies} bodies across ${inlandTiles} tiles`);
+    }
+    if (riverTiles > 0) {
+        console.log(`watercourses: ${riverTriangles} stroke triangles across ${riverTiles} tiles`);
+    }
 
     // The index has to list every .ptm on disk, not just the ones this run
     // produced. A scoped bake that rewrote it from `written` alone would

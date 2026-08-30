@@ -30,8 +30,24 @@ export interface LonLatBounds {
     north: number;
 }
 
+/**
+ * One inland water body: a lake, a reservoir, or a stretch of wide river.
+ *
+ * `surfaceHeightM` is undefined for flowing water and for any body the coast
+ * bake could not measure. Undefined means "follow the DEM", never "sea level" —
+ * dropping inland water to the sea datum is exactly the bug this layer exists
+ * to fix.
+ */
+export interface InlandPolygon {
+    exterior: LonLat[];
+    holes: LonLat[][];
+    surfaceHeightM?: number;
+}
+
 export interface ShorelineInput {
     polygons: CoastPolygon[];
+    /** Inland bodies for this tile. Omit and every non-land node is ocean. */
+    inland?: InlandPolygon[];
     bounds: LonLatBounds;
     /** Node count per side. */
     size: number;
@@ -42,6 +58,14 @@ export interface ShorelineInput {
 export interface Shoreline {
     /** 1 = land, per node, row-major `size * size`. */
     landNodes: Uint8Array;
+    /** 1 = inland water, per node. Land and open ocean are both 0. */
+    inlandNodes: Uint8Array;
+    /**
+     * Surface height per inland node, NaN where the body follows the DEM.
+     *
+     * Only meaningful where `inlandNodes` is 1.
+     */
+    inlandHeights: Float32Array;
     /** True when any node differs from any other. */
     mixed: boolean;
     /** Crossing parameter along a cell edge, or undefined if none recorded. */
@@ -178,9 +202,9 @@ export function buildShoreline(input: ShorelineInput): Shoreline {
 
     // --- classification: even-odd scanline over all rings ------------------
     const landNodes = new Uint8Array(size * size);
-    const insideAt = (px: number, py: number): boolean => {
+    const pointInRings = (px: number, py: number, src: Ring[]): boolean => {
         let inside = false;
-        for (const r of rings) {
+        for (const r of src) {
             const p = r.pts;
             const n = p.length / 2;
             for (let i = 0, j = n - 1; i < n; j = i++) {
@@ -197,35 +221,180 @@ export function buildShoreline(input: ShorelineInput): Shoreline {
         }
         return inside;
     };
+    const insideAt = (px: number, py: number) => pointInRings(px, py, rings);
 
     // Scanline: for each node row, collect ring crossings once and fill spans.
     const xs: number[] = [];
-    for (let row = 0; row < size; row++) {
-        const py = row;
-        xs.length = 0;
-        for (const r of rings) {
-            const p = r.pts;
-            const n = p.length / 2;
-            for (let i = 0, j = n - 1; i < n; j = i++) {
-                const yi = p[i * 2 + 1];
-                const yj = p[j * 2 + 1];
-                if ((yi > py) !== (yj > py)) {
-                    const xi = p[i * 2];
-                    const xj = p[j * 2];
-                    xs.push((xj - xi) * (py - yi) / (yj - yi) + xi);
+    const scanline = (src: Ring[], onSpan: (row: number, from: number, to: number) => void) => {
+        for (let row = 0; row < size; row++) {
+            const py = row;
+            xs.length = 0;
+            for (const r of src) {
+                const p = r.pts;
+                const n = p.length / 2;
+                for (let i = 0, j = n - 1; i < n; j = i++) {
+                    const yi = p[i * 2 + 1];
+                    const yj = p[j * 2 + 1];
+                    if ((yi > py) !== (yj > py)) {
+                        const xi = p[i * 2];
+                        const xj = p[j * 2];
+                        xs.push((xj - xi) * (py - yi) / (yj - yi) + xi);
+                    }
+                }
+            }
+            if (xs.length === 0) {
+                continue;
+            }
+            xs.sort((a, b) => a - b);
+            // Even-odd: fill between alternating pairs.
+            for (let k = 0; k + 1 < xs.length; k += 2) {
+                const from = Math.max(0, Math.ceil(xs[k]));
+                const to = Math.min(size - 1, Math.floor(xs[k + 1]));
+                if (from <= to) {
+                    onSpan(row, from, to);
                 }
             }
         }
-        if (xs.length === 0) {
+    };
+
+    scanline(rings, (row, from, to) => {
+        for (let col = from; col <= to; col++) {
+            landNodes[row * size + col] = 1;
+        }
+    });
+
+    // --- inland water: the same fill, but one body at a time ---------------
+    //
+    // Per body, not over their union: each carries its own surface height, and
+    // an even-odd fill across all of them at once would let two overlapping
+    // bodies cancel each other out into dry land.
+    //
+    // These rings are NOT simplified, unlike the land rings above.
+    //
+    // Simplifying both looks symmetrical and is the opposite of it. The land
+    // polygons already have inland water subtracted, so a lake's shore appears
+    // twice — once as a hole in the land ring, once as this body's exterior —
+    // and running Douglas-Peucker over each independently moves them apart.
+    // Nodes in the band between land off, water off. They belong to neither,
+    // fall through to the open-ocean default, and get baked at sea level: a
+    // river at 750 m breaks into segments with 750 m holes between them.
+    //
+    // Measured on the Colorado, tile 12/1545/1226, at simplifyCells 2: 187
+    // nodes moved out of the water and 69 of them were inside the OSM polygon.
+    //
+    // Simplification buys nothing here anyway. The land rings are simplified
+    // because the decimator cuts against them and the triangle budget depends
+    // on it; this pass only answers "how high is the water", which costs the
+    // same at any vertex count.
+    const inlandNodes = new Uint8Array(size * size);
+    const inlandHeights = new Float32Array(size * size).fill(NaN);
+    const inlandRings: Ring[] = [];
+    /**
+     * Each body's rings kept together, with the grid-space box they occupy.
+     *
+     * Grouped per body because holes may only cancel their own exterior, and
+     * boxed because `centreIsLand` is called per leaf inside the decimator's
+     * budget search — on a tile carrying 548 bodies, testing every ring on
+     * every call would dominate the bake.
+     */
+    const inlandRegions: Array<{
+        rings: Ring[]; minX: number; minY: number; maxX: number; maxY: number;
+    }> = [];
+    for (const body of input.inland ?? []) {
+        const bodyRings: Ring[] = [];
+        const pushBodyRing = (src: LonLat[]) => {
+            if (src.length < 3) {
+                return;
+            }
+            const raw = new Float64Array(src.length * 2);
+            for (let i = 0; i < src.length; i++) {
+                raw[i * 2] = toGridX(src[i].lon);
+                raw[i * 2 + 1] = toGridY(src[i].lat);
+            }
+            const ring: Ring = { pts: raw };
+            bodyRings.push(ring);
+            inlandRings.push(ring);
+        };
+        pushBodyRing(body.exterior);
+        for (const hole of body.holes) {
+            pushBodyRing(hole);
+        }
+        if (bodyRings.length === 0) {
             continue;
         }
-        xs.sort((a, b) => a - b);
-        // Even-odd: fill between alternating pairs.
-        for (let k = 0; k + 1 < xs.length; k += 2) {
-            const from = Math.max(0, Math.ceil(xs[k]));
-            const to = Math.min(size - 1, Math.floor(xs[k + 1]));
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const r of bodyRings) {
+            for (let i = 0; i < r.pts.length; i += 2) {
+                if (r.pts[i] < minX) minX = r.pts[i];
+                if (r.pts[i] > maxX) maxX = r.pts[i];
+                if (r.pts[i + 1] < minY) minY = r.pts[i + 1];
+                if (r.pts[i + 1] > maxY) maxY = r.pts[i + 1];
+            }
+        }
+        inlandRegions.push({ rings: bodyRings, minX, minY, maxX, maxY });
+        const surface = body.surfaceHeightM ?? NaN;
+        scanline(bodyRings, (row, from, to) => {
             for (let col = from; col <= to; col++) {
-                landNodes[row * size + col] = 1;
+                inlandNodes[row * size + col] = 1;
+                inlandHeights[row * size + col] = surface;
+            }
+        });
+    }
+
+    // Inland water wins over land.
+    //
+    // The land rings are simplified, and simplifying a *hole* shrinks it: bands
+    // of a lake or river get swallowed back into the land polygon, and where
+    // that happens the tile grows no water at all and the terrain shows through
+    // the middle of the body. Measured on the Colorado, tile 12/1545/1226, at
+    // the simplifyCells 2 the mesh bake actually uses: 194 of 1183 nodes inside
+    // the OSM polygon came back as land — 16% of the river, in bands across it.
+    //
+    // This was survivable only while inland water sat at sea level, where the
+    // gaps were lost inside a 750 m slot. Once the water is at its own height
+    // the body reads as chopped into pieces, so the exact ring has to win.
+    for (let i = 0; i < landNodes.length; i++) {
+        if (inlandNodes[i]) {
+            landNodes[i] = 0;
+        }
+    }
+
+    // Close whatever band the land rings' own simplification still leaves.
+    //
+    // Dropping the simplification above fixes this pass's half of the
+    // disagreement, not the land pass's half: the land hole is still a
+    // simplified ring and can sit inside the body it was cut from. So any node
+    // that is not land and touches inland water is adopted into that body.
+    //
+    // The alternative — leaving it — is not neutral. An unclaimed node defaults
+    // to open ocean, so the cost of guessing wrong here is one node of lake
+    // where there should be sea, against a sea-level hole punched through a
+    // mountain river. One pass, because the band is a fraction of a cell wide.
+    //
+    // Read from a snapshot so the fill cannot cascade across the tile within
+    // this pass, which would walk a lake's height out over open water.
+    const seed = inlandNodes.slice();
+    for (let row = 0; row < size; row++) {
+        for (let col = 0; col < size; col++) {
+            const i = row * size + col;
+            if (landNodes[i] || seed[i]) {
+                continue;
+            }
+            for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    const x = col + dx;
+                    const y = row + dy;
+                    if (x < 0 || y < 0 || x >= size || y >= size) {
+                        continue;
+                    }
+                    const j = y * size + x;
+                    if (seed[j]) {
+                        inlandNodes[i] = 1;
+                        inlandHeights[i] = inlandHeights[j];
+                        dy = 2;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -284,7 +453,11 @@ export function buildShoreline(input: ShorelineInput): Shoreline {
         }
     };
 
-    for (const r of rings) {
+    // Inland rings are walked too, not just the land rings. They are now part
+    // of the land/water boundary — the block above lets them cut into land — so
+    // without their crossings the marching-squares cutter would have to place
+    // those shoreline vertices blind.
+    for (const r of [...rings, ...inlandRings]) {
         const p = r.pts;
         const n = p.length / 2;
         for (let i = 0, j = n - 1; i < n; j = i++) {
@@ -369,10 +542,46 @@ export function buildShoreline(input: ShorelineInput): Shoreline {
         return undefined;
     };
 
-    const centreIsLand = (x: number, y: number, blockSize: number): boolean =>
-        insideAt(x + blockSize / 2, y + blockSize / 2);
+    /**
+     * True when a body of inland water covers this point.
+     *
+     * Tested per body: a hole may only cancel the exterior it belongs to, so
+     * pooling every ring into one even-odd pass would let one lake's island
+     * punch a hole in a neighbouring lake.
+     */
+    const insideInland = (px: number, py: number): boolean => {
+        for (const region of inlandRegions) {
+            if (px < region.minX || px > region.maxX
+                || py < region.minY || py > region.maxY) {
+                continue;
+            }
+            if (pointInRings(px, py, region.rings)) {
+                return true;
+            }
+        }
+        return false;
+    };
 
-    return { landNodes, mixed, edgeCrossing, centreIsLand };
+    /**
+     * Which side a block's centre falls on, for resolving a saddle cell.
+     *
+     * Inland water subtracts, exactly as it does for `landNodes` above. The two
+     * have to agree: the node grid says a lake is water while this said the
+     * block over it was land, and the decimator uses this one to break the tie
+     * on ambiguous cells — so a shoreline could be cut against the answer the
+     * classification had already rejected.
+     *
+     * Note this reads the land rings, which are simplified, while the inland
+     * rings are not. That asymmetry is deliberate and matches the node pass:
+     * where the two disagree, the water wins.
+     */
+    const centreIsLand = (x: number, y: number, blockSize: number): boolean => {
+        const px = x + blockSize / 2;
+        const py = y + blockSize / 2;
+        return insideAt(px, py) && !insideInland(px, py);
+    };
+
+    return { landNodes, inlandNodes, inlandHeights, mixed, edgeCrossing, centreIsLand };
 }
 
 export const __testing = { douglasPeucker, simplifyRing, pointSegDistance };

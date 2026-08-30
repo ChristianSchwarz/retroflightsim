@@ -212,10 +212,23 @@ class Source:
         # the window to whole source pixels and shift the result by up to half
         # of one; going through the window's own transform does not.
         window = self.ds.window(west, south, east, north).round_offsets().round_lengths()
-        window = window.intersection(
-            rasterio.windows.Window(0, 0, self.ds.width, self.ds.height))
-        if window.width < 1 or window.height < 1:
+        # Clamped to the raster by hand rather than with Window.intersection,
+        # which *raises* on an empty overlap instead of returning an empty
+        # window - so the degenerate check below never ran and the bake died
+        # with "Intersection is empty" instead of skipping the tile.
+        #
+        # The bounds test above does not prevent it. A tile overlapping the
+        # raster by less than a pixel passes that test, and then round_offsets
+        # takes the overlap away: on a one-tile-wide bbox the raster came out
+        # 123 px across and a tile asked for a window at column 123.
+        col_off = max(0, int(window.col_off))
+        row_off = max(0, int(window.row_off))
+        col_end = min(int(self.ds.width), int(window.col_off + window.width))
+        row_end = min(int(self.ds.height), int(window.row_off + window.height))
+        if col_end - col_off < 1 or row_end - row_off < 1:
             return None
+        window = rasterio.windows.Window(
+            col_off, row_off, col_end - col_off, row_end - row_off)
         # 4x the target is plenty to resample from and bounds the read.
         out_w = int(min(window.width, size * 4))
         out_h = int(min(window.height, size * 4))

@@ -1,13 +1,22 @@
 /**
- * LVR1 OSM land-polygon tile decode.
+ * LVR1 / LVR2 / LVR3 OSM water-vector tile decode.
  *
  * Bake-time only. The runtime never reads coastline vectors any more — the
  * shoreline is cut offline and baked into the mesh.
+ *
+ * LVR2 adds a second polygon layer: inland water, each body carrying the
+ * surface height it should be baked at. LVR3 adds a third, which is not
+ * polygons at all: watercourse centrelines with a true width on them, for the
+ * rivers and canals too narrow for the node grid to hold. LVR1 is still
+ * emitted for the great majority of tiles — the ones with no lake and no river
+ * in them — and still decodes here, so all three coexist on disk indefinitely.
  */
 
 import { unzlibSync } from 'fflate';
 
 export const LVR_MAGIC = 0x3152564c; // 'LVR1' little-endian
+export const LVR2_MAGIC = 0x3252564c; // 'LVR2' little-endian
+export const LVR3_MAGIC = 0x3352564c; // 'LVR3' little-endian
 
 export interface LonLat {
     lon: number;
@@ -21,8 +30,42 @@ export interface CoastPolygon {
     holes: LonLat[][];
 }
 
+/**
+ * One inland water body, clipped to this tile.
+ *
+ * `surfaceHeightM` is undefined for flowing water — a river descends across a
+ * tile, so it follows the DEM per-node instead of sitting at one height — and
+ * also for any body the coast bake could not measure, which is treated the
+ * same way. Undefined is therefore "follow the terrain", never "sea level".
+ */
+export interface InlandBody {
+    exterior: LonLat[];
+    holes: LonLat[][];
+    surfaceHeightM: number | undefined;
+}
+
+/**
+ * One river or canal, as a centreline and the width it really is.
+ *
+ * A line, not a polygon, because that is the only form a narrow watercourse
+ * survives in: cut into the terrain it has to span a couple of grid cells to
+ * land on a node at all, and a 12 m canal is under one cell at Potsdam z12.
+ * The mesh bake drapes it over the surface and the renderer strokes it, so the
+ * width it is drawn at can be a screen decision rather than a bake one.
+ */
+export interface Watercourse {
+    /** True width on the ground, metres. */
+    widthM: number;
+    /** Centreline, clipped to this tile. Two points or more. */
+    points: LonLat[];
+}
+
 export interface CoastVectorTile {
     polygons: CoastPolygon[];
+    /** Empty for an LVR1 tile, which cannot carry inland water. */
+    inland: InlandBody[];
+    /** Empty below LVR3, which is where watercourse centrelines start. */
+    watercourses: Watercourse[];
 }
 
 /**
@@ -31,41 +74,38 @@ export interface CoastVectorTile {
  */
 export function decodeLvr(bytes: ArrayBuffer | Uint8Array): CoastVectorTile {
     const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    let payload: Uint8Array;
-    if (raw.byteLength >= 4
-        && raw[0] === 0x4c && raw[1] === 0x56 && raw[2] === 0x52 && raw[3] === 0x31) {
-        payload = raw;
-    } else {
-        payload = unzlibSync(raw);
-    }
+    // 'LVR' plus a version digit means the payload arrived already inflated.
+    const bare = raw.byteLength >= 4
+        && raw[0] === 0x4c && raw[1] === 0x56 && raw[2] === 0x52
+        && (raw[3] === 0x31 || raw[3] === 0x32 || raw[3] === 0x33);
+    const payload = bare ? raw : unzlibSync(raw);
     if (payload.byteLength < 6) {
-        throw new Error(`LVR1 too short: ${payload.byteLength}`);
+        throw new Error(`LVR too short: ${payload.byteLength}`);
     }
     const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
     const magic = view.getUint32(0, true);
-    if (magic !== LVR_MAGIC) {
-        throw new Error(`Bad LVR1 magic: 0x${magic.toString(16)}`);
+    if (magic !== LVR_MAGIC && magic !== LVR2_MAGIC && magic !== LVR3_MAGIC) {
+        throw new Error(`Bad LVR magic: 0x${magic.toString(16)}`);
     }
-    const polyCount = view.getUint16(4, true);
-    let offset = 6;
-    const polygons: CoastPolygon[] = [];
-    for (let p = 0; p < polyCount; p++) {
+    let offset = 4;
+
+    const readRings = (what: string): LonLat[][] => {
         if (offset + 2 > payload.byteLength) {
-            throw new Error(`LVR1 truncated at polygon ${p}`);
+            throw new Error(`LVR truncated before ${what}`);
         }
         const ringCount = view.getUint16(offset, true);
         offset += 2;
         const rings: LonLat[][] = [];
         for (let r = 0; r < ringCount; r++) {
             if (offset + 2 > payload.byteLength) {
-                throw new Error(`LVR1 truncated at ring ${r} of polygon ${p}`);
+                throw new Error(`LVR truncated at ring ${r} of ${what}`);
             }
             const vertCount = view.getUint16(offset, true);
             offset += 2;
             const ring: LonLat[] = [];
             for (let v = 0; v < vertCount; v++) {
                 if (offset + 8 > payload.byteLength) {
-                    throw new Error(`LVR1 truncated at vertex ${v} of ring ${r}`);
+                    throw new Error(`LVR truncated at vertex ${v} of ring ${r} of ${what}`);
                 }
                 ring.push({
                     lon: view.getFloat32(offset, true),
@@ -75,16 +115,87 @@ export function decodeLvr(bytes: ArrayBuffer | Uint8Array): CoastVectorTile {
             }
             rings.push(ring);
         }
-        if (rings.length === 0) {
-            continue;
+        return rings;
+    };
+
+    const polyCount = view.getUint16(offset, true);
+    offset += 2;
+    const polygons: CoastPolygon[] = [];
+    for (let p = 0; p < polyCount; p++) {
+        const rings = readRings(`polygon ${p}`);
+        if (rings.length > 0) {
+            polygons.push({ exterior: rings[0], holes: rings.slice(1) });
         }
-        polygons.push({ exterior: rings[0], holes: rings.slice(1) });
     }
-    return { polygons };
+
+    const inland: InlandBody[] = [];
+    if (magic === LVR2_MAGIC || magic === LVR3_MAGIC) {
+        if (offset + 2 > payload.byteLength) {
+            throw new Error('LVR2 truncated before the inland layer');
+        }
+        const bodyCount = view.getUint16(offset, true);
+        offset += 2;
+        for (let b = 0; b < bodyCount; b++) {
+            if (offset + 4 > payload.byteLength) {
+                throw new Error(`LVR2 truncated at inland body ${b}`);
+            }
+            const height = view.getFloat32(offset, true);
+            offset += 4;
+            const rings = readRings(`inland body ${b}`);
+            if (rings.length === 0) {
+                continue;
+            }
+            inland.push({
+                exterior: rings[0],
+                holes: rings.slice(1),
+                // NaN is the bake saying "no single height here, follow the DEM".
+                surfaceHeightM: Number.isNaN(height) ? undefined : height,
+            });
+        }
+    }
+
+    const watercourses: Watercourse[] = [];
+    if (magic === LVR3_MAGIC) {
+        if (offset + 2 > payload.byteLength) {
+            throw new Error('LVR3 truncated before the watercourse layer');
+        }
+        const lineCount = view.getUint16(offset, true);
+        offset += 2;
+        for (let l = 0; l < lineCount; l++) {
+            if (offset + 6 > payload.byteLength) {
+                throw new Error(`LVR3 truncated at watercourse ${l}`);
+            }
+            const widthM = view.getFloat32(offset, true);
+            offset += 4;
+            const pointCount = view.getUint16(offset, true);
+            offset += 2;
+            const points: LonLat[] = [];
+            for (let v = 0; v < pointCount; v++) {
+                if (offset + 8 > payload.byteLength) {
+                    throw new Error(`LVR3 truncated at point ${v} of watercourse ${l}`);
+                }
+                points.push({
+                    lon: view.getFloat32(offset, true),
+                    lat: view.getFloat32(offset + 4, true),
+                });
+                offset += 8;
+            }
+            // A single point is not a stroke. Dropped rather than rejected:
+            // a clip that grazes a tile corner can legitimately produce one.
+            if (points.length >= 2) {
+                watercourses.push({ widthM, points });
+            }
+        }
+    }
+    return { polygons, inland, watercourses };
 }
 
-/** Encode an uncompressed LVR1 payload (used by tests). */
-export function encodeLvrUncompressed(polygons: CoastPolygon[]): Uint8Array {
+/** Encode an uncompressed LVR1/LVR2/LVR3 payload (used by tests). */
+export function encodeLvrUncompressed(
+    polygons: CoastPolygon[],
+    inland: InlandBody[] = [],
+    watercourses: Watercourse[] = [],
+): Uint8Array {
     let byteLen = 6;
     for (const poly of polygons) {
         byteLen += 2;
@@ -93,9 +204,28 @@ export function encodeLvrUncompressed(polygons: CoastPolygon[]): Uint8Array {
             byteLen += 2 + ring.length * 8;
         }
     }
+    const layered = inland.length > 0 || watercourses.length > 0;
+    if (layered) {
+        byteLen += 2;
+        for (const body of inland) {
+            byteLen += 4 + 2 + (1 + body.holes.length) * 2;
+            for (const ring of [body.exterior, ...body.holes]) {
+                byteLen += ring.length * 8;
+            }
+        }
+    }
+    if (watercourses.length > 0) {
+        byteLen += 2;
+        for (const course of watercourses) {
+            byteLen += 4 + 2 + course.points.length * 8;
+        }
+    }
     const out = new Uint8Array(byteLen);
     const view = new DataView(out.buffer);
-    view.setUint32(0, LVR_MAGIC, true);
+    view.setUint32(
+        0,
+        watercourses.length > 0 ? LVR3_MAGIC : (layered ? LVR2_MAGIC : LVR_MAGIC),
+        true);
     view.setUint16(4, polygons.length, true);
     let offset = 6;
     for (const poly of polygons) {
@@ -105,6 +235,40 @@ export function encodeLvrUncompressed(polygons: CoastPolygon[]): Uint8Array {
             view.setUint16(offset, ring.length, true);
             offset += 2;
             for (const pt of ring) {
+                view.setFloat32(offset, pt.lon, true);
+                view.setFloat32(offset + 4, pt.lat, true);
+                offset += 8;
+            }
+        }
+    }
+    if (layered) {
+        view.setUint16(offset, inland.length, true);
+        offset += 2;
+        for (const body of inland) {
+            view.setFloat32(offset, body.surfaceHeightM ?? NaN, true);
+            offset += 4;
+            view.setUint16(offset, 1 + body.holes.length, true);
+            offset += 2;
+            for (const ring of [body.exterior, ...body.holes]) {
+                view.setUint16(offset, ring.length, true);
+                offset += 2;
+                for (const pt of ring) {
+                    view.setFloat32(offset, pt.lon, true);
+                    view.setFloat32(offset + 4, pt.lat, true);
+                    offset += 8;
+                }
+            }
+        }
+    }
+    if (watercourses.length > 0) {
+        view.setUint16(offset, watercourses.length, true);
+        offset += 2;
+        for (const course of watercourses) {
+            view.setFloat32(offset, course.widthM, true);
+            offset += 4;
+            view.setUint16(offset, course.points.length, true);
+            offset += 2;
+            for (const pt of course.points) {
                 view.setFloat32(offset, pt.lon, true);
                 view.setFloat32(offset + 4, pt.lat, true);
                 offset += 8;

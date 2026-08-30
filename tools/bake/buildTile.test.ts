@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { ecefToEnu, geodeticToEcef, makeEnuBasis } from '../../src/script/terrain/geodesy';
+import {
+    ecefToEnu, ecefToGeodetic, enuToEcef, geodeticToEcef, makeEnuBasis,
+} from '../../src/script/terrain/geodesy';
 import { padBlendWeight } from '../../src/script/terrain/flattenPad';
 import { decodePtm } from '../../src/script/terrain/ptm';
 import { TerrainClass } from '../../src/script/terrain/tones';
+import { Watercourse } from './lvr';
 import { CoastPolygon, LonLatBounds } from './shoreline';
-import { BuildTileInput, TileCover, buildTile } from './buildTile';
+import { BuildTileInput, COAST_BUDGET_CEILING, TileCover, buildTile } from './buildTile';
 
 const SIZE = 33;
 const CELLS = SIZE - 1;
@@ -77,6 +80,36 @@ function base(overrides: Partial<BuildTileInput> = {}): BuildTileInput {
 }
 
 describe('buildTile', () => {
+    /**
+     * The frame the vertices come out in, which nothing downstream re-derives:
+     * the runtime binds these positions to the GPU untouched. Writing north on
+     * +z instead of −z costs nothing that looks wrong tile by tile and draws
+     * the entire planet as its own mirror image. See `sceneFromEnu`.
+     */
+    it('writes vertices in scene axes, with north on −z', () => {
+        // Grid row 0 is the tile's north edge, so this ramps downhill going
+        // south — and the summit must land on negative z.
+        const ramp = heightsFrom((_x, y) => 500 - (y / CELLS) * 450);
+        const tile = decodePtm(buildTile(base({
+            heights: ramp, polygons: [coastAt(CELLS + 2)], skirtDepthM: 0,
+        })).bytes);
+
+        let highest = 0;
+        let lowest = 0;
+        for (let v = 1; v < tile.landPositions.length / 3; v++) {
+            if (tile.landPositions[v * 3 + 1] > tile.landPositions[highest * 3 + 1]) {
+                highest = v;
+            }
+            if (tile.landPositions[v * 3 + 1] < tile.landPositions[lowest * 3 + 1]) {
+                lowest = v;
+            }
+        }
+        assert.ok(tile.landPositions[highest * 3 + 2] < 0,
+            `summit sits north, so z should be negative: ${tile.landPositions[highest * 3 + 2]}`);
+        assert.ok(tile.landPositions[lowest * 3 + 2] > 0,
+            `foot sits south, so z should be positive: ${tile.landPositions[lowest * 3 + 2]}`);
+    });
+
     it('produces bytes that decode back to a consistent tile', () => {
         const r = buildTile(base({ polygons: [coastAt(16)] }));
         const tile = decodePtm(r.bytes);
@@ -207,7 +240,13 @@ describe('buildTile', () => {
             return [{ exterior: pts, holes: [] }];
         };
 
-        it('stays within the budget on a pathological coastline', () => {
+        it('coarsens a pathological coastline rather than letting it run away', () => {
+            // The shoreline is allowed past the budget - coarsening it is what
+            // turned rivers into dashed lines - but only as far as
+            // COAST_BUDGET_CEILING. Without a ceiling a Crimea tile reached
+            // 60386 triangles, ten times its budget, and one tile that heavy
+            // makes the runtime coarsen LOD across the whole scene and stream
+            // everything around it in more slowly.
             const budget = 400;
             const r = buildTile(base({
                 heights: heightsFrom((x, y) => (x * 37 + y * 53) % 200),
@@ -215,10 +254,24 @@ describe('buildTile', () => {
                 triangleBudget: budget,
             }));
             assert.ok(
-                r.triangleCount <= budget,
-                `${r.triangleCount} triangles exceeds budget ${budget}`,
+                r.triangleCount <= budget * COAST_BUDGET_CEILING,
+                `${r.triangleCount} triangles exceeds the ceiling `
+                + `${budget * COAST_BUDGET_CEILING}`,
             );
             assert.ok(r.attempts > 1, 'the budget actually had to bite');
+            assert.ok(r.minLeafSize > 1, 'a comb this fine has to coarsen the cut');
+        });
+
+        it('keeps an ordinary coastline at full resolution, over budget or not', () => {
+            // The property the dashed rivers cost us: an ordinary shoreline is
+            // cut at leaf 1 even when that overspends, because a coarsened cut
+            // is wrong where an overspent one is merely expensive.
+            const r = buildTile(base({
+                heights: heightsFrom((x, y) => 40 + Math.sin(x / 4) * 30),
+                polygons: [coastAt(16)],
+                triangleBudget: 400,
+            }));
+            assert.equal(r.minLeafSize, 1);
         });
 
         it('leaves a tile that already fits untouched', () => {
@@ -283,8 +336,9 @@ describe('buildTile', () => {
             }));
             const tile = decodePtm(r.bytes);
 
-            // Tile-local positions are relative to the tile centre, so rebuild
-            // the absolute ENU of each vertex and check the ones sitting in the
+            // Tile-local positions are relative to the tile centre and in scene
+            // axes (z runs south), so rebuild the absolute ENU of each vertex —
+            // flipping z back to north — and check the ones sitting in the
             // pad's flat core.
             const centreLon = (BOUNDS.west + BOUNDS.east) / 2;
             const centreLat = (BOUNDS.south + BOUNDS.north) / 2;
@@ -297,7 +351,7 @@ describe('buildTile', () => {
             for (let v = 0; v < tile.landPositions.length / 3; v++) {
                 const e = centre.e + tile.landPositions[v * 3] * tile.quantScale;
                 const u = centre.u + tile.landPositions[v * 3 + 1] * tile.quantScale;
-                const n = centre.n + tile.landPositions[v * 3 + 2] * tile.quantScale;
+                const n = centre.n - tile.landPositions[v * 3 + 2] * tile.quantScale;
                 if (padBlendWeight(e, n, pad) < 1) {
                     continue;
                 }
@@ -478,5 +532,377 @@ describe('buildTile cover', () => {
         }));
         assert.equal(r.landColors.length, r.landTriangles * 3);
         assert.equal(r.landColors[0], 90);
+    });
+});
+
+describe('inland water height', () => {
+    const lonAt = (gx: number) => BOUNDS.west + (gx / CELLS) * (BOUNDS.east - BOUNDS.west);
+    const latAt = (gy: number) => BOUNDS.north - (gy / CELLS) * (BOUNDS.north - BOUNDS.south);
+    const ringOf = (x0: number, y0: number, x1: number, y1: number) => [
+        { lon: lonAt(x0), lat: latAt(y0) },
+        { lon: lonAt(x1), lat: latAt(y0) },
+        { lon: lonAt(x1), lat: latAt(y1) },
+        { lon: lonAt(x0), lat: latAt(y1) },
+    ];
+
+    /**
+     * The whole tile as land with a rectangular hole cut out of it.
+     *
+     * This is the shape the real bake produces: inland water is subtracted from
+     * the land polygons, so a lake arrives as a hole, and every node inside it
+     * classifies as "not land".
+     */
+    const landWithHole = (x0: number, y0: number, x1: number, y1: number): CoastPolygon => ({
+        exterior: ringOf(-1, -1, CELLS + 1, CELLS + 1),
+        holes: [ringOf(x0, y0, x1, y1)],
+    });
+
+    const inlandRect = (
+        x0: number, y0: number, x1: number, y1: number, surfaceHeightM?: number,
+    ) => ({ exterior: ringOf(x0, y0, x1, y1), holes: [], surfaceHeightM });
+
+    /** Geodetic heights of every water vertex in a built tile. */
+    function waterHeights(r: ReturnType<typeof buildTile>): number[] {
+        const tile = decodePtm(r.bytes);
+        const centre = ecefToEnu(BASIS, geodeticToEcef(
+            (BOUNDS.south + BOUNDS.north) / 2,
+            (BOUNDS.west + BOUNDS.east) / 2,
+            r.centerHeightM,
+        ));
+        const out: number[] = [];
+        for (let v = 0; v < tile.waterPositions.length / 3; v++) {
+            out.push(centre.u + tile.waterPositions[v * 3 + 1] * tile.quantScale);
+        }
+        return out;
+    }
+
+    it('sits a lake at its own surface, not at sea level', () => {
+        const r = buildTile(base({
+            heights: heightsFrom(() => 820),
+            polygons: [landWithHole(10, 10, 22, 22)],
+            inland: [inlandRect(10, 10, 22, 22, 800)],
+        }));
+        const hs = waterHeights(r);
+        assert.ok(hs.length > 0, 'no water vertices were produced');
+        // The whole lake is within a metre of its surface: the depth bias is
+        // half a metre, and the tile is small enough that ENU up is height.
+        for (const h of hs) {
+            assert.ok(
+                Math.abs(h - 800) < 1.5,
+                `water vertex at ${h.toFixed(1)} m, expected ~800`,
+            );
+        }
+    });
+
+    it('leaves open ocean at sea level', () => {
+        // The same tile without an inland layer is what an LVR1 tile decodes
+        // to, and it must bake exactly as it always did.
+        const r = buildTile(base({
+            heights: heightsFrom(() => 820),
+            polygons: [landWithHole(10, 10, 22, 22)],
+        }));
+        const hs = waterHeights(r);
+        assert.ok(hs.length > 0, 'no water vertices were produced');
+        for (const h of hs) {
+            assert.ok(Math.abs(h) < 1.5, `water vertex at ${h.toFixed(1)} m, expected ~0`);
+        }
+    });
+
+    it('lets a river follow the terrain instead of flattening it', () => {
+        // No surface height: flowing water descends across a tile, so a single
+        // flat plane would be wrong in a way a lake's never is.
+        const r = buildTile(base({
+            heights: heightsFrom((_x, y) => 900 - y * 4),
+            polygons: [landWithHole(10, 2, 22, CELLS - 2)],
+            inland: [inlandRect(10, 2, 22, CELLS - 2)],
+        }));
+        const hs = waterHeights(r);
+        assert.ok(hs.length > 0, 'no water vertices were produced');
+        const min = Math.min(...hs);
+        const max = Math.max(...hs);
+        assert.ok(min > 700, `river bottomed out at ${min.toFixed(1)} m, nowhere near sea level`);
+        assert.ok(max - min > 50, `river spans only ${(max - min).toFixed(1)} m; it should descend`);
+    });
+
+    it('clamps the rim of a lake down to the ground it meets', () => {
+        // A surface above its own shore would leave water standing over dry
+        // land, which is the one artifact that reads as broken from the air.
+        const r = buildTile(base({
+            heights: heightsFrom(() => 800),
+            polygons: [landWithHole(10, 10, 22, 22)],
+            inland: [inlandRect(10, 10, 22, 22, 900)],
+        }));
+        const hs = waterHeights(r);
+        assert.ok(hs.length > 0, 'no water vertices were produced');
+        assert.ok(
+            Math.abs(Math.min(...hs) - 800) < 1.5,
+            `lake rim at ${Math.min(...hs).toFixed(1)} m, expected clamping to the 800 m shore`,
+        );
+        assert.ok(
+            Math.max(...hs) > 898,
+            `lake interior at ${Math.max(...hs).toFixed(1)} m, expected it to stay flat at 900`,
+        );
+    });
+});
+
+/** Guards against a fixture that vacuously passes by producing no geometry. */
+function tileHasLand(r: ReturnType<typeof buildTile>): boolean {
+    return decodePtm(r.bytes).landPositions.length > 0;
+}
+
+describe('skirts at a distant ENU origin', () => {
+    // The real bake lays the whole planet out in one ENU frame centred on the
+    // play origin, so a tile on another continent sits thousands of kilometres
+    // from it — and the frame's u axis is local "up" only near that origin.
+    const FAR_BASIS = makeEnuBasis(28.0015, -15.3937, 0); // Canary Islands
+    const CANYON: LonLatBounds = {
+        west: -112.10449, east: -112.06055, south: 36.07910, north: 36.12305,
+    };
+
+    it('hangs a skirt below the tile rather than flinging it sideways', () => {
+        const r = buildTile({
+            id: { z: 12, x: 1545, y: 1226 },
+            bounds: CANYON,
+            heights: heightsFrom(() => 800),
+            size: SIZE,
+            seaLevel: 0,
+            maxErrorM: 2,
+            skirtDepthM: 178,
+            basis: FAR_BASIS,
+            // Without a land polygon the whole tile is ocean and there is no
+            // land skirt to check at all.
+            polygons: [{
+                exterior: [
+                    { lon: CANYON.west - 1, lat: CANYON.north + 1 },
+                    { lon: CANYON.east + 1, lat: CANYON.north + 1 },
+                    { lon: CANYON.east + 1, lat: CANYON.south - 1 },
+                    { lon: CANYON.west - 1, lat: CANYON.south - 1 },
+                ],
+                holes: [],
+            }],
+        });
+        assert.ok(tileHasLand(r), 'fixture produced no land, so it checks nothing');
+        const tile = decodePtm(r.bytes);
+        const centre = ecefToEnu(FAR_BASIS, geodeticToEcef(
+            (CANYON.south + CANYON.north) / 2,
+            (CANYON.west + CANYON.east) / 2,
+            r.centerHeightM,
+        ));
+        let outLon = 0;
+        let outLat = 0;
+        let lowest = Infinity;
+        for (let v = 0; v < tile.landPositions.length / 3; v++) {
+            const p = enuToEcef(FAR_BASIS, {
+                e: centre.e + tile.landPositions[v * 3] * tile.quantScale,
+                u: centre.u + tile.landPositions[v * 3 + 1] * tile.quantScale,
+                n: centre.n - tile.landPositions[v * 3 + 2] * tile.quantScale,
+            });
+            const g = ecefToGeodetic(p.x, p.y, p.z);
+            outLon = Math.max(outLon, g.lon - CANYON.east, CANYON.west - g.lon);
+            outLat = Math.max(outLat, g.lat - CANYON.north, CANYON.south - g.lat);
+            lowest = Math.min(lowest, g.height);
+        }
+        // The terrain is flat at 800 m, so the skirt's foot belongs at 622 m.
+        // Subtracting from ENU u instead only reached 765 m here — a third of
+        // the drop — because u is barely vertical this far from the origin.
+        assert.ok(
+            Math.abs(lowest - (800 - 178)) < 2,
+            `skirt foot at ${lowest.toFixed(1)} m, expected ~622 (a full ${178} m below the surface)`,
+        );
+        // A skirt dropped along the local vertical keeps the tile's footprint.
+        // Subtracting from ENU u instead moved it 174 m sideways here, which is
+        // ~0.0019 deg of longitude — two orders of magnitude past this bound.
+        assert.ok(
+            outLon < 1e-4,
+            `land vertex ${(outLon * 111320 * 0.81).toFixed(0)} m outside the tile in longitude`,
+        );
+        assert.ok(
+            outLat < 1e-4,
+            `land vertex ${(outLat * 110540).toFixed(0)} m outside the tile in latitude`,
+        );
+    });
+});
+
+describe('normal orientation at a distant ENU origin', () => {
+    const FAR_BASIS = makeEnuBasis(28.0015, -15.3937, 0); // Canary Islands
+    const CANYON: LonLatBounds = {
+        west: -112.10449, east: -112.06055, south: 36.07910, north: 36.12305,
+    };
+    const FULL_LAND: CoastPolygon = {
+        exterior: [
+            { lon: CANYON.west - 1, lat: CANYON.north + 1 },
+            { lon: CANYON.east + 1, lat: CANYON.north + 1 },
+            { lon: CANYON.east + 1, lat: CANYON.south - 1 },
+            { lon: CANYON.west - 1, lat: CANYON.south - 1 },
+        ],
+        holes: [],
+    };
+
+    it('points every land normal along the local vertical, not the frame y axis', () => {
+        // Rugged on purpose, in both axes. A single plane will not do it: every
+        // normal is then the same one, so the old rule either flips all of them
+        // or none. Real canyon terrain points normals in every direction, and
+        // 31% of them came out facing into the ground on tile 12/1545/1226.
+        const r = buildTile(base({
+            bounds: CANYON,
+            basis: FAR_BASIS,
+            heights: heightsFrom((x, y) =>
+                800 + Math.sin(x / 3) * 250 + Math.cos(y / 3) * 250 + Math.sin((x + y) / 2) * 120),
+            polygons: [FULL_LAND],
+            skirtDepthM: 178,
+        }));
+        const tile = decodePtm(r.bytes);
+        assert.ok(tileHasLand(r), 'fixture produced no land, so it checks nothing');
+
+        // Local up in tile-local axes, the same way buildTile derives it.
+        const centre = ecefToEnu(FAR_BASIS, geodeticToEcef(
+            (CANYON.south + CANYON.north) / 2,
+            (CANYON.west + CANYON.east) / 2,
+            r.centerHeightM,
+        ));
+        const above = ecefToEnu(FAR_BASIS, geodeticToEcef(
+            (CANYON.south + CANYON.north) / 2,
+            (CANYON.west + CANYON.east) / 2,
+            r.centerHeightM + 1000,
+        ));
+        const ux = above.e - centre.e;
+        const uy = above.u - centre.u;
+        const uz = centre.n - above.n;
+        const ul = Math.hypot(ux, uy, uz);
+
+        let downward = 0;
+        const count = tile.landNormals.length / 4;
+        for (let v = 0; v < count; v++) {
+            const nx = tile.landNormals[v * 4] / 127;
+            const ny = tile.landNormals[v * 4 + 1] / 127;
+            const nz = tile.landNormals[v * 4 + 2] / 127;
+            if ((nx * ux + ny * uy + nz * uz) / ul < -0.01) {
+                downward++;
+            }
+        }
+        assert.equal(
+            downward, 0,
+            `${downward} of ${count} land normals point into the ground; `
+            + 'the fixed-sun shading follows them',
+        );
+    });
+});
+
+describe('watercourse strokes', () => {
+    /** All land, so the stroke has real terrain under it to follow. */
+    const LAND = { polygons: [coastAt(CELLS + 2)] };
+
+    /** An east-west canal along the middle of the tile. */
+    function canal(widthM = 12): Watercourse {
+        const lat = (BOUNDS.south + BOUNDS.north) / 2;
+        return {
+            widthM,
+            points: [
+                { lon: BOUNDS.west, lat },
+                { lon: BOUNDS.east, lat },
+            ],
+        };
+    }
+
+    it('emits a stroke for a canal far too narrow to cut into the grid', () => {
+        // A cell here is ~35 m, so a 12 m canal cannot land on a node at all.
+        const plain = decodePtm(buildTile(base(LAND)).bytes);
+        const withCanal = decodePtm(
+            buildTile(base({ ...LAND, watercourses: [canal()] })).bytes);
+        assert.equal(plain.riverIndices.length, 0);
+        assert.ok(withCanal.riverIndices.length > 0);
+        // ...and it changes nothing about the surface underneath it.
+        assert.equal(withCanal.landPositions.length, plain.landPositions.length);
+        assert.equal(withCanal.waterIndices.length, plain.waterIndices.length);
+    });
+
+    it('carries the true width, not a widened one', () => {
+        const tile = decodePtm(
+            buildTile(base({ ...LAND, watercourses: [canal(12)] })).bytes);
+        for (let i = 0; i < tile.riverHalfWidths.length; i++) {
+            assert.equal(tile.riverHalfWidths[i], 60);   // 6.0 m in decimetres
+        }
+    });
+
+    it('resamples a long straight reach so the stroke follows the terrain', () => {
+        // Two OSM nodes a whole tile apart: without resampling the stroke
+        // would be one quad flying over everything between them.
+        const tile = decodePtm(
+            buildTile(base({ ...LAND, watercourses: [canal()] })).bytes);
+        const pairs = tile.riverHalfWidths.length / 2;
+        assert.ok(pairs > CELLS / 2, `only ${pairs} centreline points`);
+        const heights = new Set<number>();
+        for (let v = 0; v < tile.riverHalfWidths.length; v++) {
+            heights.add(tile.riverPositions[v * 3 + 1]);
+        }
+        assert.ok(heights.size > 2, `stroke is flat over varying ground (${heights.size})`);
+    });
+
+    it('pairs every centreline point with opposite offsets across the flow', () => {
+        const tile = decodePtm(
+            buildTile(base({ ...LAND, watercourses: [canal()] })).bytes);
+        for (let p = 0; p * 2 + 1 < tile.riverHalfWidths.length; p++) {
+            const a = p * 2;
+            const b = a + 1;
+            for (let k = 0; k < 3; k++) {
+                assert.equal(tile.riverPositions[a * 3 + k], tile.riverPositions[b * 3 + k]);
+                // Summed rather than negated: a zero component negates to -0,
+                // which is not strictly equal to the 0 on the other side.
+                assert.equal(
+                    tile.riverDirections[a * 4 + k] + tile.riverDirections[b * 4 + k], 0);
+            }
+        }
+    });
+
+    it('sits on the surface that is drawn, not on the DEM under it', () => {
+        // A coarse tolerance decimates the interior hard, so the drawn surface
+        // and the DEM part company by metres. Draped on the DEM the stroke
+        // would be buried; the check is that every point of it is at or above
+        // the land triangle it falls in.
+        const r = buildTile(base({
+            ...LAND, maxErrorM: 40, watercourses: [canal()], triangleBudget: undefined,
+        }));
+        const tile = decodePtm(r.bytes);
+        const q = tile.quantScale;
+        const at = (v: number) => ({
+            x: tile.landPositions[v * 3] * q,
+            y: tile.landPositions[v * 3 + 1] * q,
+            z: tile.landPositions[v * 3 + 2] * q,
+        });
+        /** Height of the drawn land at (x, z), or undefined off the mesh. */
+        const landY = (x: number, z: number): number | undefined => {
+            for (let t = 0; t * 3 + 2 < tile.landPositions.length / 3; t++) {
+                const a = at(t * 3), b = at(t * 3 + 1), c = at(t * 3 + 2);
+                const det = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+                if (Math.abs(det) < 1e-9) continue;
+                const l0 = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / det;
+                const l1 = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / det;
+                const l2 = 1 - l0 - l1;
+                if (l0 < -1e-6 || l1 < -1e-6 || l2 < -1e-6) continue;
+                return a.y * l0 + b.y * l1 + c.y * l2;
+            }
+            return undefined;
+        };
+        let checked = 0;
+        for (let v = 0; v < tile.riverHalfWidths.length; v += 2) {
+            const x = tile.riverPositions[v * 3] * q;
+            const y = tile.riverPositions[v * 3 + 1] * q;
+            const z = tile.riverPositions[v * 3 + 2] * q;
+            const ground = landY(x, z);
+            if (ground === undefined) continue;
+            checked++;
+            assert.ok(y >= ground - 0.05,
+                `stroke ${y.toFixed(2)} below drawn land ${ground.toFixed(2)}`);
+        }
+        assert.ok(checked > 4, `only ${checked} points landed on the mesh`);
+    });
+
+    it('runs the offset across the flow, not along it', () => {
+        const tile = decodePtm(
+            buildTile(base({ ...LAND, watercourses: [canal()] })).bytes);
+        // The canal runs east; the offset must be north-south (scene z), with
+        // no east component to speak of.
+        assert.ok(Math.abs(tile.riverDirections[0]) < 16, `east ${tile.riverDirections[0]}`);
+        assert.ok(Math.abs(tile.riverDirections[2]) > 100, `south ${tile.riverDirections[2]}`);
     });
 });

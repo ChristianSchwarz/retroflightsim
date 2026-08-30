@@ -206,7 +206,7 @@ The pipeline has four stages:
 pip install rasterio numpy
 python tools/bake_planet_dem.py --input data/output_hh.tif --out assets/planet
 
-# 2. coastlines: OSM -> .lwm masks + .lvr land polygons
+# 2. coastlines: OSM -> .lwm masks + .lvr land polygons + inland water
 pip install shapely requests
 python tools/bake_osm_coast.py --manifest assets/planet/manifest.json
 
@@ -222,6 +222,19 @@ npm run verify:planet -- --dir assets/terrain
 Stage 4 is the only place terrain geometry is produced. The runtime fetches,
 decodes and draws — it never triangulates — so there is no fallback path that
 can drift out of sync with the bake.
+
+Two more checks read the finished tiles back and compare them against the OSM
+water they were baked from, each taking `z/x/y` arguments:
+
+```bash
+npx tsx tools/verify_water.ts 12/4387/853    # lakes: is the interior wet?
+npx tsx tools/verify_rivers.ts 12/4387/853   # rivers: drawn, and in one piece?
+```
+
+`verify_water.ts` reports *interior* cells only, so a river two cells across is
+invisible to it — and most are not water in the mesh at all. `verify_rivers.ts`
+checks the other half: that every centreline reached the mesh as a stroke, that
+the stroke covers its length, and that none of it is buried under the terrain.
 
 Stage 3 is optional. Skip it and every land facet comes out plain grass, which
 is what the bake produced before cover existed.
@@ -307,6 +320,27 @@ the previous bake left rather than replacing them.
 Verified on two adjacent Alpine areas: baking them as two scoped runs gives a
 `assets/terrain` byte-identical to one unscoped bake of both — same 60 .ptm
 files, same index, same manifest.
+
+#### The box is snapped to whole tiles
+
+Every stage writes whole tiles, and a stage whose sources stop halfway across
+one still writes all of it. What it writes over the half it has no data for is
+not "nothing": it is **open ocean** from the coast bake and unknown cover from
+the cover bake, on top of whatever a neighbouring area baked there.
+
+So a hand-drawn box is grown outwards onto whole zoom-12 tile edges before any
+stage sees it — by `snapBboxToTiles` for an F9 import, and again inside
+`bake_osm_coast.py` for anything run by hand. `fetch_planet_dem.py` already did
+this for the DEM; the other stages needed it too.
+
+Measured on two overlapping Crimea imports before the fix: the second box's
+southern edge fell at lat 45.204449, a third of the way down tile row 1019. That
+row was in range, the bake rewrote all of it, and the lower two thirds came out
+as sea — a 3.5 km strip of Black Sea straight across the middle of the
+peninsula, over ground the first import had baked correctly. Snapped, the same
+two areas stitch: every tile in row 1019 comes back 100% land at every node row.
+
+The cost is at most one extra tile ring per side, baked with real data.
 
 Tiles are a global quadtree, so a new area shares ancestors with everything
 already baked — a z0 tile is the ancestor of a hemisphere. `build_parent` fills
@@ -405,6 +439,22 @@ at home that resolves to (0, 0) exactly as before, and elsewhere a foreign
 area's pad lands at its real offset — 111 km away for Tenerife — and touches
 nothing.
 
+### Which way is north
+
+Scene space is **x = east, y = up, z = south** — north is −z. Three.js is
+right-handed with +Y up, so east × up is *south*; calling +z north makes the
+frame left-handed and every position expressed in it comes out mirrored, with
+what is really east of the pilot drawn to the west. It is also the sign the
+rest of the sim has always used: `vectorHeading` reads a bearing as
+atan2(x, −z), and the JSBSim bridge maps NED north onto −z.
+
+The bake writes tile vertices and normals in those axes directly (the runtime
+binds them to the GPU untouched), and `sceneFromEnu` / `enuFromScene` in
+`terrain/geodesy.ts` are the only places the flip happens. Tiles carrying the
+old north-on-+z layout are PTM1 v3 and are refused at load with a message
+naming `npm run bake:mesh`, because a mirrored tile is exactly the kind of
+wrong that looks fine until you compare it with a map.
+
 ### Tiles are baked in one frame and drawn in another
 
 A baked tile stores its vertices as offsets from the tile centre **in the frame
@@ -492,6 +542,134 @@ bit-identical, so `Swatches` and `Imagery` are untouched and only the two
 palette-driven modes get the bigger patches. Changing `--patch-m` means
 re-running `npm run bake:cover` **and** `npm run bake:mesh`.
 
+A tile is baked whole even where the source raster does not reach it, and the
+part with no source falls back to class colours. That edge case is not rare: a
+tile can overlap the raster by less than one pixel, which survives the bounds
+test and is then rounded away, leaving a window that starts past the raster's
+last column. `rasterio`'s `Window.intersection` **raises** on an empty overlap
+rather than returning an empty window, so the degenerate check behind it never
+ran and the whole bake died with `WindowError: Intersection is empty` instead of
+skipping one tile. It shows up on a bbox about a tile wide — the raster comes
+out ~123 px across and a tile asks for column 123. The window is clamped by hand
+now; see `Source.read_onto`.
+
+### Inland water
+
+Lakes and rivers are not the sea and must not be baked at sea level. Dropping
+them there punches a slot through the world: measured on the Colorado in the
+Grand Canyon, tile 12/1545/1226, the DEM reads 734-774 m along the river while
+the mesh sat it at 0 m and hung 740 m walls off both banks.
+
+Stage 2 therefore emits a second polygon layer. Land is assembled exactly as
+before — every water polygon, inland ones included, is still subtracted from it,
+so the ocean shoreline is unchanged — and the inland bodies are reported
+alongside it in an **LVR2** vector tile. Tiles with no lake or river in them stay
+LVR1 and are left byte-identical.
+
+Each body is one of two kinds, decided by its OSM tags:
+
+* **Flat** — `natural=water` (any `water=*` that is not a watercourse) and
+  `landuse=reservoir`. A lake sits at one elevation; water that is not level
+  reads as broken from the air immediately.
+* **Flowing** — `waterway=riverbank` and `water=river|stream|canal|ditch|drain`.
+  A river descends across a tile, so it follows the DEM per-node instead. It is
+  never flat, but it is never wrong either.
+
+Only bodies wide enough for the node grid come through this way. The narrow ones
+— which is most watercourses — are drawn instead, as strokes; see below.
+
+`natural=bay` stays with the ocean: a bay is the sea reaching inland.
+
+#### Rivers and canals: a stroke, not a cut
+
+A watercourse at true width does not survive the node grid. The shoreline cut
+samples grid nodes, so anything under a couple of cells across lands on one only
+where the polygon happens to cross it: the river comes out as a dashed line, or,
+under one cell, as nothing at all. A cell is 12 x 19 m at Potsdam z12 and four
+times that a level up, and OSM tags the canals there at 12 m.
+
+Widening them until the grid could hold them was tried and rejected. It works,
+in the sense that the dashes go away — measured per flowing body on the Potsdam
+bake, 19 of 32 drawn nowhere became 0 of 32 — but it buys that by drawing a 12 m
+canal 48 m wide at every range, including the range where you are looking
+straight down at it. There is no width in metres that is both visible from 20 km
+and honest from 200 m, because the requirement is not in metres. It is in pixels.
+
+So watercourses are cut out of the terrain problem entirely and drawn over it:
+
+1. **Stage 2** keeps every `waterway=river|canal` centreline as a line, with the
+   true width off its `width` tag or a per-kind fallback, and writes it into a
+   third **LVR3** layer. It still buffers the same line into a water polygon, so
+   a river wide enough to be real water still gets a real water surface with a
+   shoreline cut around it — nothing about the wide ones changes.
+2. **Stage 4** resamples each centreline to one point per grid cell, drops it
+   onto the surface the tile actually *draws* — not the DEM, which at z10 is
+   529 m of decimation away from it — and emits two vertices per point at the
+   same position, carrying opposite unit offsets across the flow. The width is
+   not in the geometry.
+3. **The renderer** widens it, in `RiverVertProgram`. The stroke is drawn at its
+   true width until that falls below `RIVER_MIN_HALF_PIXELS`, and then it holds.
+
+The result is a canal that is 12 m wide when 12 m is more than a pixel and about
+two pixels wide when it is not — the generalisation a paper chart makes, applied
+where the information about pixels actually exists.
+
+Four details that are load-bearing, two of them learned the hard way:
+
+* The widening happens in view space and the result is **projected once**. The
+  first version gave the whole stroke the centreline's depth and w, which meant
+  dividing by the widened corner's own w and rebuilding a clip position around a
+  different one — and that breaks the homogeneous coordinate the near-plane clip
+  depends on. A vertex behind the eye kept a positive w and landed somewhere
+  arbitrary on screen instead of being clipped, so the stroke flashed across the
+  whole frame, sky included, every time a river passed under the aircraft.
+* **No resolution snapping**, the same as the water material, which is built
+  `highp` for the same reason. Snapping both banks of a two-pixel ribbon to the
+  pixel grid independently collapses it on some frames and opens it on others:
+  the river flickers on its own.
+* It floats a twentieth of a cell above the surface. Coplanar is not enough:
+  the stroke and the facet under it are projected by different vertex programs,
+  so their depths differ by noise and the pair speckles.
+* `RIVER_MAX_STRETCH` caps how far the pixel floor may stretch a stroke. Seen
+  almost edge-on the perpendicular projects to nearly nothing, and holding the
+  floor there would fan a distant reach out into a sheet lying across the
+  landscape. Capped, it thins out instead.
+
+`npx tsx tools/verify_rivers.ts z/x/y` reads the two files back and checks that
+every centreline reached the mesh, that the stroke covers its length, and that
+no part of it is buried under the terrain.
+
+A flat body's height is the **5th percentile of the DEM one step outside its own
+perimeter**, measured once over the whole body and stamped onto every clipped
+piece — so a lake spanning four tiles, or the same lake rebuilt at four zoom
+levels, cannot step or crack along a seam.
+
+Both halves of that rule were forced by real data:
+
+* Not the interior. Where a reservoir has dropped below its mapped extent the
+  DEM under the polygon is dry canyon — on Lake Powell it spans 442 m with no
+  plateau in it to find.
+* Not the average. What reads as broken from the air is water standing *above*
+  the ground beside it; land above water is simply a shore. Measured on the
+  perimeter of that same body:
+
+| height from | median step at the shore | shoreline leaking |
+| --- | --- | --- |
+| interior median | 12.6 m | 34.3% |
+| perimeter median | 0.0 m | 50.0% |
+| perimeter p25 | 30.1 m | 25.0% |
+| **perimeter p5** | 39.9 m | **5.1%** |
+
+The perimeter median looks best on paper and is the worst on screen. A low
+percentile rather than the minimum, because the minimum is one bad DEM sample
+from sinking the lake — 895 m against p5's 927 m on Powell.
+
+For the few percent that still leak, the mesh bake clamps shoreline vertices
+down to the ground they meet. The rim loses its flatness; the interior keeps it.
+
+A body the DEM cannot answer for gets no height and is baked as flowing water.
+That is never flat, which is the right way round for a fallback.
+
 Two more rules live in the cover bake rather than in the mesh bake, because
 they need something the raster does not carry:
 
@@ -523,6 +701,16 @@ already oversamples it 1.6x.
 | `--only z/x/y` | bake one tile, repeatable, for debugging |
 | `--limit N` | stop after N tiles, for a smoke bake |
 | `--swatches N` | colours in the baked swatch table (default 24) |
+| `--bbox W,S,E,N` | bake only the tiles overlapping this box |
+
+**`--bbox` is what makes a run additive.** Two whole-pyramid artefacts —
+`index_mesh.bin` and `swatch_histogram.bin` — are carried forward from disk only
+when it is present. Without it they are rebuilt from the tiles this run baked
+and nothing else, so a `--only` or `--limit` probe unlists every other area from
+the index (the runtime reads "not in the index" as "ocean, draw a patch") and
+resets the colour statistics the whole pyramid is quantised against. Both fail
+silently. Pass `--bbox` around the tiles you are probing, or expect to re-bake
+everything afterwards to put them back.
 
 ### The triangle budget
 
