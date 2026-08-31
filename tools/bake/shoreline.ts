@@ -53,6 +53,19 @@ export interface ShorelineInput {
     size: number;
     /** Douglas-Peucker tolerance, in grid cells. 0 disables simplification. */
     simplifyCells?: number;
+    /**
+     * True where an airfield platform is cut flat, in lon/lat.
+     *
+     * A node inside one is land whatever the coast vector says. Gran Canaria
+     * is the case: the airport is built out onto the shore, part of its apron
+     * falls outside the OSM coastline, and those nodes would otherwise stay at
+     * sea level inside a platform flattened to 13 m — a notch of open ocean
+     * punched through the middle of an airfield.
+     *
+     * Only consulted for nodes that are not already land, so on a tile with no
+     * water, or no pads, it costs nothing.
+     */
+    paved?: (lon: number, lat: number) => boolean;
 }
 
 export interface Shoreline {
@@ -394,6 +407,26 @@ export function buildShoreline(input: ShorelineInput): Shoreline {
                         dy = 2;
                         break;
                     }
+                }
+            }
+        }
+    }
+
+    // An airfield platform is land, whatever the coast vector says. Done after
+    // the inland passes so a body that reaches the apron is overridden too, and
+    // before `mixed` so a tile that is all sea except for a runway still knows
+    // it has both.
+    if (input.paved) {
+        for (let row = 0; row < size; row++) {
+            const lat = bounds.north - (row / cells) * latSpan;
+            for (let col = 0; col < size; col++) {
+                const i = row * size + col;
+                if (landNodes[i]) {
+                    continue;
+                }
+                if (input.paved(bounds.west + (col / cells) * lonSpan, lat)) {
+                    landNodes[i] = 1;
+                    inlandNodes[i] = 0;
                 }
             }
         }

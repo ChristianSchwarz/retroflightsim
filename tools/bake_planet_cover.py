@@ -143,6 +143,79 @@ CLASS_COLORS: Dict[int, Tuple[int, int, int]] = {
 }
 
 
+def _metres_per_degree(lat_deg: float) -> Tuple[float, float]:
+    """Metres per degree of latitude and of longitude.
+
+    A local copy of the series in ``bake_osm_airports.py``. Importing it would
+    pull shapely in behind it, and this file deliberately depends on rasterio
+    and numpy only - the same trade the ``.pdm`` reader in the coast bake makes.
+    """
+    lat = math.radians(lat_deg)
+    return (111132.92 - 559.82 * math.cos(2 * lat) + 1.175 * math.cos(4 * lat),
+            111412.84 * math.cos(lat) - 93.5 * math.cos(3 * lat))
+
+
+def airfield_pads(manifest: dict) -> List[dict]:
+    """Every airfield platform rectangle the airports bake recorded."""
+    out: List[dict] = []
+    for airfield in (manifest.get('airfields') or {}).get('items') or []:
+        out.extend(airfield.get('pads') or [])
+    return out
+
+
+def stamp_airfield_classes(
+    classes: np.ndarray, bounds: Tuple[float, float, float, float],
+    size: int, pads: Sequence[dict],
+) -> int:
+    """Paint the airfield platforms as built ground. Returns nodes changed.
+
+    The cover raster does not know an airfield is there. WorldCover has Gran
+    Canaria's runways as a patchwork of bare and built at 10 m, and a grass
+    field as grass - and whatever the ground was before it was paved is the one
+    thing it must not be afterwards. So the platform the mesh bake flattens is
+    also the platform the cover bake paints.
+
+    Only the flat core, never the feather, which is the same rule the mesh bake
+    and the height sampler use for what counts as paved: the feather is where
+    the airfield blends into the countryside, and it should look like it.
+
+    Written into the classes before the colour pass, so a tile with no imagery
+    picks up the built-up colour from the class LUT for free.
+    """
+    if not pads:
+        return 0
+    west, south, east, north = bounds
+    lons = west + (east - west) * np.arange(size) / (size - 1)
+    lats = north - (north - south) * np.arange(size) / (size - 1)
+    changed = 0
+    for pad in pads:
+        half_d = pad['halfD']
+        half_w = pad['halfW']
+        feather = pad.get('featherM', 0.0)
+        reach = math.hypot(half_d + feather, half_w + feather)
+        m_lat, m_lon = _metres_per_degree(pad['lat'])
+        m_lon = max(1.0, m_lon)
+        if (pad['lat'] < south - reach / m_lat or pad['lat'] > north + reach / m_lat
+                or pad['lon'] < west - reach / m_lon or pad['lon'] > east + reach / m_lon):
+            continue
+        core_d = max(0.0, half_d - feather)
+        core_w = max(0.0, half_w - feather)
+        if core_d <= 0 or core_w <= 0:
+            continue
+        e = (lons - pad['lon']) * m_lon
+        n = (lats - pad['lat']) * m_lat
+        heading = math.radians(pad.get('headingDeg', 0.0))
+        ax, ay = math.sin(heading), math.cos(heading)
+        # Rows are latitude, columns are longitude, matching the class grid.
+        along = e[None, :] * ax + n[:, None] * ay
+        across = e[None, :] * ay - n[:, None] * ax
+        mask = (np.abs(along) <= core_d) & (np.abs(across) <= core_w)
+        if mask.any():
+            changed += int(mask.sum())
+            classes[mask] = CLS_BUILT
+    return changed
+
+
 def build_class_lut() -> np.ndarray:
     """256-entry lookup so the whole raster converts in one indexing op."""
     lut = np.full(256, CLS_UNKNOWN, dtype=np.uint8)
@@ -391,8 +464,13 @@ def main() -> None:
     patch = f'{args.patch_m:.0f} m patches' if args.patch_m > 0 else 'raw classes'
     print(f'baking cover for {len(tiles)} tiles -> {out_root} ({patch})')
 
+    pads = airfield_pads(manifest)
+    if pads:
+        print(f'airfields: {len(pads)} platform rectangles painted as built ground')
+
     written = 0
     with_imagery = 0
+    paved_nodes = 0
     total_bytes = 0
     t0 = time.time()
     for i, (z, x, y) in enumerate(tiles):
@@ -431,6 +509,7 @@ def main() -> None:
         # The crop leaves a view into the padded array; the encoder needs the
         # bytes contiguous.
         classes = np.ascontiguousarray(classes)
+        paved_nodes += stamp_airfield_classes(classes, bounds, size, pads)
 
         # Colour. Average, because this one really is a continuous quantity.
         colors = np.zeros((size, size, 3), dtype=np.uint8)
@@ -477,6 +556,8 @@ def main() -> None:
     print(f'wrote {written} cover tiles, {total_bytes / 1048576:.1f} MB in {secs:.1f}s')
     print(f'  {with_imagery}/{max(1, written)} carry real imagery; '
           f'the rest fall back to class colours')
+    if paved_nodes:
+        print(f'  {paved_nodes} nodes repainted as airfield pavement')
     print('next: npm run bake:mesh')
 
 

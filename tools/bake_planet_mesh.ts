@@ -39,7 +39,10 @@ import { PLC_FLAG_REAL_IMAGERY, decodePlc } from './bake/plc';
 import {
     HISTOGRAM_BINS, accumulateColors, luminanceWindow, medianCut, newColorHistogram,
 } from './bake/swatches';
-import { EnuBasis, enuToGeodeticApprox, makeEnuBasis } from '../src/script/terrain/geodesy';
+import {
+    EnuBasis, ecefToEnu, enuToGeodeticApprox, geodeticToEcef, makeEnuBasis,
+} from '../src/script/terrain/geodesy';
+import { FlattenPadRecord, padFromRecord } from '../src/script/terrain/flattenPad';
 import { AIRBASE_FLATTEN_PAD, PLAY_ORIGIN } from '../src/script/state/worldLayout';
 import { buildTile } from './bake/buildTile';
 import { TileKey, decodeTileIndex, encodeTileIndex } from './bake/index';
@@ -309,6 +312,81 @@ function walkTiles(src: string, maxZoom: number): Array<{ z: number; x: number; 
     return out;
 }
 
+/**
+ * The airfield descriptions, written beside the manifest rather than into it.
+ *
+ * Carried through whole from the DEM manifest: the runtime wants the runways,
+ * taxiways and aprons to draw, and the airports bake has already merged them
+ * across every scoped run.
+ */
+const AIRFIELDS_FILE = 'airfields.json';
+
+/** One airfield as `tools/bake_osm_airports.py` writes it into the DEM manifest. */
+interface AirfieldRecord {
+    name: string;
+    icao?: string;
+    area?: string;
+    pads?: FlattenPadRecord[];
+}
+
+/**
+ * Every pad this bake should cut, geodetically.
+ *
+ * The airfields come from the airports bake: real runways, at their real
+ * bearings, each cut to the plane fitted for its own platform.
+ *
+ * An area with none of them still gets the old pad — a 1 x 4 km level box at
+ * its centre, which is where the authored airbase stands. That is the only
+ * thing left holding it up, and an area that has a real airfield does not need
+ * an invented one flattened into the middle of it.
+ */
+function padRecordsFor(
+    src: { airfields?: { items?: AirfieldRecord[] }; maxZoom: number; seaLevel?: number },
+    areas: Array<{ name: string; west: number; south: number; east: number; north: number }>,
+    srcDir: string,
+): FlattenPadRecord[] {
+    const records: FlattenPadRecord[] = [];
+
+    const airfields = src.airfields?.items ?? [];
+    const areasWithAirfield = new Set(airfields.map(a => a.area).filter(Boolean));
+
+    for (const area of areas) {
+        if (areasWithAirfield.has(area.name)) {
+            continue;
+        }
+        const home = PLAY_ORIGIN.lon >= area.west && PLAY_ORIGIN.lon <= area.east
+            && PLAY_ORIGIN.lat >= area.south && PLAY_ORIGIN.lat <= area.north;
+        const lat = home ? PLAY_ORIGIN.lat : (area.south + area.north) / 2;
+        const lon = home ? PLAY_ORIGIN.lon : (area.west + area.east) / 2;
+        const heightMsl = computePadHeight(
+            srcDir, src, makeEnuBasis(lat, lon, 0), AIRBASE_FLATTEN_PAD);
+        console.log(`pad ${area.name}: ${lat.toFixed(4)}, ${lon.toFixed(4)} -> `
+            + `${heightMsl.toFixed(2)} m MSL${home ? ' (home)' : ''}`);
+        records.push({
+            lat, lon,
+            halfW: AIRBASE_FLATTEN_PAD.halfW,
+            halfD: AIRBASE_FLATTEN_PAD.halfD,
+            featherM: AIRBASE_FLATTEN_PAD.featherM,
+            heightMsl,
+        });
+    }
+
+    let airfieldPads = 0;
+    for (const airfield of airfields) {
+        for (const pad of airfield.pads ?? []) {
+            records.push({ ...pad, icao: airfield.icao });
+            airfieldPads++;
+        }
+    }
+    if (airfields.length > 0) {
+        console.log(`airfields: ${airfieldPads} pads across ${airfields.length} fields; `
+            + `${areas.length - areasWithAirfield.size} areas still on a centre pad`);
+    } else {
+        console.log('airfields: none in the manifest — run `npm run bake:airports`');
+    }
+    return records;
+}
+
 function main(): void {
     const args = parseArgs(process.argv.slice(2));
     const manifestPath = path.join(args.src, 'manifest.json');
@@ -329,16 +407,19 @@ function main(): void {
     // is unchanged to the last decimal.
     const areas: Array<{ name: string; west: number; south: number; east: number; north: number }> =
         src.areas?.length ? src.areas : [{ name: 'terrain', ...src.coverage }];
-    const pads = areas.map(area => {
-        const home = PLAY_ORIGIN.lon >= area.west && PLAY_ORIGIN.lon <= area.east
-            && PLAY_ORIGIN.lat >= area.south && PLAY_ORIGIN.lat <= area.north;
-        const lat = home ? PLAY_ORIGIN.lat : (area.south + area.north) / 2;
-        const lon = home ? PLAY_ORIGIN.lon : (area.west + area.east) / 2;
-        const padBasis = home ? basis : makeEnuBasis(lat, lon, 0);
-        const heightMsl = computePadHeight(args.src, src, padBasis, AIRBASE_FLATTEN_PAD);
-        console.log(`pad ${area.name}: ${lat.toFixed(4)}, ${lon.toFixed(4)} -> `
-            + `${heightMsl.toFixed(2)} m MSL${home ? ' (home)' : ''}`);
-        return { ...AIRBASE_FLATTEN_PAD, lat, lon, basis: padBasis, heightMsl };
+    const padRecords = padRecordsFor(src, areas, args.src);
+    const airfieldsFile = src.airfields?.items?.length ? src.airfields : undefined;
+    // Each pad is evaluated in a frame centred on itself. The pad is an
+    // oriented box in ENU and ENU axes turn with position, so a box laid out in
+    // the bake's frame would sit skewed against the local north the runtime
+    // flattens against.
+    const pads = padRecords.map(rec => {
+        const padBasis = makeEnuBasis(rec.lat, rec.lon, 0);
+        const toEnu = (lat: number, lon: number) => {
+            const enu = ecefToEnu(padBasis, geodeticToEcef(lat, lon, 0));
+            return { e: enu.e, n: enu.n };
+        };
+        return { ...padFromRecord(rec, toEnu), basis: padBasis, lat: rec.lat, lon: rec.lon };
     });
 
     let tiles = args.only.length > 0
@@ -574,14 +655,16 @@ function main(): void {
             queryZoom: heightMaxZoom,
             coarseZoom: 7,
         },
-        flattenPads: pads.map(p => ({
-            lat: p.lat,
-            lon: p.lon,
-            halfW: p.halfW,
-            halfD: p.halfD,
-            featherM: p.featherM,
-            heightMsl: p.heightMsl,
-        })),
+        // The geodetic records, not the working pads built from them: those
+        // carry axes resolved in each pad's own ENU frame, and the runtime
+        // resolves its own against whichever play area it is flying in.
+        flattenPads: padRecords,
+        // A pointer, not the descriptions. Every runway, taxiway and apron in
+        // the pyramid is an order of magnitude larger than this manifest, and
+        // the manifest is fetched before anything can be drawn at all.
+        airfields: airfieldsFile === undefined
+            ? undefined
+            : { path: AIRFIELDS_FILE, count: airfieldsFile.items.length },
         bake: {
             tool: 'bake_planet_mesh',
             version: '1.0.0',
@@ -592,6 +675,15 @@ function main(): void {
         path.join(args.out, 'manifest.json'),
         `${JSON.stringify(outManifest, null, 2)}\n`,
     );
+    if (airfieldsFile !== undefined) {
+        const target = path.join(args.out, AIRFIELDS_FILE);
+        // Compact, unlike the manifest beside it: this is seven hundred
+        // taxiway point arrays that nobody reads by hand, and indenting them
+        // costs 600 KB of what the browser has to fetch and parse.
+        fs.writeFileSync(target, `${JSON.stringify(airfieldsFile)}\n`);
+        const kb = Math.round(fs.statSync(target).size / 1024);
+        console.log(`wrote ${airfieldsFile.items.length} airfields to ${target} (${kb} KB)`);
+    }
 
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(`wrote ${written.length} tiles, ${(totalBytes / 1048576).toFixed(1)} MB in ${secs}s`);

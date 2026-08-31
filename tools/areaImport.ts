@@ -329,6 +329,15 @@ function plan(job: Job, withCover: boolean): Step[] {
             label: 'baking coastline', cmd: PYTHON,
             args: ['tools/bake_osm_coast.py', `--bbox=${bbox}`],
         },
+        // After the coast, because an airfield's platform is checked against
+        // the land mask the coast bake just wrote — a runway the mask calls
+        // water is one the terrain will refuse to flatten. Before the cover,
+        // so the ground under the pavement can be painted as built rather than
+        // left as whatever grew there.
+        {
+            label: 'baking airfields', cmd: PYTHON,
+            args: ['tools/bake_osm_airports.py', `--bbox=${bbox}`],
+        },
     ];
     if (withCover) {
         steps.push({

@@ -199,7 +199,7 @@ palette/alpha heuristics get it wrong. The value can be either a literal
 `assets/planet` is a **build product**, not a tracked asset. It is gitignored
 and must be generated locally before the sim will show terrain.
 
-The pipeline has four stages:
+The pipeline has five stages:
 
 ```
 # 1. heights: WGS84 GeoTIFF -> .pdm pyramid + index.bin + manifest.json
@@ -210,16 +210,20 @@ python tools/bake_planet_dem.py --input data/output_hh.tif --out assets/planet
 pip install shapely requests
 python tools/bake_osm_coast.py --manifest assets/planet/manifest.json
 
-# 3. cover: landcover + satellite imagery -> .plc per tile   (optional)
+# 3. airfields: OSM aeroways -> an `airfields` block in manifest.json
+npm run bake:airports
+npm run verify:airports
+
+# 4. cover: landcover + satellite imagery -> .plc per tile   (optional)
 npm run fetch:cover
 npm run bake:cover
 
-# 4. meshes: .pdm + .lvr + .plc -> draw-ready .ptm tiles + index_mesh.bin
+# 5. meshes: .pdm + .lvr + .plc -> draw-ready .ptm tiles + index_mesh.bin
 npm run bake:mesh
 npm run verify:planet -- --dir assets/terrain
 ```
 
-Stage 4 is the only place terrain geometry is produced. The runtime fetches,
+Stage 5 is the only place terrain geometry is produced. The runtime fetches,
 decodes and draws — it never triangulates — so there is no fallback path that
 can drift out of sync with the bake.
 
@@ -236,8 +240,76 @@ invisible to it — and most are not water in the mesh at all. `verify_rivers.ts
 checks the other half: that every centreline reached the mesh as a stroke, that
 the stroke covers its length, and that none of it is buried under the terrain.
 
-Stage 3 is optional. Skip it and every land facet comes out plain grass, which
+Stage 4 is optional. Skip it and every land facet comes out plain grass, which
 is what the bake produced before cover existed.
+
+### Airfields
+
+Stage 3 pulls `aeroway=*` out of OpenStreetMap and writes an `airfields` block
+into `assets/planet/manifest.json`. It is the same data openairportmap.org
+draws — that site is an Overpass front end over `aeroway`, so this queries
+Overpass directly and caches the answer in `data/osm-cache` alongside the coast
+bake's.
+
+Per airfield it records the runways as OSM has them (centre, true heading,
+measured length, width, surface, and the `ref` the designators are painted
+from), the taxiways, aprons and buildings, a set of oriented rectangles the
+terrain would have to be cut flat under, and one plane — height and
+longitudinal gradient — fitted to the DEM across that footprint.
+
+The mesh bake reads those rectangles and cuts the terrain to them — oriented to
+the runway and following its fitted slope, rather than levelled into a shelf.
+The cover bake paints the same footprints as built ground, and both the shore
+classifier and the runtime height sampler treat a platform's flat core as land
+whatever the coastline says, which is what keeps Gran Canaria's seaward apron
+from coming out as a notch of open ocean.
+
+It also copies the descriptions to `assets/terrain/airfields.json` — a sibling
+file rather than a manifest block, because the runways, taxiways and aprons of
+a whole pyramid run to 350 KB against a 44 KB manifest that is fetched before
+anything can be drawn. The runtime builds each airfield's pavement, threshold
+bars, painted designators, aiming points, centreline, taxiways and aprons as
+flat geometry laid on the same plane the terrain was cut to, and makes each
+runway solid ground.
+
+The sim is then based at one of them: the nearest usable airfield to the play
+origin, which is where the spawns are, which way the ILS points, and what the
+hangars, the tower and the ramp are laid out around. The spawn menu offers the
+others. AI pilots are handed every runway in the area and pick their own by
+proximity, so one that takes off from a field returns to it.
+
+Only the runway strips and the largest aprons are cut flat, so the taxiways and
+the rest of the aprons are draped on the terrain instead of laid on the
+airfield's plane — the network reaches a kilometre past the strips, and on the
+plane it floats or buries itself by up to twenty metres. Concrete gets its own
+palette tone: a slab-laid military field reads markedly paler than an asphalt
+civil one, and the taxiways and aprons follow their own runway's surface.
+
+Widths come from OSM where it has them and from the aerodrome class where it
+does not, which for taxiways is almost always — 667 of 684 across the baked
+airfields carry no `width` tag at all. The defaults are Annex 14's code
+letters: 23 m at an international field down to 10.5 m at a light-aircraft
+strip, and the same idea gives runways 45 m down to 18 m.
+
+**The invented pad is gone.** An area with a real airfield in it no longer gets
+the 1 x 4 km level box flattened at its centre, and `assets/runway01.gltf` is
+only drawn for an area that has no airfield at all — a pyramid baked before
+this stage existed, which still gets exactly the world it always had.
+
+Two details worth knowing when reading the report:
+
+- **The gradient is clamped to ICAO limits** (1% for runways over 1200 m, 2%
+  below). A steeper fit is the DEM disagreeing with itself, not a runway.
+- **SRTM is a surface model.** It has terminal roofs and hangars in it, and an
+  airport is where those are large and numerous. The fit trims its high tail
+  and reports what it dropped as `outlierMaxM` — at Gran Canaria, whose
+  platform carries 59 mapped buildings, that is 31 m of terminal.
+
+`npm run verify:airports` re-derives all of it from what is on disk, with no
+network, and separates *problems* (the heights are gone, or the stored plane no
+longer matches them — exit 1) from *notes* (OSM disagreeing with itself, which
+it does constantly on small fields — exit 0). Add `--verbose` for a line per
+airfield, or `--icao GCLP` for one.
 
 ### Height sources
 
@@ -303,6 +375,7 @@ area, not both. `merge_planet_dem.py` is the additive form.
 npm run fetch:dem -- --bbox 7.6,45.9,7.8,46.0 --out data/imports/alps.tif
 npm run merge:dem -- --input data/imports/alps.tif --out assets/planet
 python tools/bake_osm_coast.py --bbox 7.6,45.9,7.8,46.0
+npm run bake:airports -- --bbox 7.6,45.9,7.8,46.0
 npm run fetch:cover -- --bbox 7.6,45.9,7.8,46.0
 npm run bake:cover -- --bbox 7.6,45.9,7.8,46.0
 npm run bake:mesh -- --bbox 7.6,45.9,7.8,46.0
@@ -311,8 +384,8 @@ npm run bake:mesh -- --bbox 7.6,45.9,7.8,46.0
 **Pass the same `--bbox` to every stage.** It is what makes each one additive.
 Without it a stage walks the whole pyramid, and since its sources only cover
 the new area, every tile outside gets rewritten from nothing: stage 2 turns
-other coastlines into open ocean, stage 3 writes unknown-class cover over
-real cover, stage 4 re-meshes the world for no reason. With it, each stage
+other coastlines into open ocean, stage 4 writes unknown-class cover over
+real cover, stage 5 re-meshes the world for no reason. With it, each stage
 touches only the tiles that overlap, and merges its pyramid-wide records
 (the index, the swatch table, the level skirts, the coverage box) with what
 the previous bake left rather than replacing them.

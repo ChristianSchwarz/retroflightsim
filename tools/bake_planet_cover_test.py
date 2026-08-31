@@ -16,7 +16,7 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 
-from bake_planet_cover import Source
+from bake_planet_cover import CLS_BUILT, CLS_GRASS, Source, stamp_airfield_classes
 
 NODATA = 255
 
@@ -78,6 +78,61 @@ class ReadOntoTest(unittest.TestCase):
         # The western half is inside the raster, the eastern half is not.
         self.assertTrue(np.all(out[0, :, :14] == 7), 'inside the raster went blank')
         self.assertTrue(np.all(out[0, :, 18:] == NODATA), 'data spilled past the edge')
+
+
+class StampAirfieldClassesTest(unittest.TestCase):
+    """The ground under a runway must not be whatever grew there before it."""
+
+    # A 0.01 deg tile near the Gran Canaria play origin, 33 nodes a side, so a
+    # node is roughly 35 m.
+    BOUNDS = (-15.40, 28.00, -15.39, 28.01)
+    SIZE = 33
+
+    def grid(self):
+        return np.full((self.SIZE, self.SIZE), CLS_GRASS, dtype=np.uint8)
+
+    def pad(self, **kw):
+        base = {
+            'lat': 28.005, 'lon': -15.395, 'headingDeg': 0.0,
+            'halfD': 400.0, 'halfW': 120.0, 'featherM': 40.0,
+        }
+        base.update(kw)
+        return base
+
+    def test_paints_the_core_and_leaves_the_rest(self):
+        classes = self.grid()
+        changed = stamp_airfield_classes(classes, self.BOUNDS, self.SIZE, [self.pad()])
+        self.assertGreater(changed, 0)
+        self.assertEqual(classes[self.SIZE // 2, self.SIZE // 2], CLS_BUILT)
+        # The corners are far outside a 240 x 800 m strip through the middle.
+        for row, col in ((0, 0), (0, -1), (-1, 0), (-1, -1)):
+            self.assertEqual(classes[row, col], CLS_GRASS)
+
+    def test_turns_with_the_runway(self):
+        along = self.grid()
+        across = self.grid()
+        stamp_airfield_classes(along, self.BOUNDS, self.SIZE, [self.pad(headingDeg=0.0)])
+        stamp_airfield_classes(across, self.BOUNDS, self.SIZE, [self.pad(headingDeg=90.0)])
+        mid = self.SIZE // 2
+        # 8 nodes off centre is ~276 m north or ~246 m east: inside the 360 m
+        # core along the strip, well outside the 80 m core across it. So a
+        # north-south strip is built up the middle column and not along the
+        # middle row, and turned 90 degrees it is exactly the other way round.
+        self.assertEqual(along[8, mid], CLS_BUILT)
+        self.assertEqual(along[mid, 8], CLS_GRASS)
+        self.assertEqual(across[mid, 8], CLS_BUILT)
+        self.assertEqual(across[8, mid], CLS_GRASS)
+
+    def test_a_pad_on_another_island_touches_nothing(self):
+        classes = self.grid()
+        changed = stamp_airfield_classes(
+            classes, self.BOUNDS, self.SIZE, [self.pad(lat=27.93, lon=-15.39)])
+        self.assertEqual(changed, 0)
+        self.assertTrue(np.all(classes == CLS_GRASS))
+
+    def test_no_pads_is_a_no_op(self):
+        classes = self.grid()
+        self.assertEqual(stamp_airfield_classes(classes, self.BOUNDS, self.SIZE, []), 0)
 
 
 if __name__ == '__main__':

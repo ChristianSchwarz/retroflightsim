@@ -28,8 +28,6 @@ Optional: ``osmcoastline`` binary for robust coastline assembly from PBF.
 from __future__ import annotations
 
 import argparse
-import gzip
-import hashlib
 import json
 import math
 import os
@@ -54,6 +52,26 @@ except ImportError:
     print('error: shapely and requests are required (pip install shapely requests)', file=sys.stderr)
     raise
 
+from osm_common import (
+    DemSampler,
+    LAND,
+    LWM_MAGIC,
+    WATER,
+    Bounds,
+    glue_negative_bbox,
+    load_manifest,
+    nodes_map as _nodes_map,
+    overpass_fetch as _overpass_fetch,
+    parse_bbox,
+    read_lwm,
+    relation_rings as _relation_rings,
+    snap_bounds_to_tiles,
+    tagged_width_m as _tagged_width_m,
+    tile_bounds,
+    tile_range_for_bounds,
+    ways_map as _ways_map,
+)
+
 try:
     from rasterio.features import rasterize
     from rasterio.transform import from_bounds as transform_from_bounds
@@ -61,11 +79,6 @@ try:
 except ImportError:
     HAS_RASTERIO = False
 
-LWM_MAGIC = b'LWM1'
-LWM_HEADER_BYTES = 8
-LWM_NODATA = 255
-LAND = 1
-WATER = 0
 
 LVR_MAGIC = b'LVR1'
 LVR2_MAGIC = b'LVR2'
@@ -88,10 +101,6 @@ SURFACE_PERCENTILE = 5.0
 # assembly rather than as open sea. See the check in :func:`bake`.
 MIN_PLAUSIBLE_LAND_FRACTION = 0.005
 
-# Overpass responses are cached by query hash. The public endpoints refuse
-# large queries often enough that without this a single 500 costs another full
-# fetch, and a bake that fails at a later stage re-downloads everything.
-OSM_CACHE_DIR = os.path.join('data', 'osm-cache')
 
 # Width to assume for a watercourse OSM maps as a bare centreline with no
 # `width` tag on it, which is most of them. Used for two things: the water
@@ -106,109 +115,6 @@ WATERWAY_FALLBACK_WIDTH_M = {'river': 30.0, 'canal': 12.0}
 # costs a little shape and no continuity at all. It is what keeps a z8 tile
 # from carrying every bend the z12 one does.
 LINE_SIMPLIFY_CELLS = 0.5
-
-OVERPASS_URLS = (
-    'https://overpass.kumi.systems/api/interpreter',
-    'https://overpass-api.de/api/interpreter',
-)
-
-
-@dataclass(frozen=True)
-class Bounds:
-    west: float
-    south: float
-    east: float
-    north: float
-
-    def as_overpass(self) -> str:
-        return f'{self.south},{self.west},{self.north},{self.east}'
-
-    def as_box(self) -> Polygon:
-        return box(self.west, self.south, self.east, self.north)
-
-
-def tile_bounds(z: int, x: int, y: int) -> Bounds:
-    span = 180.0 / (1 << z)
-    west = -180.0 + x * span
-    north = 90.0 - y * span
-    return Bounds(west, north - span, west + span, north)
-
-
-def tile_range_for_bounds(z: int, b: Bounds) -> Tuple[int, int, int, int]:
-    span = 180.0 / (1 << z)
-    nx, ny = (1 << (z + 1)), (1 << z)
-    x0 = int(math.floor((b.west + 180.0) / span))
-    x1 = int(math.ceil((b.east + 180.0) / span)) - 1
-    y0 = int(math.floor((90.0 - b.north) / span))
-    y1 = int(math.ceil((90.0 - b.south) / span)) - 1
-    return (max(0, x0), max(0, y0), min(nx - 1, max(0, x1)), min(ny - 1, max(0, y1)))
-
-
-def snap_bounds_to_tiles(b: Bounds, zoom: int) -> Bounds:
-    """Grow a bbox outwards until it lands on whole tile edges at `zoom`.
-
-    Every tile this bake writes is written *whole*, from land assembled for the
-    bbox and nothing else. A tile the bbox cuts through therefore comes out land
-    on one side of the cut and open ocean on the other — and it is written over
-    whatever a previous area baked there.
-
-    That is the seam between two imported areas. Measured on two overlapping
-    Crimea imports: the second area's raw southern edge fell at lat 45.204449,
-    a third of the way down tile row 1019, and the bake rewrote that whole row
-    with the lower two thirds as sea. A 3.5 km strip of Black Sea straight
-    across the middle of the peninsula, over ground the first area had baked
-    correctly.
-
-    Snapping is the same fix `fetch_planet_dem.py` already applies to the DEM,
-    and for the same reason: a stage whose sources stop mid-tile cannot write
-    that tile. Outwards rather than inwards, so nothing the caller asked for is
-    dropped; the cost is at most one extra tile ring, baked with real data.
-    """
-    span = 180.0 / (1 << zoom)
-    # A bbox already on an edge must not grow: floating point lands a whole
-    # number a hair either side of itself, and ceil() of 1020.0000001 is a tile
-    # further out than asked for.
-    lo = lambda v: math.floor(v + 1e-9)
-    hi = lambda v: math.ceil(v - 1e-9)
-    return Bounds(
-        west=lo((b.west + 180.0) / span) * span - 180.0,
-        south=90.0 - hi((90.0 - b.south) / span) * span,
-        east=hi((b.east + 180.0) / span) * span - 180.0,
-        north=90.0 - lo((90.0 - b.north) / span) * span,
-    )
-
-
-def glue_negative_bbox(argv: Sequence[str]) -> List[str]:
-    """Rewrite ``--bbox -18.66,...`` into the ``--bbox=-18.66,...`` argparse takes.
-
-    Every western-hemisphere bbox starts with a minus, and argparse reads that
-    as the next option rather than this one's value - including the Canaries
-    example in this file's own docstring, which could not be run as written.
-    Its negative-number escape hatch only recognises a bare number, and a bbox
-    has commas in it.
-    """
-    out: List[str] = []
-    i = 0
-    while i < len(argv):
-        if argv[i] == '--bbox' and i + 1 < len(argv) and argv[i + 1].startswith('-'):
-            out.append(f'--bbox={argv[i + 1]}')
-            i += 2
-            continue
-        out.append(argv[i])
-        i += 1
-    return out
-
-
-def parse_bbox(text: str) -> Bounds:
-    parts = [float(p.strip()) for p in text.split(',')]
-    if len(parts) != 4:
-        raise ValueError('bbox must be west,south,east,north')
-    return Bounds(parts[0], parts[1], parts[2], parts[3])
-
-
-def load_manifest(path: str) -> dict:
-    with open(path, encoding='utf-8') as fh:
-        return json.load(fh)
 
 
 def decode_index(index_path: str, min_zoom: int, max_zoom: int) -> Dict[int, Set[Tuple[int, int]]]:
@@ -262,51 +168,6 @@ def scan_pdm_tiles(out_dir: str, min_zoom: int, max_zoom: int) -> Dict[int, Set[
     return tiles
 
 
-def overpass_cache_path(query: str) -> str:
-    key = hashlib.sha1(query.encode('utf-8')).hexdigest()[:16]
-    return os.path.join(OSM_CACHE_DIR, f'{key}.json.gz')
-
-
-def _overpass_fetch(query: str, label: str, refresh: bool) -> dict:
-    """One Overpass request, cached by query hash."""
-    cache = overpass_cache_path(query)
-    if not refresh and os.path.isfile(cache):
-        try:
-            with gzip.open(cache, 'rt', encoding='utf-8') as fh:
-                data = json.load(fh)
-            print(f'using cached OSM {label} ({cache})')
-            return data
-        except Exception:
-            print(f'  cached {label} unreadable, re-fetching', file=sys.stderr)
-
-    headers = {
-        'User-Agent': 'retroflightsim-coast-bake/1.0',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
-    }
-    body = ('data=' + requests.utils.quote(query)).encode('utf-8')
-    last_err: Optional[Exception] = None
-    for url in OVERPASS_URLS:
-        print(f'fetching OSM {label} via Overpass ({url})…')
-        try:
-            resp = requests.post(url, data=body, headers=headers, timeout=300)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get('remark'):
-                print(f'  overpass remark: {data["remark"]}', file=sys.stderr)
-            try:
-                os.makedirs(OSM_CACHE_DIR, exist_ok=True)
-                with gzip.open(cache, 'wt', encoding='utf-8') as fh:
-                    json.dump(data, fh)
-                print(f'  cached to {cache}')
-            except Exception as err:
-                print(f'  could not cache the response: {err}', file=sys.stderr)
-            return data
-        except Exception as err:
-            last_err = err
-            print(f'  overpass failed: {err}', file=sys.stderr)
-    raise RuntimeError(f'all Overpass endpoints failed: {last_err}')
-
-
 def overpass_query(b: Bounds, refresh: bool = False) -> dict:
     """Fetch the coastline and the water features as two separate requests.
 
@@ -351,65 +212,11 @@ out skel qt;
     return {'elements': elements}
 
 
-def _nodes_map(elements: Sequence[dict]) -> Dict[int, Tuple[float, float]]:
-    out: Dict[int, Tuple[float, float]] = {}
-    for el in elements:
-        if el.get('type') == 'node':
-            out[el['id']] = (el['lon'], el['lat'])
-    return out
-
-
 def _way_line(way: dict, nodes: Dict[int, Tuple[float, float]]) -> Optional[LineString]:
     coords = [nodes[nid] for nid in way.get('nodes', []) if nid in nodes]
     if len(coords) < 2:
         return None
     return LineString(coords)
-
-
-def _relation_rings(relation: dict, ways: Dict[int, dict], nodes: Dict[int, Tuple[float, float]]) -> List[List[Tuple[float, float]]]:
-    """Assemble outer rings from a multipolygon relation."""
-    outer_ways: List[List[int]] = []
-    for m in relation.get('members', []):
-        if m.get('type') != 'way' or m.get('role') not in ('outer', ''):
-            continue
-        wid = m.get('ref')
-        if wid in ways:
-            outer_ways.append(ways[wid].get('nodes', []))
-    if not outer_ways:
-        return []
-    # Chain way segments into closed rings.
-    rings: List[List[Tuple[float, float]]] = []
-    used: Set[int] = set()
-    for start_idx, start_nodes in enumerate(outer_ways):
-        if start_idx in used:
-            continue
-        chain = list(start_nodes)
-        used.add(start_idx)
-        changed = True
-        while changed:
-            changed = False
-            for j, seg in enumerate(outer_ways):
-                if j in used:
-                    continue
-                if chain[-1] == seg[0]:
-                    chain.extend(seg[1:])
-                    used.add(j)
-                    changed = True
-                elif chain[-1] == seg[-1]:
-                    chain.extend(reversed(seg[:-1]))
-                    used.add(j)
-                    changed = True
-                elif chain[0] == seg[-1]:
-                    chain = seg[:-1] + chain
-                    used.add(j)
-                    changed = True
-                elif chain[0] == seg[0]:
-                    chain = list(reversed(seg[1:])) + chain
-                    used.add(j)
-                    changed = True
-        if len(chain) >= 4 and chain[0] == chain[-1]:
-            rings.append([nodes[n] for n in chain if n in nodes])
-    return rings
 
 
 @dataclass
@@ -436,48 +243,6 @@ class WaterBody:
     geom: object
     flat: bool
     height: Optional[float] = None
-
-
-def _ways_map(elements: Sequence[dict]) -> Dict[int, dict]:
-    """Ways by id, keeping the tagged copy when an id appears more than once.
-
-    Overpass answers `out body; >; out skel qt;` by printing the matched
-    elements with their tags and then everything reached by recursion *without*
-    them. A coastline way that is also a member of, say, a water relation comes
-    back twice - once tagged, once as a bare skeleton - and a plain
-    `{el['id']: el}` lets whichever arrives last win.
-
-    On the Crimea bbox that silently untagged 163 of 667 coastline ways. The
-    remaining 504 could not close the chain, `polygonize` returned a single
-    face the size of the bbox, and the entire peninsula baked as open sea.
-    """
-    out: Dict[int, dict] = {}
-    for el in elements:
-        if el.get('type') != 'way':
-            continue
-        prev = out.get(el['id'])
-        if prev is None or (not prev.get('tags') and el.get('tags')):
-            out[el['id']] = el
-    return out
-
-
-def _tagged_width_m(tags: dict) -> Optional[float]:
-    """Metres from a `width` tag, tolerating the usual '12 m' / '12,5' forms."""
-    raw = tags.get('width') or tags.get('est_width')
-    if not raw:
-        return None
-    text = str(raw).strip().replace(',', '.')
-    number = ''
-    for ch in text:
-        if ch.isdigit() or ch == '.':
-            number += ch
-        else:
-            break
-    try:
-        value = float(number)
-    except ValueError:
-        return None
-    return value if value > 0 else None
 
 
 def waterway_width_m(tags: dict) -> Optional[float]:
@@ -756,77 +521,10 @@ def run_osmcoastline(pbf: str, out_shp: str) -> bool:
     return False
 
 
-PDM_MAGIC = b'PDM1'
-PDM_HEADER_BYTES = 24
-PDM_NODATA = 0xFFFF
-
 # Perimeter samples per body. A cap, not a target: a lake with a 400 km shore
 # does not need a sample every 20 m to place a percentile.
 MAX_PERIMETER_SAMPLES = 2048
 MIN_PERIMETER_SAMPLES = 8
-# Decoded .pdm tiles held at once. 257x257 float32 is 264 KB, so this is a
-# ~70 MB ceiling on a bake that would otherwise cache the whole pyramid.
-DEM_CACHE_TILES = 256
-
-
-def decode_pdm(blob: bytes) -> np.ndarray:
-    """Heights from a .pdm tile as float32, voids as NaN.
-
-    A local reader rather than an import of tools/bake_planet_dem.py: that
-    module requires rasterio at import time and this one deliberately treats
-    rasterio as optional. The on-disk format is fixed, so the duplication is
-    cheap where the dependency would not be.
-    """
-    payload = zlib.decompress(blob)
-    magic, n, _flags, _pad, lo, _hi, scale, _err = struct.unpack_from(
-        '<4sHBBffff', payload, 0)
-    if magic != PDM_MAGIC:
-        raise ValueError(f'not a {PDM_MAGIC.decode()} tile: {magic!r}')
-    q = np.frombuffer(payload, dtype='<u2', count=n * n,
-                      offset=PDM_HEADER_BYTES).reshape(n, n)
-    grid = (lo + q.astype(np.float32) * scale).astype(np.float32)
-    grid[q == PDM_NODATA] = np.nan
-    return grid
-
-
-class DemSampler:
-    """Nearest-node lookups into the .pdm pyramid at one zoom level."""
-
-    def __init__(self, out_dir: str, zoom: int, tile_size: int):
-        self.out_dir = out_dir
-        self.zoom = zoom
-        self.n = tile_size
-        self.span = 180.0 / (1 << zoom)
-        self._cache: Dict[Tuple[int, int], Optional[np.ndarray]] = {}
-
-    def _tile(self, x: int, y: int) -> Optional[np.ndarray]:
-        key = (x, y)
-        if key not in self._cache:
-            if len(self._cache) >= DEM_CACHE_TILES:
-                self._cache.clear()
-            path = os.path.join(self.out_dir, str(self.zoom), str(x), f'{y}.pdm')
-            grid: Optional[np.ndarray] = None
-            if os.path.isfile(path):
-                try:
-                    with open(path, 'rb') as fh:
-                        grid = decode_pdm(fh.read())
-                except Exception:
-                    grid = None
-            self._cache[key] = grid
-        return self._cache[key]
-
-    def sample(self, lon: float, lat: float) -> float:
-        """Height at lon/lat, or NaN where the pyramid holds no data."""
-        x = int(math.floor((lon + 180.0) / self.span))
-        y = int(math.floor((90.0 - lat) / self.span))
-        grid = self._tile(x, y)
-        if grid is None:
-            return float('nan')
-        b = tile_bounds(self.zoom, x, y)
-        cells = self.n - 1
-        col = int(round((lon - b.west) / (b.east - b.west) * cells))
-        row = int(round((b.north - lat) / (b.north - b.south) * cells))
-        return float(grid[min(cells, max(0, row)), min(cells, max(0, col))])
 
 
 def flat_body_height(
@@ -968,31 +666,6 @@ def encode_lwm(grid: bytes, n: int) -> bytes:
     header = struct.pack('<4sHBB', LWM_MAGIC, n, 0, 0)
     payload = header + grid
     return zlib.compress(payload, 6)
-
-
-def decode_lwm(blob: bytes) -> Tuple[bytearray, int]:
-    """Inverse of :func:`encode_lwm`: returns (grid, n)."""
-    payload = zlib.decompress(blob)
-    magic, n, _f0, _f1 = struct.unpack('<4sHBB', payload[:8])
-    if magic != LWM_MAGIC:
-        raise ValueError(f'not a {LWM_MAGIC.decode()} tile: {magic!r}')
-    return bytearray(payload[8:8 + n * n]), n
-
-
-def read_lwm(out_dir: str, z: int, x: int, y: int) -> Optional[bytearray]:
-    """A previously baked mask, or None if this tile was never written.
-
-    Needed because a coarse mask is decimated from its four children, and
-    :func:`build_parent_mask` leaves any quadrant it is not given as water. Bake
-    one area and the ancestors it shares with an area baked earlier would come
-    back with that earlier land drowned.
-    """
-    path = os.path.join(out_dir, str(z), str(x), f'{y}.lwm')
-    if not os.path.isfile(path):
-        return None
-    with open(path, 'rb') as fh:
-        grid, _n = decode_lwm(fh.read())
-    return grid
 
 
 def vector_simplify_tol(z: int, max_zoom: int, tile_size: int) -> float:

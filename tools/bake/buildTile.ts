@@ -20,7 +20,9 @@
  */
 
 import { EnuBasis, Ecef, Enu, ecefToEnu, geodeticToEcef } from '../../src/script/terrain/geodesy';
-import { FlattenPad, applyFlattenPad } from '../../src/script/terrain/flattenPad';
+import {
+    FlattenPad, applyFlattenPad, padBlendWeight, padReachM,
+} from '../../src/script/terrain/flattenPad';
 import { CLASS_TO_TONE, TerrainClass, TerrainTone } from '../../src/script/terrain/tones';
 import { PTM_MAX_RIVER_VERTS, PtmTileId, encodePtm } from '../../src/script/terrain/ptm';
 import { GridTriangle, decimate } from './decimate';
@@ -126,7 +128,7 @@ export interface BuildTileInput {
     triangleBudget?: number;
     /**
      * Baked flatten pads, heightMsl included, each with the ENU frame it is
-     * laid out in. A pad is an axis-aligned box in ENU and ENU axes turn with
+     * laid out in. A pad is an oriented box in ENU and ENU axes turn with
      * position, so a pad far from the bake's origin has to be measured in its
      * own frame or it sits skewed against the local north the runtime uses.
      */
@@ -184,13 +186,18 @@ const NEIGHBOURHOOD = [
  * work. The longitude span widens with latitude because a degree of longitude
  * is shorter there.
  */
-function padLatSpan(pad: { halfD: number; featherM: number }): number {
-    return (pad.halfD + pad.featherM) / 110540 + 1e-4;
+// The cheap reject boxes below are sized from the pad's reach — the radius that
+// holds it whichever way it is turned — rather than from halfD and halfW
+// separately, which only bound a pad pointing due north. A pad at 032 with the
+// old spans would have had its corners rejected and come out with two of them
+// unflattened.
+function padLatSpan(pad: FlattenPad): number {
+    return padReachM(pad) / 110540 + 1e-4;
 }
 
-function padLonSpan(pad: { halfW: number; featherM: number; lat: number }): number {
+function padLonSpan(pad: FlattenPad & { lat: number }): number {
     const shrink = Math.max(0.05, Math.cos(pad.lat * Math.PI / 180));
-    return (pad.halfW + pad.featherM) / (111320 * shrink) + 1e-4;
+    return padReachM(pad) / (111320 * shrink) + 1e-4;
 }
 
 /**
@@ -266,12 +273,35 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     const { size, heights, bounds, seaLevel, basis } = input;
     const cells = size - 1;
 
+    // A point the pads have already levelled is ground, so the shoreline pass
+    // below must not leave it as sea. Only the pad *core* counts: the feather
+    // is where the platform blends into whatever is around it, and if that is
+    // the sea then blending into the sea is right.
+    const pads = input.pads;
+    const paved = pads && pads.length > 0
+        ? (lon: number, lat: number): boolean => {
+            for (const pad of pads) {
+                if (Math.abs(lat - pad.lat) > padLatSpan(pad)
+                    || Math.abs(lon - pad.lon) > padLonSpan(pad)) {
+                    continue;
+                }
+                geodeticToEcef(lat, lon, 0, _ecef);
+                ecefToEnu(pad.basis, _ecef, _padEnu);
+                if (padBlendWeight(_padEnu.e, _padEnu.n, pad) >= 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        : undefined;
+
     const shoreline = buildShoreline({
         polygons: input.polygons ?? [],
         inland: input.inland,
         bounds,
         size,
         simplifyCells: input.simplifyCells,
+        paved,
     });
 
     // --- 3. budget-constrained decimation ---------------------------------

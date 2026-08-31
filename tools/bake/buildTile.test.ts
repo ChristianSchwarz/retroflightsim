@@ -385,6 +385,92 @@ describe('buildTile', () => {
             })).bytes;
             assert.deepEqual(Array.from(a), Array.from(b));
         });
+
+        it('cuts the platform to a slope rather than to a shelf', () => {
+            // 0.8% along the pad axis, which is due north here. A real runway
+            // is allowed 1%, and forcing one level carves a step into ground
+            // that falls across the airfield.
+            const gradient = 0.008;
+            const sloped = [{
+                ...pads[0], gradE: 0, gradN: gradient,
+            }];
+            const r = buildTile(base({
+                heights: heightsFrom(() => 40),
+                polygons: [coastAt(CELLS + 2)],
+                pads: sloped, skirtDepthM: 0,
+            }));
+            const tile = decodePtm(r.bytes);
+            const centre = ecefToEnu(BASIS, geodeticToEcef(
+                (BOUNDS.south + BOUNDS.north) / 2,
+                (BOUNDS.west + BOUNDS.east) / 2,
+                r.centerHeightM,
+            ));
+
+            let checked = 0;
+            let lowest = Infinity;
+            let highest = -Infinity;
+            for (let v = 0; v < tile.landPositions.length / 3; v++) {
+                const e = centre.e + tile.landPositions[v * 3] * tile.quantScale;
+                const u = centre.u + tile.landPositions[v * 3 + 1] * tile.quantScale;
+                const n = centre.n - tile.landPositions[v * 3 + 2] * tile.quantScale;
+                if (padBlendWeight(e, n, pad) < 1) {
+                    continue;
+                }
+                checked++;
+                lowest = Math.min(lowest, u);
+                highest = Math.max(highest, u);
+                assert.ok(Math.abs(u - (pad.heightMsl + gradient * n)) < 1.5,
+                    `vertex ${n.toFixed(0)} m north sits at ${u.toFixed(2)} m`);
+            }
+            assert.ok(checked > 0, 'no vertices landed inside the pad core');
+            assert.ok(highest - lowest > 1,
+                'the platform came out level, so the gradient was ignored');
+        });
+
+        it('treats the platform as land where the coast says otherwise', () => {
+            // Gran Canaria: the airport is built out onto the shore and part of
+            // its apron falls outside the OSM coastline. Left as sea, that is a
+            // notch of open ocean through the middle of a flattened airfield.
+            const allSea: CoastPolygon[] = [];
+            const withPad = buildTile(base({
+                heights: heightsFrom(() => 0), polygons: allSea,
+                pads, skirtDepthM: 0,
+            }));
+            const without = buildTile(base({
+                heights: heightsFrom(() => 0), polygons: allSea, skirtDepthM: 0,
+            }));
+            assert.equal(without.landTriangles, 0, 'the tile should be all sea without a pad');
+            assert.ok(withPad.landTriangles > 0,
+                'the pad core did not become land');
+
+            // And the surface it became sits at the pad height, not at sea
+            // level. The *highest* vertex, because the land stream also holds
+            // the feet of the shore walls that now drop from the platform edge
+            // to the water beside it, and those belong at sea level.
+            const tile = decodePtm(withPad.bytes);
+            const centre = ecefToEnu(BASIS, geodeticToEcef(
+                (BOUNDS.south + BOUNDS.north) / 2,
+                (BOUNDS.west + BOUNDS.east) / 2,
+                withPad.centerHeightM,
+            ));
+            let highest = -Infinity;
+            let atPadHeight = 0;
+            for (let v = 0; v < tile.landPositions.length / 3; v++) {
+                const e = centre.e + tile.landPositions[v * 3] * tile.quantScale;
+                const u = centre.u + tile.landPositions[v * 3 + 1] * tile.quantScale;
+                const n = centre.n - tile.landPositions[v * 3 + 2] * tile.quantScale;
+                if (padBlendWeight(e, n, pad) < 1) {
+                    continue;
+                }
+                highest = Math.max(highest, u);
+                if (Math.abs(u - pad.heightMsl) < 1.5) {
+                    atPadHeight++;
+                }
+            }
+            assert.ok(Math.abs(highest - pad.heightMsl) < 1.5,
+                `platform tops out at ${highest.toFixed(2)} m, expected ~${pad.heightMsl}`);
+            assert.ok(atPadHeight > 0, 'nothing was raised to the pad height');
+        });
     });
 
     describe('skirts', () => {
