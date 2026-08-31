@@ -65,6 +65,67 @@ function classesIn(bytes: Uint8Array): Set<number> {
     return out;
 }
 
+/** ENU of the tile's centre, which is what its vertices are relative to. */
+function tileCentreEnu(centerHeightM = 0) {
+    return ecefToEnu(BASIS, geodeticToEcef(
+        (BOUNDS.south + BOUNDS.north) / 2, (BOUNDS.west + BOUNDS.east) / 2, centerHeightM));
+}
+
+/** A pad centred `de` east and `dn` north of the tile centre. */
+function padAt(de: number, dn: number) {
+    const centre = tileCentreEnu();
+    return {
+        centerX: centre.e + de, centerZ: centre.n + dn,
+        halfW: 500, halfD: 2000, featherM: 80, heightMsl: 41.7,
+        basis: BASIS, lat: 28.0015, lon: -15.3937,
+    };
+}
+
+/**
+ * The height the tile is actually *drawn* at, anywhere on it.
+ *
+ * Reading vertices alone cannot catch a leaf that spans a feature: its corners
+ * can be exactly right while everything the triangle interpolates between them
+ * is wrong. This walks the land facets and interpolates, which is what the
+ * player sees. NaN where no facet covers the point.
+ */
+function landSurface(r: ReturnType<typeof buildTile>): (e: number, n: number) => number {
+    const tile = decodePtm(r.bytes);
+    const centre = tileCentreEnu(r.centerHeightM);
+    const p = tile.landPositions;
+    const s = tile.quantScale;
+    // Absolute ENU per vertex; tile z runs south, so north flips sign.
+    const at = (v: number) => ({
+        e: centre.e + p[v * 3] * s,
+        u: centre.u + p[v * 3 + 1] * s,
+        n: centre.n - p[v * 3 + 2] * s,
+    });
+    return (e: number, n: number) => {
+        let best = NaN;
+        for (let v = 0; v + 2 < p.length / 3; v += 3) {
+            const a = at(v);
+            const b = at(v + 1);
+            const c = at(v + 2);
+            const d = (b.n - c.n) * (a.e - c.e) + (c.e - b.e) * (a.n - c.n);
+            if (Math.abs(d) < 1e-9) {
+                continue;               // a skirt, seen edge-on from above
+            }
+            const l0 = ((b.n - c.n) * (e - c.e) + (c.e - b.e) * (n - c.n)) / d;
+            const l1 = ((c.n - a.n) * (e - c.e) + (a.e - c.e) * (n - c.n)) / d;
+            const l2 = 1 - l0 - l1;
+            if (l0 < -1e-6 || l1 < -1e-6 || l2 < -1e-6) {
+                continue;
+            }
+            const u = l0 * a.u + l1 * b.u + l2 * c.u;
+            // The topmost facet is the one that would be seen.
+            if (!(best > u)) {
+                best = u;
+            }
+        }
+        return best;
+    };
+}
+
 function base(overrides: Partial<BuildTileInput> = {}): BuildTileInput {
     return {
         id: { z: 12, x: 3745, y: 1410 },
@@ -376,6 +437,53 @@ describe('buildTile', () => {
                 heights: bumpy, polygons: [coastAt(CELLS + 2)],
             })).bytes;
             assert.notDeepEqual(Array.from(withPad), Array.from(without));
+        });
+
+        it('cuts the platform across the whole core, not just at leaf corners', () => {
+            // The pad is applied per *vertex*, so the decimator has to measure
+            // its error against the padded surface: merged on the raw DEM, a
+            // leaf straddling the rim meets the platform only at its corners
+            // and interpolates flat across everything between them. Measured
+            // at Gran Canaria, that left a 407 m leaf carrying the ground five
+            // to six metres over aprons 150 m inside the flat core — and the
+            // pavement, which is draped on the height query, drawn buried.
+            //
+            // Uniform heights are the sharpest form of it: nothing for the
+            // error test to see, so without the pad the whole tile merges into
+            // one leaf whose four corners all sit outside the pad.
+            const PLATEAU = 300;
+            const small = {
+                ...padAt(0, 0), halfW: 300, halfD: 400, featherM: 80, heightMsl: 41.7,
+            };
+            // Under a budget, too: the tolerance the budget search negotiates
+            // with gets raised until the interior merges whatever is in it, so
+            // the platform needs a condition of its own that nothing relaxes.
+            const r = buildTile(base({
+                heights: heightsFrom(() => PLATEAU),
+                polygons: [coastAt(CELLS + 2)],
+                pads: [small], skirtDepthM: 0, triangleBudget: 600,
+            }));
+            const surface = landSurface(r);
+
+            let checked = 0;
+            // Kept a couple of cells clear of the rim: the feather is only as
+            // sharp as the DEM under it, and this one steps 258 m over 80.
+            for (let de = -150; de <= 150; de += 75) {
+                for (let dn = -200; dn <= 200; dn += 100) {
+                    const e = small.centerX + de;
+                    const n = small.centerZ + dn;
+                    if (padBlendWeight(e, n, small) < 1) {
+                        continue;
+                    }
+                    const u = surface(e, n);
+                    assert.ok(Number.isFinite(u), `no drawn surface over the core at ${de},${dn}`);
+                    checked++;
+                    assert.ok(Math.abs(u - small.heightMsl) < 1.5,
+                        `drawn ground at ${u.toFixed(2)} m over a core cut to `
+                        + `${small.heightMsl} m (${de},${dn} from the pad centre)`);
+                }
+            }
+            assert.ok(checked > 0, 'no sample landed inside the pad core');
         });
 
         it('is a no-op when no pad is supplied', () => {

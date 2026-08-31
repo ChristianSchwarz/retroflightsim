@@ -6,8 +6,10 @@
  * two conditions hold:
  *
  *   1. the block's heights stay within `maxErrorM` of the bilinear surface
- *      through its four corners, and
- *   2. the block does not straddle the shoreline.
+ *      through its four corners,
+ *   2. the block does not straddle the shoreline, and
+ *   3. the same holds of the *padded* heights, against a tolerance the
+ *      triangle budget is not allowed to relax - see `padHeights`.
  *
  * Condition 2 is what keeps the coast crisp: any block containing a land/water
  * transition is refused, so shoreline blocks always bottom out at `minLeafSize`
@@ -35,6 +37,27 @@ export interface DecimateInput {
     landNodes: Uint8Array;
     /** Vertical tolerance (m) for merging a block. */
     maxErrorM: number;
+    /**
+     * The same heights with the flatten pads applied — the surface the tile
+     * will actually be drawn at. Omit where no pad reaches the tile.
+     *
+     * A third merge condition, and a *hard* one: `maxErrorM` is what the
+     * triangle budget negotiates with, and on a busy coastal tile it is raised
+     * until the interior merges no matter what is in it. An airfield platform
+     * cannot be traded away like that. It is cut into the terrain to carry the
+     * pavement, the pavement is draped on a height query that already knows
+     * about it, and a leaf that spans its rim leaves the two on different
+     * surfaces — at Gran Canaria, a 407 m leaf ran between one corner cut down
+     * to the 9 m apron and one left up on 24 m of hillside, and buried aprons
+     * lying 150 m inside the flat core under five to six metres of ground.
+     *
+     * So the pad gets its own tolerance, which nothing relaxes. It costs only
+     * the rim: inside the core the padded surface is an exact plane, so a
+     * block there merges as freely as it ever did.
+     */
+    padHeights?: Float32Array;
+    /** Tolerance (m) for {@link padHeights}. Never coarsened by the budget. */
+    padErrorM?: number;
     /**
      * Finest leaf, in cells. Raising it coarsens the shoreline as well as the
      * interior, which is the lever the triangle budget turns.
@@ -88,7 +111,6 @@ export function decimate(input: DecimateInput): DecimateResult {
         throw new Error('decimate: minLeafSize and maxLeafSize must be powers of two');
     }
 
-    const h = (x: number, y: number) => heights[y * size + x];
     const isLand = (x: number, y: number) => landNodes[y * size + x] !== 0;
 
     /** True when every node of the block shares one class. */
@@ -104,12 +126,15 @@ export function decimate(input: DecimateInput): DecimateResult {
         return true;
     };
 
-    /** Max |height - bilinear(corners)| over the block. */
-    const blockError = (bx: number, by: number, s: number): number => {
-        const h00 = h(bx, by);
-        const h10 = h(bx + s, by);
-        const h01 = h(bx, by + s);
-        const h11 = h(bx + s, by + s);
+    /** Max |height - bilinear(corners)| over the block, for one height field. */
+    const blockError = (
+        field: Float32Array, bx: number, by: number, s: number,
+    ): number => {
+        const at = (x: number, y: number) => field[y * size + x];
+        const h00 = at(bx, by);
+        const h10 = at(bx + s, by);
+        const h01 = at(bx, by + s);
+        const h11 = at(bx + s, by + s);
         let worst = 0;
         for (let y = 0; y <= s; y++) {
             const v = y / s;
@@ -119,7 +144,7 @@ export function decimate(input: DecimateInput): DecimateResult {
                     + h10 * u * (1 - v)
                     + h01 * (1 - u) * v
                     + h11 * u * v;
-                const d = Math.abs(h(bx + x, by + y) - bilinear);
+                const d = Math.abs(at(bx + x, by + y) - bilinear);
                 if (d > worst) {
                     worst = d;
                 }
@@ -127,6 +152,12 @@ export function decimate(input: DecimateInput): DecimateResult {
         }
         return worst;
     };
+
+    const padHeights = input.padHeights;
+    const padErrorM = input.padErrorM ?? maxErrorM;
+    /** The pad's own condition, which the triangle budget may not relax. */
+    const padFits = (bx: number, by: number, s: number): boolean =>
+        padHeights === undefined || blockError(padHeights, bx, by, s) <= padErrorM;
 
     // --- 1. Top-down subdivision -------------------------------------------
     const leaves: Leaf[] = [];
@@ -137,7 +168,8 @@ export function decimate(input: DecimateInput): DecimateResult {
             return;
         }
         const uniform = blockUniform(bx, by, s);
-        if (uniform && s <= maxLeafSize && blockError(bx, by, s) <= maxErrorM) {
+        if (uniform && s <= maxLeafSize && blockError(heights, bx, by, s) <= maxErrorM
+            && padFits(bx, by, s)) {
             leaves.push({ x: bx, y: by, size: s, uniform: true, land: isLand(bx, by) });
             return;
         }

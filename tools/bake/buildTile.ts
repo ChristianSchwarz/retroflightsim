@@ -3,7 +3,9 @@
  *
  * Pipeline, in order:
  *   1. classify nodes and locate shoreline crossings   (shoreline.ts)
- *   2. decimate into a restricted quadtree and cut the coast  (decimate.ts)
+ *   2. decimate into a restricted quadtree and cut the coast  (decimate.ts),
+ *      holding the *padded* heights to a tolerance of their own alongside the
+ *      raw DEM's (see padNodeHeights)
  *   3. enforce the triangle budget by coarsening and retrying
  *   4. project grid space -> geodetic -> ECEF -> tile-local scene axes
  *   5. apply the airbase flatten pad, the water surface and the depth bias
@@ -37,6 +39,16 @@ export const WATER_HEIGHT_EPS_M = 0.5;
  * into sky-coloured sparkles along the beach line.
  */
 export const WATER_DEPTH_BIAS_M = 0.5;
+
+/**
+ * How far the drawn ground may stray from the flattened platform.
+ *
+ * Held to a third of AIRFIELD_SURFACE_EPS_M, which is the clearance the
+ * pavement is drawn at over the ground it is draped on. Anything looser and
+ * the platform's rim can eat into that clearance and surface through the
+ * taxiways; anything tighter buys nothing the runtime could see.
+ */
+export const PAD_ERROR_M = 0.5;
 
 /** Water within this distance of the shore is painted as the shallow tone. */
 export const SHALLOW_WATER_COAST_M = 80;
@@ -201,6 +213,72 @@ function padLonSpan(pad: FlattenPad & { lat: number }): number {
 }
 
 /**
+ * Node heights with the flatten pads already applied — the surface that will
+ * actually be drawn.
+ *
+ * The decimator has to measure its error against this rather than against the
+ * raw DEM, because the pad is applied per *vertex*, down in `project`. A leaf
+ * merged on the raw heights therefore meets the platform only at its corners,
+ * and interpolates straight across everything between them.
+ *
+ * Measured at Gran Canaria: a 407 m leaf straddling the platform's rim ran
+ * between one corner cut down to the 9 m apron and one left up on 24 m of
+ * hillside, and carried the drawn ground five to six metres over aprons lying
+ * 150 m *inside* the pad's flat core. The pavement is draped on the height
+ * query, which does see the pad, so it was drawn buried.
+ *
+ * Handing these to the decimator alongside the raw heights makes the rim a
+ * feature it can see, so it subdivides there as it does anywhere else the
+ * ground turns, and the platform reaches the surface across its whole
+ * footprint instead of only where a leaf corner happened to land. They go
+ * *alongside* rather than instead, because the pad's tolerance is the one
+ * thing the triangle budget may not negotiate away - see
+ * DecimateInput.padHeights.
+ *
+ * Returns the input array untouched when no pad comes near the tile, which is
+ * almost every tile of a planet.
+ */
+function padNodeHeights(
+    heights: Float32Array, size: number, bounds: LonLatBounds,
+    pads: BuildTileInput['pads'],
+): Float32Array {
+    if (pads === undefined || pads.length === 0) {
+        return heights;
+    }
+    const near = pads.filter(p =>
+        p.lat + padLatSpan(p) >= bounds.south && p.lat - padLatSpan(p) <= bounds.north
+        && p.lon + padLonSpan(p) >= bounds.west && p.lon - padLonSpan(p) <= bounds.east);
+    if (near.length === 0) {
+        return heights;
+    }
+    const cells = size - 1;
+    const lonSpan = bounds.east - bounds.west;
+    const latSpan = bounds.north - bounds.south;
+    const out = Float32Array.from(heights);
+    for (let gy = 0; gy < size; gy++) {
+        const lat = bounds.north - (gy / cells) * latSpan;
+        for (let gx = 0; gx < size; gx++) {
+            let h = heights[gy * size + gx];
+            if (!Number.isFinite(h)) {
+                continue;
+            }
+            const lon = bounds.west + (gx / cells) * lonSpan;
+            for (const pad of near) {
+                if (Math.abs(lat - pad.lat) > padLatSpan(pad)
+                    || Math.abs(lon - pad.lon) > padLonSpan(pad)) {
+                    continue;
+                }
+                geodeticToEcef(lat, lon, h, _ecef);
+                ecefToEnu(pad.basis, _ecef, _padEnu);
+                h = applyFlattenPad(h, _padEnu.e, _padEnu.n, pad);
+            }
+            out[gy * size + gx] = h;
+        }
+    }
+    return out;
+}
+
+/**
  * Multi-source chamfer distance (in cells) from every seeded node.
  *
  * Seeded on land it says how far out to sea a point is, which decides the
@@ -335,12 +413,20 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
      * resolution cut and only the pathological ones give way.
      */
 
+    // The pads are what `project` will do to these heights, so the decimator
+    // has to see them — and against a tolerance the budget search below cannot
+    // relax, which is why they go in beside the raw heights rather than
+    // replacing them. See padNodeHeights and DecimateInput.padHeights.
+    const drawnHeights = padNodeHeights(heights, size, bounds, input.pads);
+
     let attempts = 0;
     const run = (err: number, leaf: number) => {
         attempts++;
         return decimate({
             size,
             heights,
+            padHeights: drawnHeights === heights ? undefined : drawnHeights,
+            padErrorM: PAD_ERROR_M,
             landNodes: shoreline.landNodes,
             maxErrorM: err,
             minLeafSize: leaf,

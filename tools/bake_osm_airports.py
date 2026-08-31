@@ -400,6 +400,29 @@ def runway_surface(tags: dict) -> str:
     return 'asphalt' if tags.get('ref') or tags.get('lit') == 'yes' else 'gravel'
 
 
+# A storey, for turning `building:levels` into metres. Airport buildings run
+# tall - a terminal concourse is one storey and fifteen metres of it - so this
+# is the generous end of the usual 3-3.5 m.
+STOREY_HEIGHT_M = 4.0
+
+
+def building_height_m(tags: dict) -> Optional[float]:
+    """Height in metres where OSM states one, else None.
+
+    None is the common case by a mile: not one of Gran Canaria's sixty airport
+    buildings carries a height or a storey count. The runtime infers one from
+    the kind and the footprint, and this is here so that a better-mapped area
+    is not held to the same guess.
+    """
+    height = tagged_number(tags.get('height') or tags.get('building:height'))
+    if height is not None and height > 0:
+        return height
+    levels = tagged_number(tags.get('building:levels'))
+    if levels is not None and levels > 0:
+        return levels * STOREY_HEIGHT_M
+    return None
+
+
 def taxiway_width_m(tags: dict, kind: str) -> float:
     """A taxiway's width: OSM's own where it has one, else its class default."""
     tagged = tagged_width_m(tags)
@@ -791,6 +814,7 @@ def assemble_airfields(data: dict) -> List[Airfield]:
                 'kind': 'tower' if aeroway in ('control_tower', 'tower') else aeroway,
                 'lat': lat_c, 'lon': lon_c, 'headingDeg': heading,
                 'widthM': width, 'depthM': depth,
+                'heightM': building_height_m(tags),
             })
 
     # A runway inside no aerodrome at all is its own field. Disused strips and

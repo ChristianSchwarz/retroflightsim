@@ -285,6 +285,16 @@ plane it floats or buries itself by up to twenty metres. Concrete gets its own
 palette tone: a slab-laid military field reads markedly paler than an asphalt
 civil one, and the taxiways and aprons follow their own runway's surface.
 
+Terminals, hangars and control towers are drawn too — as boxes, which is what
+they are from the air in a sim with one flat colour per surface. Their heights
+come from OSM's `height` or `building:levels` where it has them (11 of 265) and
+from the kind and footprint where it does not: a hangar is built round a tail
+so it is tall in proportion to its span, a terminal is a long low shed, and a
+control tower is the one building at an airfield taller than it is wide. They
+are obstacles the AI steers round, not collision meshes — a ground-height query
+walks every scenery soup, and 265 boxes in that loop would be paid for on every
+contact test of every frame.
+
 Widths come from OSM where it has them and from the aerodrome class where it
 does not, which for taxiways is almost always — 667 of 684 across the baked
 airfields carry no `width` tag at all. The defaults are Annex 14's code
