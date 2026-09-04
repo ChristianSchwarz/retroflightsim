@@ -446,25 +446,58 @@ export function startImport(req: Request, res: Response): void {
     jobs.set(id, job);
     res.json({ ok: true, id });
 
-    runImport(job, withCover).then(() => {
-        job.state = 'done';
-        job.step = 'done';
-        // Stay on the last step rather than running past it: percent 100 is
-        // what carries overall to 100, and `stepIndex + 1` stays in range.
-        job.stepIndex = Math.max(0, job.stepCount - 1);
-        job.percent = 100;
-        line(job, '\nimport complete — reload to fly there');
-    }).catch((err: Error) => {
-        job.state = 'failed';
-        job.error = err.message;
-        line(job, `\nFAILED: ${err.message}`);
-    }).finally(() => {
-        emit(job, { line: '' });
-        for (const sub of job.subscribers) {
-            sub.end();
+    finishJob(job, runImport(job, withCover), 'import complete — reload to fly there');
+}
+
+export function startDelete(req: Request, res: Response): void {
+    const busy = runningJob();
+    if (busy) {
+        res.status(409).json({ ok: false, error: `a job is already running (${busy.name})` });
+        return;
+    }
+
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const { areas } = readAreas();
+    const area = areas.find(a => a.name === name);
+    if (!area) {
+        res.status(404).json({ ok: false, error: `no area called "${name}"` });
+        return;
+    }
+    if (areas.length <= 1) {
+        res.status(409).json({
+            ok: false,
+            error: 'refusing to delete the only area — that is the whole terrain',
+        });
+        return;
+    }
+
+    const bbox: [number, number, number, number] =
+        [area.west, area.south, area.east, area.north];
+    const id = `delete-${slug(name)}-${jobs.size}-${process.hrtime.bigint().toString(36)}`;
+    const job: Job = {
+        id, name: `delete ${name}`, bbox,
+        state: 'running', log: [], step: 'starting',
+        stepIndex: 0, stepCount: 2, percent: 0,
+        subscribers: new Set(),
+    };
+    jobs.set(id, job);
+    res.json({ ok: true, id });
+
+    const steps: Step[] = [
+        {
+            label: 'removing baked tiles', cmd: PYTHON,
+            args: ['tools/delete_area.py', '--name', name],
+        },
+        {
+            label: 'rebaking surrounding meshes', cmd: process.execPath,
+            args: ['--import', 'tsx', 'tools/bake_planet_mesh.ts', '--bbox', bbox.join(',')],
+        },
+    ];
+    finishJob(job, (async () => {
+        for (let i = 0; i < steps.length; i++) {
+            await runStep(job, steps[i].label, i, steps[i].cmd, steps[i].args);
         }
-        job.subscribers.clear();
-    });
+    })(), `deleted "${name}" — reload the page`);
 }
 
 export function importStream(req: Request, res: Response): void {

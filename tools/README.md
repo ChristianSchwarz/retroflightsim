@@ -479,6 +479,27 @@ the OSM tile usage policy for picking an area. Point `OSM_TILE_URL` in
 [`tools/areaImport.ts`](areaImport.ts) at your own tile server if you ever need
 more than that.
 
+### Deleting an area
+
+Each baked area in the dialog carries a small **×**: it removes the area's
+tiles from both trees, server-side, with the same streamed progress. Behind it
+is `tools/delete_area.py` — the inverse of `merge_planet_dem.py`:
+
+```
+python tools/delete_area.py --name alps            # add --dry-run to just look
+npm run bake:mesh -- --bbox <box it prints>
+```
+
+Only tiles no *remaining* area claims are deleted; a tile two areas overlap
+belongs to both and stays. Every ancestor the area's heights were decimated
+into is rebuilt from the children still on disk — otherwise the coarse view
+keeps ghost mountains — and deleted outright where none survive. The manifests'
+`areas`, `coverage` and airfield records shrink to match. The second command is
+what the in-app delete runs for you: coarse *meshes* around the hole can only
+be rebuilt by the mesh bake.
+
+Deleting the last area is refused — that is the whole terrain.
+
 ### Flying somewhere else
 
 Each bake records the area it covered under `areas` in the manifest, named by

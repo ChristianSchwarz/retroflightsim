@@ -7,6 +7,7 @@
 //   GET  /api/osm/:z/:x/:y   OpenStreetMap tiles for the area picker
 //   GET  /api/areas          areas the baked pyramid holds
 //   POST /api/import-area    start a bake; GET the same path + /:id for progress
+//   POST /api/delete-area    remove a baked area (same progress stream)
 //
 // Multi-plane mod packs are split by Unity livery material: each aircraft becomes
 // its own .aircraft.pack so liveries stay separate in the spawn menu.
@@ -18,7 +19,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import { unzipSync } from 'fflate';
 import {
-    areasHandler, importStream, osmTile, startImport,
+    areasHandler, importStream, osmTile, startDelete, startImport,
 } from './areaImport';
 
 const PROJECT_ROOT = path.dirname(__dirname);
@@ -1015,6 +1016,7 @@ if (LIVE_RELOAD) {
 app.get('/api/osm/:z/:x/:y', osmTile);
 app.get('/api/areas', areasHandler);
 app.post('/api/import-area', express.json(), startImport);
+app.post('/api/delete-area', express.json(), startDelete);
 app.get('/api/import-area/:id', importStream);
 
 app.get('/api/health', (_req: Request, res: Response) => {
