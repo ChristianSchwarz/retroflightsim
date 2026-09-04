@@ -3,7 +3,8 @@
 //   GET  /api/osm/:z/:x/:y   OpenStreetMap raster tile, cached on disk
 //   GET  /api/areas          the areas the baked pyramid already holds
 //   POST /api/import-area    start a bake for a bbox; returns a job id
-//   GET  /api/import-area/:id  server-sent progress for that job
+//   POST /api/delete-area    remove a baked area; returns a job id
+//   GET  /api/import-area/:id  server-sent progress for that job (either kind)
 //
 // The bake is the same command line documented in tools/README.md, run stage by
 // stage with one bbox. It takes minutes at best and half an hour when the
@@ -367,12 +368,41 @@ async function runImport(job: Job, withCover: boolean): Promise<void> {
     }
 }
 
-export function startImport(req: Request, res: Response): void {
+function runningJob(): Job | undefined {
     for (const j of jobs.values()) {
         if (j.state === 'running') {
-            res.status(409).json({ ok: false, error: `an import is already running (${j.name})` });
-            return;
+            return j;
         }
+    }
+    return undefined;
+}
+
+/** Wire a job's outcome into its state, log and subscribers. */
+function finishJob(job: Job, work: Promise<void>, doneLine: string): void {
+    work.then(() => {
+        job.state = 'done';
+        job.step = 'done';
+        job.stepIndex = Math.max(0, job.stepCount - 1);
+        job.percent = 100;
+        line(job, `\n${doneLine}`);
+    }).catch((err: Error) => {
+        job.state = 'failed';
+        job.error = err.message;
+        line(job, `\nFAILED: ${err.message}`);
+    }).finally(() => {
+        emit(job, { line: '' });
+        for (const sub of job.subscribers) {
+            sub.end();
+        }
+        job.subscribers.clear();
+    });
+}
+
+export function startImport(req: Request, res: Response): void {
+    const busy = runningJob();
+    if (busy) {
+        res.status(409).json({ ok: false, error: `a job is already running (${busy.name})` });
+        return;
     }
 
     const body = req.body ?? {};
