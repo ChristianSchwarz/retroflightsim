@@ -24,6 +24,7 @@ import math
 import os
 import struct
 import sys
+import time
 import zlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -49,9 +50,60 @@ WATER = 0
 OSM_CACHE_DIR = os.path.join('data', 'osm-cache')
 
 OVERPASS_URLS = (
-    'https://overpass.kumi.systems/api/interpreter',
     'https://overpass-api.de/api/interpreter',
+    'https://overpass.osm.ch/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
 )
+
+# (connect, read). A mirror that is down outright - unreachable, or behind a
+# network that blocks it - should fail in seconds, not eat the same 300s a
+# reachable-but-slow mirror is given to actually answer a heavy query. Without
+# the split, one dead mirror at the front of the order cost the full read
+# timeout on every single round, which is what made every fetch look like it
+# was hanging rather than retrying.
+OVERPASS_TIMEOUT_S = (10.0, 300.0)
+
+# A heavy query (hundreds of thousands of elements, which a regional bbox
+# routinely is) is exactly the kind of request the public Overpass mirrors
+# 504 on under load - transient, and often gone a round or two later, once
+# whatever spike caused it has passed. Every mirror is tried before any
+# waiting happens - a mirror that is merely busy this second is worth trying
+# once before writing off the whole fetch - and only once every mirror has
+# failed does the round sleep and try them all again.
+OVERPASS_ROUNDS = 3
+OVERPASS_BACKOFF_S = (10.0, 30.0)
+
+# A mirror that failed drifts to the back of the queue for every later fetch,
+# not just the rest of this one. kumi.systems once spent a whole day
+# answering 500/502 to everything, and a queue that always starts at the
+# front paid its refusal on every single fetch of a multi-hour bake. A
+# success resets the count, so a mirror that recovers earns its place back.
+_MIRROR_FAILURES: Dict[str, int] = {}
+
+
+def mirror_order() -> List[str]:
+    """Overpass mirrors, least-failing first; ties keep `OVERPASS_URLS` order."""
+    return sorted(OVERPASS_URLS, key=lambda u: _MIRROR_FAILURES.get(u, 0))
+
+
+def _mirror_failed(url: str) -> None:
+    _MIRROR_FAILURES[url] = _MIRROR_FAILURES.get(url, 0) + 1
+
+
+def _mirror_succeeded(url: str) -> None:
+    _MIRROR_FAILURES[url] = 0
+
+
+def remark_is_failure(remark: str) -> bool:
+    """Whether an Overpass ``remark`` means the answer is incomplete.
+
+    Overpass answers a query it could not finish with HTTP 200 and a
+    ``remark`` field instead of a 5xx - a timeout or an out-of-memory kill
+    reads as success to anything that only checks the status code. Both
+    start with "runtime error:"; anything else (a note about a deprecated
+    tag, say) is informational and the data beside it is still whole.
+    """
+    return remark.strip().lower().startswith('runtime error')
 
 
 # --- tile grid --------------------------------------------------------
@@ -162,7 +214,18 @@ def overpass_cache_path(query: str) -> str:
 
 
 def overpass_fetch(query: str, label: str, refresh: bool) -> dict:
-    """One Overpass request, cached by query hash."""
+    """One Overpass request, cached by query hash.
+
+    Every mirror (in :func:`mirror_order`) is tried once per round before any
+    round sleeps; `OVERPASS_ROUNDS` rounds are attempted before giving up. A
+    regional bbox routinely asks for hundreds of thousands of elements, which
+    is exactly the kind of request the public mirrors 504 on under load - a
+    5xx, a connection error, an unparseable body, or an HTTP-200 answer whose
+    `remark` says the query died server-side are all treated the same way:
+    the mirror's failure count goes up and the next mirror gets a turn. A 4xx
+    is the query's own fault and no mirror or wait will fix it, so that fails
+    the whole fetch at once.
+    """
     cache = overpass_cache_path(query)
     if not refresh and os.path.isfile(cache):
         try:
@@ -178,15 +241,47 @@ def overpass_fetch(query: str, label: str, refresh: bool) -> dict:
         'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
     }
     body = ('data=' + requests.utils.quote(query)).encode('utf-8')
-    last_err: Optional[Exception] = None
-    for url in OVERPASS_URLS:
-        print(f'fetching OSM {label} via Overpass ({url})…')
-        try:
-            resp = requests.post(url, data=body, headers=headers, timeout=300)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get('remark'):
-                print(f'  overpass remark: {data["remark"]}', file=sys.stderr)
+    last_err: Optional[str] = None
+    for round_idx in range(OVERPASS_ROUNDS):
+        for url in mirror_order():
+            suffix = '' if round_idx == 0 else f' (round {round_idx + 1}/{OVERPASS_ROUNDS})'
+            print(f'fetching OSM {label} via Overpass ({url}){suffix}…')
+            try:
+                resp = requests.post(url, data=body, headers=headers, timeout=OVERPASS_TIMEOUT_S)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as err:
+                last_err = str(err)
+                print(f'  overpass failed: {last_err}', file=sys.stderr)
+                _mirror_failed(url)
+                continue
+
+            if resp.status_code >= 400:
+                if resp.status_code < 500 and resp.status_code != 429:
+                    raise RuntimeError(
+                        f'overpass rejected the query ({resp.status_code} '
+                        f'{resp.reason}): {resp.text[:200]}')
+                last_err = f'{resp.status_code} {resp.reason}'
+                print(f'  overpass failed: {last_err}', file=sys.stderr)
+                _mirror_failed(url)
+                continue
+
+            try:
+                data = resp.json()
+            except ValueError:
+                last_err = 'response was not JSON'
+                print(f'  overpass failed: {last_err}', file=sys.stderr)
+                _mirror_failed(url)
+                continue
+
+            remark = data.get('remark')
+            if remark and remark_is_failure(remark):
+                last_err = remark
+                print(f'  overpass failed: {remark}', file=sys.stderr)
+                _mirror_failed(url)
+                continue
+            if remark:
+                print(f'  overpass remark: {remark}', file=sys.stderr)
+
+            _mirror_succeeded(url)
             try:
                 os.makedirs(OSM_CACHE_DIR, exist_ok=True)
                 with gzip.open(cache, 'wt', encoding='utf-8') as fh:
@@ -195,10 +290,13 @@ def overpass_fetch(query: str, label: str, refresh: bool) -> dict:
             except Exception as err:
                 print(f'  could not cache the response: {err}', file=sys.stderr)
             return data
-        except Exception as err:
-            last_err = err
-            print(f'  overpass failed: {err}', file=sys.stderr)
-    raise RuntimeError(f'all Overpass endpoints failed: {last_err}')
+
+        if round_idx < OVERPASS_ROUNDS - 1:
+            delay = OVERPASS_BACKOFF_S[round_idx]
+            print(f'  every mirror failed, retrying in {delay:.0f}s…', flush=True)
+            time.sleep(delay)
+    raise RuntimeError(
+        f'all Overpass mirrors failed after {OVERPASS_ROUNDS} rounds: {last_err}')
 
 
 # --- OSM element helpers ----------------------------------------------

@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
 import os
 import shutil
 import struct
@@ -73,6 +74,11 @@ DEFAULT_SEA_LEVEL = 0.0
 # A tile is "land" once any sample rises this far above the sea datum. Small
 # enough to keep beaches, large enough to reject float noise on the sea floor.
 LAND_EPSILON_M = 0.5
+
+# Finest-level sampling is one bilinear read per tile with no interaction
+# between tiles, so it is split across this many worker processes by default.
+# Leaving one core free keeps the machine responsive to everything else.
+DEFAULT_JOBS = max(1, (os.cpu_count() or 1) - 1)
 
 
 @dataclass(frozen=True)
@@ -282,6 +288,97 @@ def mask_has_land(mask: np.ndarray, src: Bounds, cell_lon: float, cell_lat: floa
     c1 = max(c0 + 1, min(w, c1))
     r1 = max(r0 + 1, min(h, r1))
     return bool(mask[r0:r1, c0:c1].any())
+
+
+def open_sampler(input_path: str, sea_level: float) -> SourceSampler:
+    """Opens `input_path` fresh, reprojecting to EPSG:4326 first if needed.
+
+    Factored out of :func:`bake` so a multiprocessing worker can call it too:
+    a rasterio ``Dataset`` does not survive being pickled across a process
+    boundary, so each worker in :func:`sample_leaf_level_parallel` opens its
+    own handle on the same file rather than sharing the caller's.
+    """
+    dataset = rasterio.open(input_path)
+    if dataset.crs is None:
+        raise ValueError('source has no CRS')
+    if dataset.crs.to_epsg() != 4326:
+        vrt = WarpedVRT(dataset, crs='EPSG:4326', resampling=Resampling.bilinear)
+        return SourceSampler(vrt, sea_level)
+    return SourceSampler(dataset, sea_level)
+
+
+# Per-worker state for sample_leaf_level_parallel, set once by _init_leaf_worker.
+_leaf_sampler: Optional[SourceSampler] = None
+_leaf_tile_size = 0
+_leaf_z = 0
+
+
+def _init_leaf_worker(input_path: str, sea_level: float, tile_size: int, z: int) -> None:
+    global _leaf_sampler, _leaf_tile_size, _leaf_z
+    _leaf_sampler = open_sampler(input_path, sea_level)
+    _leaf_tile_size = tile_size
+    _leaf_z = z
+
+
+def _sample_leaf_worker(xy: Tuple[int, int]) -> Tuple[int, int, np.ndarray]:
+    x, y = xy
+    assert _leaf_sampler is not None
+    grid = _leaf_sampler.sample_grid(tile_bounds(_leaf_z, x, y), _leaf_tile_size)
+    return x, y, grid
+
+
+def sample_leaf_level_parallel(
+    input_path: str,
+    sea_level: float,
+    candidates: List[Tuple[int, int]],
+    z: int,
+    tile_size: int,
+    jobs: int,
+    land_epsilon_m: float = LAND_EPSILON_M,
+) -> Dict[Tuple[int, int], np.ndarray]:
+    """Bilinear-samples every candidate leaf tile, across `jobs` worker processes.
+
+    Tiles at the finest level are independent of each other - each is one
+    bilinear read over its own footprint into a grid keyed by (x, y), and the
+    result is a plain dict with no order dependence downstream (every caller
+    re-sorts before writing). That makes this the one part of the DEM bake
+    safe to parallelise: the ancestor rebuild that follows (`build_parent` /
+    `gather_children` in `bake()` and `merge_planet_dem.merge()`) reloads
+    siblings off disk level by level and must stay serial.
+
+    `jobs <= 1` runs in-process with no pool, which is also the fallback for
+    a handful of tiles where process startup would cost more than it saves.
+    """
+    level_grids: Dict[Tuple[int, int], np.ndarray] = {}
+    total = len(candidates)
+    if total == 0:
+        return level_grids
+    step = max(1, total // 20)
+    done = 0
+
+    def accept(x: int, y: int, grid: np.ndarray) -> None:
+        nonlocal done
+        done += 1
+        if done % step == 0 or done == total:
+            print(f'  sampling {done}/{total}', flush=True)
+        if float(np.nanmax(grid)) <= sea_level + land_epsilon_m:
+            return
+        level_grids[(x, y)] = grid
+
+    jobs = max(1, min(jobs, total))
+    if jobs == 1:
+        sampler = open_sampler(input_path, sea_level)
+        for x, y in candidates:
+            accept(x, y, sampler.sample_grid(tile_bounds(z, x, y), tile_size))
+        return level_grids
+
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(
+        jobs, initializer=_init_leaf_worker, initargs=(input_path, sea_level, tile_size, z),
+    ) as pool:
+        for x, y, grid in pool.imap_unordered(_sample_leaf_worker, candidates, chunksize=4):
+            accept(x, y, grid)
+    return level_grids
 
 
 def quantize(grid: np.ndarray) -> Tuple[np.ndarray, float, float, float]:
@@ -515,7 +612,6 @@ def bake(args: argparse.Namespace) -> int:
     print(f'level {max_zoom:2d}    {len(candidates)} candidate tiles '
           f'(of {(x1 - x0 + 1) * (y1 - y0 + 1)} in coverage)')
 
-    level_grids: Dict[Tuple[int, int], np.ndarray] = {}
     total_bytes = 0
     total_tiles = 0
     height_min = math.inf
@@ -523,13 +619,8 @@ def bake(args: argparse.Namespace) -> int:
     level_errors: Dict[int, float] = {}
     level_index: List[Tuple[int, int, int, int, int, List[Tuple[int, int]]]] = []
 
-    for i, (x, y) in enumerate(candidates):
-        grid = sampler.sample_grid(tile_bounds(max_zoom, x, y), tile_size)
-        if float(np.nanmax(grid)) <= args.sea_level + LAND_EPSILON_M:
-            continue
-        level_grids[(x, y)] = grid
-        if (i % 200) == 0:
-            print(f'  sampling {i + 1}/{len(candidates)}', flush=True)
+    level_grids = sample_leaf_level_parallel(
+        args.input, args.sea_level, candidates, max_zoom, tile_size, args.jobs)
 
     print(f'level {max_zoom:2d}    {len(level_grids)} tiles with land')
 
@@ -635,6 +726,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument('--name', help='name for this area in the manifest '
                                        '(default: the input file stem)')
     parser.add_argument('--clean', action='store_true', help='delete the output directory first')
+    parser.add_argument('--jobs', type=int, default=DEFAULT_JOBS,
+                        help=f'worker processes for leaf-tile sampling (default {DEFAULT_JOBS})')
     args = parser.parse_args(list(argv) if argv is not None else None)
     return bake(args)
 

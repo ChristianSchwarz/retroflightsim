@@ -35,7 +35,7 @@ const OSM_USER_AGENT = 'retroflightsim/0.0.1 (+https://github.com/ruben3d/retrof
 const OSM_MAX_ZOOM = 12;
 
 /** Matches --max-span in tools/fetch_planet_dem.py. */
-const MAX_SPAN_DEG = 3;
+const MAX_SPAN_DEG = 6;
 
 /**
  * Zoom whose tile edges an import is snapped to.
@@ -195,8 +195,9 @@ export function parseProgress(line: string): number | undefined {
     if (covered) {
         return clampPercent(Number(covered[1]));
     }
-    // `  sampling 12/18` and `  rasterize 12/23`.
-    const ratio = /^\s*(?:sampling|rasterize)\s+(\d+)\s*\/\s*(\d+)/.exec(line);
+    // `  sampling 12/18`, `  rasterize 12/23`, `  writing 12/23 at z11` and
+    // `  clip 12/23 at z11`.
+    const ratio = /^\s*(?:sampling|rasterize|writing|clip)\s+(\d+)\s*\/\s*(\d+)/.exec(line);
     if (ratio) {
         const total = Number(ratio[2]);
         return total > 0 ? clampPercent(100 * Number(ratio[1]) / total) : undefined;
@@ -211,7 +212,7 @@ function clampPercent(v: number): number | undefined {
 /** True for a line that is only a progress update, so the log can replace it. */
 export function isProgressLine(line: string): boolean {
     return /^\s*\d+\s*\/\s*\d+\s*\(/.test(line)
-        || /^\s*(?:sampling|rasterize)\s+\d+\s*\/\s*\d+/.test(line);
+        || /^\s*(?:sampling|rasterize|writing|clip)\s+\d+\s*\/\s*\d+/.test(line);
 }
 
 function frameFor(job: Job, event: Record<string, unknown>): string {

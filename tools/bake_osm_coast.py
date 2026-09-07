@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
 import os
 import struct
 import subprocess
@@ -83,6 +84,12 @@ except ImportError:
 LVR_MAGIC = b'LVR1'
 LVR2_MAGIC = b'LVR2'
 LVR3_MAGIC = b'LVR3'
+
+# Rasterizing and clipping are one tile against a fixed set of polygons each,
+# with no interaction between tiles, so both loops are split across this many
+# worker processes by default. Leaving one core free keeps the machine
+# responsive to everything else.
+DEFAULT_JOBS = max(1, (os.cpu_count() or 1) - 1)
 
 # Inland water bodies whose surface is flat: a lake sits at one elevation, and
 # the eye reads a non-level water surface as broken instantly. Flowing water
@@ -398,39 +405,69 @@ def _polygons_from_osm(
                 land_polys.append(poly)
 
     clip = bbox.as_box()
-    # Polygonize coastline linework + bbox boundary to split land/sea.
-    bbox_ring = LineString([
-        (bbox.west, bbox.south), (bbox.east, bbox.south),
-        (bbox.east, bbox.north), (bbox.west, bbox.north), (bbox.west, bbox.south),
-    ])
-    # Node the linework before polygonizing. `polygonize` does not split lines
-    # where they cross; it only closes rings out of segments that already share
-    # endpoints. An island whose coastline closes on itself inside the bbox
-    # needs no help - which is why the Canaries baked correctly - but a
-    # mainland coast runs off the edge, and its crossing with the bbox ring is
-    # not a shared endpoint until something nodes it. Unnoded, the crossings
-    # never close and the whole bbox comes out as ocean.
-    linework = unary_union(coastline_lines + [bbox_ring])
-    pieces = list(polygonize(linework))
-
-    # Corner probe: assume southwest corner is open ocean for regional bboxes.
-    ocean_probe = Point(bbox.west + 0.01 * (bbox.east - bbox.west),
-                        bbox.south + 0.01 * (bbox.north - bbox.south))
-    ocean_poly: Optional[Polygon] = None
-    for piece in pieces:
-        if piece.contains(ocean_probe):
-            ocean_poly = piece
-            break
-    if ocean_poly is None and pieces:
-        ocean_poly = max(pieces, key=lambda p: p.area)
-
     land_from_coast: List[Polygon] = []
-    for piece in pieces:
-        if ocean_poly is not None and piece.equals(ocean_poly):
-            continue
-        if piece.area > 0:
-            land_from_coast.append(piece)
-    land_from_coast.extend(land_polys)
+    if coastline_lines:
+        # Polygonize coastline linework + bbox boundary to split land/sea.
+        bbox_ring = LineString([
+            (bbox.west, bbox.south), (bbox.east, bbox.south),
+            (bbox.east, bbox.north), (bbox.west, bbox.north), (bbox.west, bbox.south),
+        ])
+        # Node the linework before polygonizing. `polygonize` does not split lines
+        # where they cross; it only closes rings out of segments that already share
+        # endpoints. An island whose coastline closes on itself inside the bbox
+        # needs no help - which is why the Canaries baked correctly - but a
+        # mainland coast runs off the edge, and its crossing with the bbox ring is
+        # not a shared endpoint until something nodes it. Unnoded, the crossings
+        # never close and the whole bbox comes out as ocean.
+        linework = unary_union(coastline_lines + [bbox_ring])
+        pieces = list(polygonize(linework))
+
+        # Classify each piece as land or sea from the coastline's own winding
+        # direction, per OSM convention: land is on the left of a `natural=
+        # coastline` way, sea on the right. A fixed "assume the southwest
+        # corner is ocean" corner probe used to do this instead, which broke
+        # on this bbox - the coast only clips its NE corner (the rest is deep
+        # inland Brandenburg), so the SW corner sits on land and the probe
+        # picked the 99.5%-of-the-box land piece as "ocean", leaving ~0% land.
+        # Voting over every coastline segment on a piece's boundary is robust
+        # to a piece bordering several coastline ways with occasional noise.
+        def is_sea(piece: Polygon) -> bool:
+            land_votes = 0
+            sea_votes = 0
+            boundary = piece.boundary
+            for line in coastline_lines:
+                coords = list(line.coords)
+                for i in range(len(coords) - 1):
+                    (x1, y1), (x2, y2) = coords[i], coords[i + 1]
+                    mid = Point((x1 + x2) / 2, (y1 + y2) / 2)
+                    if boundary.distance(mid) > 1e-9:
+                        continue
+                    cross = (x2 - x1) * (piece.centroid.y - mid.y) - (y2 - y1) * (piece.centroid.x - mid.x)
+                    if cross > 0:
+                        land_votes += 1
+                    else:
+                        sea_votes += 1
+            return sea_votes > land_votes
+
+        for piece in pieces:
+            if piece.area > 0 and not is_sea(piece):
+                land_from_coast.append(piece)
+        # `place=island` relations only mean something next to a coastline:
+        # polygonizing swallows a real island's shoreline into the same "sea"
+        # piece as the water around it unless the island is re-added as land
+        # by hand. Restricted to here, or `land_polys` picking up any
+        # `place=island` relation elsewhere in the bbox - a river island with
+        # nothing to do with the sea, which is what Berlin's Spreeinsel and
+        # Kleiner Rohrwall are - would make `land_from_coast` non-empty on a
+        # bbox with no coastline at all, skipping the clip-minus-water
+        # fallback below and leaving the box almost entirely "water" instead
+        # of "land everywhere but the mapped water features".
+        land_from_coast.extend(land_polys)
+    # else: no coastline way touches this bbox at all - it is entirely
+    # inland, so there is no sea to probe for and no `land_polys` island to
+    # re-add either. `land_from_coast` stays empty, which is what sends this
+    # box down the clip-minus-water fallback below instead of being
+    # classified as ocean by a corner probe that no longer exists.
 
     water_union = unary_union(water_polys) if water_polys else Polygon()
     land_union = unary_union(land_from_coast) if land_from_coast else Polygon()
@@ -883,6 +920,187 @@ def write_lwm(out_dir: str, z: int, x: int, y: int, blob: bytes) -> int:
     return len(blob)
 
 
+def _progress_reporter(total: int, label: str, gate: int = 1):
+    """Closure that prints `label i/total` on a ~5% cadence. Cosmetic only."""
+    step = max(1, total // 20)
+    state = {'done': 0}
+
+    def report() -> None:
+        state['done'] += 1
+        done = state['done']
+        if total > gate and (done % step == 0 or done == total):
+            print(f'  {label} {done}/{total}', flush=True)
+
+    return report
+
+
+# Per-worker state for rasterize_level_parallel, set once by _init_rasterize_worker.
+_raster_land = None
+_raster_land_prep = None
+_raster_tile_size = 0
+_raster_z = 0
+
+
+def _init_rasterize_worker(land_geom, tile_size: int, z: int) -> None:
+    global _raster_land, _raster_land_prep, _raster_tile_size, _raster_z
+    _raster_land = land_geom
+    _raster_land_prep = None if HAS_RASTERIO else prep(land_geom)
+    _raster_tile_size = tile_size
+    _raster_z = z
+
+
+def _rasterize_worker(xy: Tuple[int, int]) -> Tuple[int, int, bytearray]:
+    x, y = xy
+    b = tile_bounds(_raster_z, x, y)
+    grid = rasterize_tile(_raster_land_prep, _raster_land, b, _raster_tile_size)
+    return x, y, grid
+
+
+def rasterize_level_parallel(
+    land: MultiPolygon,
+    tile_size: int,
+    z: int,
+    tiles: Sequence[Tuple[int, int]],
+    jobs: int,
+) -> Dict[Tuple[int, int], bytearray]:
+    """Rasterizes every tile at the finest level, across `jobs` worker processes.
+
+    Each tile only reads the same fixed `land` polygon and writes its own grid
+    keyed by (x, y) - independent of every other tile, with no order
+    dependence in the result (every caller re-sorts before writing). The
+    ancestor levels below it are a different story: `build_parent_mask`
+    reloads siblings off disk and must run level by level, serially - see
+    `bake()`.
+    """
+    level_grids: Dict[Tuple[int, int], bytearray] = {}
+    total = len(tiles)
+    if total == 0:
+        return level_grids
+    report = _progress_reporter(total, 'rasterize', gate=0)
+
+    jobs = max(1, min(jobs, total))
+    if jobs == 1:
+        land_prep = None if HAS_RASTERIO else prep(land)
+        for x, y in tiles:
+            b = tile_bounds(z, x, y)
+            level_grids[(x, y)] = rasterize_tile(land_prep, land, b, tile_size)
+            report()
+        return level_grids
+
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(jobs, initializer=_init_rasterize_worker, initargs=(land, tile_size, z)) as pool:
+        for x, y, grid in pool.imap_unordered(_rasterize_worker, tiles, chunksize=8):
+            level_grids[(x, y)] = grid
+            report()
+    return level_grids
+
+
+# Per-worker state for clip_level_parallel, set once by _init_clip_worker.
+_clip_out_dir = ''
+_clip_tile_size = 0
+_clip_land: Optional[MultiPolygon] = None
+_clip_inland: Sequence['WaterBody'] = ()
+_clip_courses: Sequence['Watercourse'] = ()
+
+
+def _init_clip_worker(out_dir: str, tile_size: int, land, inland, courses) -> None:
+    global _clip_out_dir, _clip_tile_size, _clip_land, _clip_inland, _clip_courses
+    _clip_out_dir = out_dir
+    _clip_tile_size = tile_size
+    _clip_land = land
+    _clip_inland = inland
+    _clip_courses = courses
+
+
+def _clip_worker(task: Tuple[int, int, int, bytearray, float, float]) -> Tuple[int, bool, int, int]:
+    z, x, y, grid, tol, line_tol = task
+    lwm_bytes = write_lwm(_clip_out_dir, z, x, y, encode_lwm(bytes(grid), _clip_tile_size))
+    b = tile_bounds(z, x, y)
+    polys = clip_vector_polys(_clip_land, b, tol)
+    inland_polys = clip_inland_bodies(_clip_inland, b, tol) if _clip_inland else []
+    lines = clip_watercourses(_clip_courses, b, line_tol) if _clip_courses else []
+    if not (polys or inland_polys or lines):
+        return lwm_bytes, False, 0, 0
+    lvr_bytes = write_lvr(_clip_out_dir, z, x, y, encode_lvr(polys, inland_polys, lines))
+    return lwm_bytes, True, lvr_bytes, len(lines)
+
+
+def clip_level_parallel(
+    out_dir: str,
+    tile_size: int,
+    land: MultiPolygon,
+    inland: Sequence['WaterBody'],
+    courses: Sequence['Watercourse'],
+    z: int,
+    tol: float,
+    line_tol: float,
+    items: Sequence[Tuple[Tuple[int, int], bytearray]],
+    jobs: int,
+) -> Tuple[int, int, int, int, int]:
+    """Writes .lwm and clips+writes .lvr for one level, across worker processes.
+
+    Each tile's mask is already decided (`items` carries the grid), so all
+    that is left per tile is independent: clip the same fixed `land`/`inland`/
+    `courses` to that tile's box and write its own two files. Returns
+    (total_lwm_bytes, written, lvr_written, total_lvr_bytes, total_lines).
+
+    What must NOT be parallelised is the ancestor rebuild that follows this
+    level in `bake()`: it reloads siblings this level just wrote back off
+    disk and decimates level by level, so it has to see every write here
+    completed in order, one level at a time.
+    """
+    total = len(items)
+    total_bytes = 0
+    written = 0
+    lvr_written = 0
+    total_lvr_bytes = 0
+    total_lines = 0
+    if total == 0:
+        return total_bytes, written, lvr_written, total_lvr_bytes, total_lines
+    report = _progress_reporter(total, f'clip {z}', gate=40)
+
+    def accept(lwm_bytes: int, has_lvr: bool, lvr_bytes: int, num_lines: int) -> None:
+        nonlocal total_bytes, written, lvr_written, total_lvr_bytes, total_lines
+        total_bytes += lwm_bytes
+        written += 1
+        if has_lvr:
+            lvr_written += 1
+            total_lvr_bytes += lvr_bytes
+            total_lines += num_lines
+        report()
+
+    jobs = max(1, min(jobs, total))
+    if jobs == 1:
+        for (x, y), grid in items:
+            accept(*_clip_worker_inline(out_dir, tile_size, land, inland, courses, z, x, y, grid, tol, line_tol))
+        return total_bytes, written, lvr_written, total_lvr_bytes, total_lines
+
+    tasks = [(z, x, y, grid, tol, line_tol) for (x, y), grid in items]
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(
+        jobs, initializer=_init_clip_worker, initargs=(out_dir, tile_size, land, inland, courses),
+    ) as pool:
+        for lwm_bytes, has_lvr, lvr_bytes, num_lines in pool.imap_unordered(_clip_worker, tasks, chunksize=8):
+            accept(lwm_bytes, has_lvr, lvr_bytes, num_lines)
+    return total_bytes, written, lvr_written, total_lvr_bytes, total_lines
+
+
+def _clip_worker_inline(
+    out_dir: str, tile_size: int, land, inland, courses,
+    z: int, x: int, y: int, grid: bytearray, tol: float, line_tol: float,
+) -> Tuple[int, bool, int, int]:
+    """Same body as `_clip_worker`, without the module-global indirection - used for the `jobs == 1` path."""
+    lwm_bytes = write_lwm(out_dir, z, x, y, encode_lwm(bytes(grid), tile_size))
+    b = tile_bounds(z, x, y)
+    polys = clip_vector_polys(land, b, tol)
+    inland_polys = clip_inland_bodies(inland, b, tol) if inland else []
+    lines = clip_watercourses(courses, b, line_tol) if courses else []
+    if not (polys or inland_polys or lines):
+        return lwm_bytes, False, 0, 0
+    lvr_bytes = write_lvr(out_dir, z, x, y, encode_lvr(polys, inland_polys, lines))
+    return lwm_bytes, True, lvr_bytes, len(lines)
+
+
 def build_parent_mask(children: Dict[Tuple[int, int], bytearray], n: int) -> bytearray:
     half = (n - 1) // 2
     parent = bytearray(n * n)
@@ -949,7 +1167,6 @@ def bake(args: argparse.Namespace) -> int:
         print('       Pass --allow-tiny-land if the bbox really is almost all water.',
               file=sys.stderr)
         return 2
-    land_prep = prep(land)
     print(f'land area   {land.area:.6f} deg²')
 
     # Inland surface heights come off the DEM that was merged in before this
@@ -997,40 +1214,26 @@ def bake(args: argparse.Namespace) -> int:
             for x in range(bx0, bx1 + 1):
                 max_tiles.add((x, y))
 
-    level_grids: Dict[Tuple[int, int], bytearray] = {}
     total_bytes = 0
     total_lvr_bytes = 0
     total_tiles = 0
     total_lvr_tiles = 0
     total_lines = 0
 
-    for i, (x, y) in enumerate(sorted(max_tiles)):
-        b = tile_bounds(max_zoom, x, y)
-        grid = rasterize_tile(land_prep, land, b, tile_size)
-        level_grids[(x, y)] = grid
-        if max_tiles and (i % max(1, len(max_tiles) // 20)) == 0:
-            print(f'  rasterize {i + 1}/{len(max_tiles)}', flush=True)
+    level_grids = rasterize_level_parallel(land, tile_size, max_zoom, sorted(max_tiles), args.jobs)
 
     print(f'level {max_zoom:2d}    {len(level_grids)} tiles')
 
     for z in range(max_zoom, min_zoom - 1, -1):
-        written = 0
-        lvr_written = 0
         tol = vector_simplify_tol(z, max_zoom, tile_size)
         line_tol = ((180.0 / (1 << z)) / max(1, tile_size - 1)) * LINE_SIMPLIFY_CELLS
-        for (x, y), grid in sorted(level_grids.items()):
-            b = tile_bounds(z, x, y)
-            total_bytes += write_lwm(out_dir, z, x, y, encode_lwm(bytes(grid), tile_size))
-            polys = clip_vector_polys(land, b, tol)
-            inland_polys = clip_inland_bodies(inland, b, tol) if inland else []
-            lines = clip_watercourses(courses, b, line_tol) if courses else []
-            if polys or inland_polys or lines:
-                total_lvr_bytes += write_lvr(
-                    out_dir, z, x, y, encode_lvr(polys, inland_polys, lines))
-                lvr_written += 1
-                total_lines += len(lines)
-            total_tiles += 1
-            written += 1
+        items = sorted(level_grids.items())
+        level_bytes, written, lvr_written, level_lvr_bytes, level_lines = clip_level_parallel(
+            out_dir, tile_size, land, inland, courses, z, tol, line_tol, items, args.jobs)
+        total_bytes += level_bytes
+        total_lvr_bytes += level_lvr_bytes
+        total_lines += level_lines
+        total_tiles += written
         total_lvr_tiles += lvr_written
         print(f'level {z:2d}    wrote {written} .lwm + {lvr_written} .lvr tiles',
               flush=True)
@@ -1108,6 +1311,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         help='ignore the cached Overpass response and re-fetch')
     parser.add_argument('--include-ocean-tiles', action='store_true',
                         help='also bake every tile in the bbox at max zoom (slow; default: PDM tiles only)')
+    parser.add_argument('--jobs', type=int, default=DEFAULT_JOBS,
+                        help=f'worker processes for rasterizing and clipping (default {DEFAULT_JOBS})')
     raw = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(glue_negative_bbox(raw))
     return bake(args)

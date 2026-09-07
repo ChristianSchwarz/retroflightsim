@@ -93,7 +93,7 @@ TILE_SIZE = 257
 
 # A bake is quadratic in span and the mesh stage is the slow half, so a
 # fat-fingered bbox is worth stopping before it downloads for an hour.
-DEFAULT_MAX_SPAN_DEG = 3.0
+DEFAULT_MAX_SPAN_DEG = 6.0
 
 # Pixels fetched beyond the claimed tiles. A node landing exactly on the raster
 # edge has no pixel centre to its outside, so the sampler clamps it to the
@@ -272,8 +272,9 @@ def mosaic_into(
     back entirely void.
     """
     used = 0
+    total = len(sources)
     filled = np.zeros(out.shape, dtype=bool)
-    for url in sources:
+    for i, url in enumerate(sources):
         name = url.rsplit('/', 1)[-1]
         try:
             with rasterio.open(url) as src:
@@ -306,16 +307,16 @@ def mosaic_into(
                     num_threads=4,
                 )
         except Exception as exc:  # noqa: BLE001 - one missing square must not sink the run
-            print(f'  skipped {name}: {exc}')
+            print(f'  [{i + 1}/{total}] skipped {name}: {exc}')
             continue
         fresh = (tmp != NODATA) & ~filled
         if not fresh.any():
-            print(f'  nothing new from {name}')
+            print(f'  [{i + 1}/{total}] nothing new from {name}')
             continue
         out[fresh] = tmp[fresh]
         filled |= fresh
         used += 1
-        print(f'  merged {name} -> {100.0 * filled.mean():.1f}% covered')
+        print(f'  [{i + 1}/{total}] merged {name} -> {100.0 * filled.mean():.1f}% covered', flush=True)
     return used
 
 

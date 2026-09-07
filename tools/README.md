@@ -350,7 +350,7 @@ and an imported area joins the pyramid at a uniform depth; fetch coarser (say
 | `--bbox` | **(required)** `west,south,east,north` in degrees. Spans crossing the antimeridian are refused. |
 | `--out` | Output GeoTIFF (default `data/imports/dem.tif`). |
 | `--arcsec` | Output pixel in arcseconds (default 1.0, the archive spacing). |
-| `--max-span` | Refuse a bbox wider or taller than this (default 3 degrees). Bake cost grows with area. |
+| `--max-span` | Refuse a bbox wider or taller than this (default 6 degrees). Bake cost grows with area. |
 | `--no-snap` | Do not align the box to tiles and the shared lattice. See below — only useful for reproducing the seam bug. |
 | `--refresh-tile-list` | Re-fetch the cached archive tile list. |
 
@@ -464,7 +464,7 @@ replaced:
 Press **F9** while the dev server is running (`npm run serve`) and pick the area
 on an OpenStreetMap map: drag to pan, wheel to zoom, **shift-drag** to draw the
 box. The readout gives the bbox, its size in km and how many terrain tiles the
-bake will touch, and refuses anything over the 3 degree limit. Name it, tick
+bake will touch, and refuses anything over the 6 degree limit. Name it, tick
 *Satellite colour* if you want the imagery stage, and press Import.
 
 That runs exactly the command sequence below, server-side, streaming each

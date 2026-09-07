@@ -49,25 +49,25 @@ warnings.filterwarnings('ignore', category=DeprecationWarning, module='rasterio'
 
 try:
     import rasterio
-    from rasterio.enums import Resampling
-    from rasterio.vrt import WarpedVRT
 except ImportError:  # pragma: no cover - dependency hint
     print('error: rasterio is required (pip install rasterio numpy)', file=sys.stderr)
     raise
 
 from bake_planet_dem import (
+    DEFAULT_JOBS,
     LAND_EPSILON_M,
     Bounds,
     area_name_for,
-    SourceSampler,
     build_parent,
     encode_tile,
     index_levels,
     mask_has_land,
     merge_area,
+    open_sampler,
     pack_index,
     parent_geometric_error,
     read_tile,
+    sample_leaf_level_parallel,
     tile_bounds,
     tile_range_for_bounds,
     unpack_index,
@@ -110,17 +110,6 @@ def load_index(out_dir: str, manifest: dict) -> Dict[int, Set[Tuple[int, int]]]:
     path = os.path.join(out_dir, manifest.get('indexPath', 'index.bin'))
     with open(path, 'rb') as fh:
         return unpack_index(fh.read())
-
-
-def open_sampler(input_path: str, sea_level: float):
-    dataset = rasterio.open(input_path)
-    if dataset.crs is None:
-        raise ValueError('source has no CRS')
-    if dataset.crs.to_epsg() != 4326:
-        print(f'reprojecting {dataset.crs} -> EPSG:4326')
-        return SourceSampler(WarpedVRT(dataset, crs='EPSG:4326',
-                                       resampling=Resampling.bilinear), sea_level)
-    return SourceSampler(dataset, sea_level)
 
 
 def gather_children(
@@ -202,12 +191,8 @@ def merge(args: argparse.Namespace) -> int:
                                    tile_bounds(max_zoom, x, y))]
     print(f'level {max_zoom:2d}    {len(candidates)} candidate tiles')
 
-    level_grids: Dict[Tuple[int, int], np.ndarray] = {}
-    for x, y in candidates:
-        grid = sampler.sample_grid(tile_bounds(max_zoom, x, y), tile_size)
-        if float(np.nanmax(grid)) <= sea_level + LAND_EPSILON_M:
-            continue
-        level_grids[(x, y)] = grid
+    level_grids = sample_leaf_level_parallel(
+        args.input, sea_level, candidates, max_zoom, tile_size, args.jobs)
     print(f'level {max_zoom:2d}    {len(level_grids)} tiles with land')
     if not level_grids:
         print('error: no land in the source bbox; nothing to merge', file=sys.stderr)
@@ -234,7 +219,8 @@ def merge(args: argparse.Namespace) -> int:
 
     for z in range(max_zoom, min_zoom - 1, -1):
         level_max_error = 0.0
-        for (x, y), grid in sorted(level_grids.items()):
+        items = sorted(level_grids.items())
+        for i, ((x, y), grid) in enumerate(items):
             err = tile_errors.get((x, y), 0.0)
             level_max_error = max(level_max_error, err)
             finite = np.isfinite(grid)
@@ -244,6 +230,8 @@ def merge(args: argparse.Namespace) -> int:
             stats['bytes'] += write_tile(args.out, z, x, y, encode_tile(grid, err))
             stats['written'] += 1
             merged_tiles.setdefault(z, set()).add((x, y))
+            if len(items) > 40 and (i % max(1, len(items) // 20)) == 0:
+                print(f'  writing {i + 1}/{len(items)} at z{z}', flush=True)
         level_errors[z] = level_max_error
         rebuilt = len(level_grids)
 
@@ -347,6 +335,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          'manifest predates areas being recorded (default: home)')
     ap.add_argument('--dry-run', action='store_true',
                     help='report what would be written and stop')
+    ap.add_argument('--jobs', type=int, default=DEFAULT_JOBS,
+                    help=f'worker processes for leaf-tile sampling (default {DEFAULT_JOBS})')
     args = ap.parse_args(argv)
     try:
         return merge(args)

@@ -31,11 +31,11 @@
  */
 
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
-import * as zlib from 'node:zlib';
+import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import { decodePdm } from '../src/script/terrain/demTile';
-import { Watercourse, decodeLvr } from './bake/lvr';
-import { PLC_FLAG_REAL_IMAGERY, decodePlc } from './bake/plc';
 import {
     HISTOGRAM_BINS, accumulateColors, luminanceWindow, medianCut, newColorHistogram,
 } from './bake/swatches';
@@ -44,9 +44,11 @@ import {
 } from '../src/script/terrain/geodesy';
 import { FlattenPadRecord, padFromRecord } from '../src/script/terrain/flattenPad';
 import { AIRBASE_FLATTEN_PAD, PLAY_ORIGIN } from '../src/script/state/worldLayout';
-import { buildTile } from './bake/buildTile';
 import { TileKey, decodeTileIndex, encodeTileIndex } from './bake/index';
-import { CoastPolygon, InlandPolygon, LonLatBounds } from './bake/shoreline';
+import { LonLatBounds } from './bake/shoreline';
+import {
+    MeshTileConfig, TileProcessResult, TileTask, tileBounds,
+} from './bake/meshTile';
 
 // Triangles per tile. Measured on real Canary z12 tiles: the coast alone costs
 // ~18k at full resolution and roughly halves per coarsening step, so this buys
@@ -150,40 +152,6 @@ function loadHistogram(dir: string): Uint32Array {
 
 function saveHistogram(dir: string, histogram: Uint32Array): void {
     fs.writeFileSync(path.join(dir, HISTOGRAM_FILE), Buffer.from(histogram.buffer));
-}
-
-/** Geographic quadtree: level z has 2^(z+1) columns by 2^z rows. */
-function tileBounds(z: number, x: number, y: number): LonLatBounds {
-    const span = 180 / (1 << z);
-    const west = -180 + x * span;
-    const north = 90 - y * span;
-    return { west, south: north - span, east: west + span, north };
-}
-
-function tileEdgeMetres(z: number, x: number, y: number): number {
-    const b = tileBounds(z, x, y);
-    const midLat = (b.south + b.north) / 2;
-    return Math.max(
-        (b.east - b.west) * 111320 * Math.cos(midLat * Math.PI / 180),
-        (b.north - b.south) * 110540,
-    );
-}
-
-/**
- * Skirt depth per level. The worst vertical mismatch across an LOD seam is
- * bounded by the *coarser* neighbour's geometric error, so the parent level's
- * error is the right term; 2x is margin, and the edge-length term covers
- * ellipsoid sagitta at coarse levels where geometric error is small.
- */
-function skirtDepthForLevel(z: number, levelErrors: number[], edgeM: number): number {
-    const parentErr = z > 0 ? (levelErrors[z - 1] ?? 0) : (levelErrors[0] ?? 0);
-    return Math.max(2 * parentErr, 0.01 * edgeM);
-}
-
-/** Interior tolerance: half the level's geometric error, floored so flats collapse. */
-function maxErrorForLevel(z: number, levelErrors: number[]): number {
-    const err = levelErrors[z] ?? 0;
-    return err <= 0 ? 1 : Math.max(1, err * 0.5);
 }
 
 /**
@@ -312,6 +280,78 @@ function walkTiles(src: string, maxZoom: number): Array<{ z: number; x: number; 
     return out;
 }
 
+const WORKER_FILE = path.join(
+    path.dirname(fileURLToPath(import.meta.url)), 'bake', 'meshTileWorker.ts',
+);
+
+/**
+ * Runs `processTile` for every tile across a pool of worker threads.
+ *
+ * Tiles only read their own input files and write their own `.ptm`, so the
+ * *computation* is safe to run in any order or in parallel. What must stay
+ * order-independent-proof is the caller: results come back in `tasks` order
+ * (indexed, not completion order) so folding them in that fixed order
+ * reproduces the old fully-serial bake byte-for-byte - see meshTile.ts.
+ */
+function runTilesInParallel(
+    cfg: MeshTileConfig,
+    tasks: TileTask[],
+    onProgress: (done: number, total: number) => void,
+): Promise<Array<TileProcessResult | undefined>> {
+    return new Promise((resolve, reject) => {
+        const results: Array<TileProcessResult | undefined> = new Array(tasks.length);
+        if (tasks.length === 0) {
+            resolve(results);
+            return;
+        }
+        const workerCount = Math.max(1, Math.min(os.cpus().length - 1, tasks.length));
+        let nextTask = 0;
+        let completed = 0;
+        let failed: unknown;
+        const workers: Worker[] = [];
+
+        const settle = (): void => {
+            for (const w of workers) {
+                w.postMessage(null);
+            }
+            resolve(results);
+        };
+
+        const dispatch = (worker: Worker): void => {
+            if (failed !== undefined || nextTask >= tasks.length) {
+                return;
+            }
+            const idx = nextTask++;
+            worker.postMessage({ idx, task: tasks[idx] });
+        };
+
+        for (let i = 0; i < workerCount; i++) {
+            const worker = new Worker(WORKER_FILE, { execArgv: process.execArgv, workerData: cfg });
+            workers.push(worker);
+            worker.on('message', (msg: { idx: number; result: TileProcessResult | undefined }) => {
+                results[msg.idx] = msg.result;
+                completed++;
+                onProgress(completed, tasks.length);
+                if (completed === tasks.length) {
+                    settle();
+                } else {
+                    dispatch(worker);
+                }
+            });
+            worker.on('error', (err) => {
+                if (failed === undefined) {
+                    failed = err;
+                    for (const w of workers) {
+                        void w.terminate();
+                    }
+                    reject(failed);
+                }
+            });
+            dispatch(worker);
+        }
+    });
+}
+
 /**
  * The airfield descriptions, written beside the manifest rather than into it.
  *
@@ -387,7 +427,7 @@ function padRecordsFor(
     return records;
 }
 
-function main(): void {
+async function main(): Promise<void> {
     const args = parseArgs(process.argv.slice(2));
     const manifestPath = path.join(args.src, 'manifest.json');
     if (!fs.existsSync(manifestPath)) {
@@ -462,84 +502,52 @@ function main(): void {
     const leafHistogram = new Map<number, number>();
     const t0 = Date.now();
 
+    // Each tile only reads its own inputs and writes its own .ptm, so the
+    // build+gzip work runs across a pool of worker threads (see meshTile.ts).
+    // Results come back indexed by `tiles` order, not completion order, and
+    // are folded below in that same order - identical to the old serial
+    // loop's byte output regardless of which worker finished a given tile.
+    const meshCfg: MeshTileConfig = {
+        src: args.src,
+        out: args.out,
+        seaLevel: src.seaLevel ?? 0,
+        levelErrors,
+        budget: args.budget,
+        basis,
+        pads,
+    };
+    const results = await runTilesInParallel(meshCfg, tiles, (done, total) => {
+        const pct = ((done / total) * 100).toFixed(1);
+        process.stdout.write(`\r  ${done}/${total} (${pct}%)`);
+    });
+    process.stdout.write('\n');
+
     for (let i = 0; i < tiles.length; i++) {
         const { z, x, y } = tiles[i];
-        const stem = path.join(args.src, String(z), String(x), String(y));
-        const pdmPath = `${stem}.pdm`;
-        if (!fs.existsSync(pdmPath)) {
+        const r = results[i];
+        if (r === undefined) {
             continue;
         }
-        const dem = decodePdm(fs.readFileSync(pdmPath));
-        let polygons: CoastPolygon[] | undefined;
-        let inland: InlandPolygon[] | undefined;
-        let watercourses: Watercourse[] | undefined;
-        const lvrPath = `${stem}.lvr`;
-        if (fs.existsSync(lvrPath)) {
-            const vec = decodeLvr(fs.readFileSync(lvrPath));
-            polygons = vec.polygons as CoastPolygon[];
-            // Empty on an LVR1 tile, which is most of them.
-            if (vec.inland.length > 0) {
-                inland = vec.inland;
-                inlandTiles++;
-                inlandBodies += vec.inland.length;
-            }
-            // Empty below LVR3.
-            if (vec.watercourses.length > 0) {
-                watercourses = vec.watercourses;
-                riverTiles++;
-            }
-        }
-        let cover: ReturnType<typeof decodePlc> | undefined;
-        const plcPath = `${stem}.plc`;
-        if (fs.existsSync(plcPath)) {
-            cover = decodePlc(fs.readFileSync(plcPath));
-            coveredTiles++;
-            if (cover.flags & PLC_FLAG_REAL_IMAGERY) {
-                imageryTiles++;
-            }
-        }
-
-        const bounds = tileBounds(z, x, y);
-        const edgeM = tileEdgeMetres(z, x, y);
-        const skirtDepthM = skirtDepthForLevel(z, levelErrors, edgeM);
-        levelSkirt[z] = skirtDepthM;
-        // Simplify the coast to roughly the interior tolerance, in cells.
-        const cellM = edgeM / (dem.size - 1);
-        const simplifyCells = cellM > 0 ? Math.min(2, (maxErrorForLevel(z, levelErrors) / cellM)) : 0;
-
-        const r = buildTile({
-            id: { z, x, y },
-            bounds,
-            heights: dem.heights,
-            size: dem.size,
-            seaLevel: src.seaLevel ?? 0,
-            maxErrorM: maxErrorForLevel(z, levelErrors),
-            skirtDepthM,
-            basis,
-            polygons,
-            inland,
-            simplifyCells,
-            triangleBudget: args.budget,
-            pads,
-            cover,
-            watercourses,
-        });
-        // Only tiles carrying real imagery feed the swatch table. A tile
-        // without it is painted in ESA's landcover map colours - a scarlet for
-        // built-up, a lemon for grassland - which are legible on a map and
-        // absurd on terrain, and letting them into the table hands real ground
-        // the nearest of *those*.
-        if (cover && (cover.flags & PLC_FLAG_REAL_IMAGERY)) {
+        if (r.imagery && r.landColors) {
             accumulateColors(colorHistogram, r.landColors);
         }
-
-        const outPath = path.join(args.out, String(z), String(x), `${y}.ptm`);
-        fs.mkdirSync(path.dirname(outPath), { recursive: true });
-        const gz = zlib.gzipSync(r.bytes, { level: 9 });
-        fs.writeFileSync(outPath, gz);
+        levelSkirt[z] = r.skirtDepthM;
+        if (r.covered) {
+            coveredTiles++;
+        }
+        if (r.imagery) {
+            imageryTiles++;
+        }
+        if (r.inlandTile) {
+            inlandTiles++;
+            inlandBodies += r.inlandBodies;
+        }
+        if (r.riverTile) {
+            riverTiles++;
+        }
 
         written.push({ z, x, y });
-        totalBytes += gz.byteLength;
+        totalBytes += r.bytesGz;
         totalTris += r.triangleCount;
         riverTriangles += r.riverTriangles;
         maxTris = Math.max(maxTris, r.triangleCount);
@@ -547,15 +555,7 @@ function main(): void {
             coarsenedCoast++;
         }
         leafHistogram.set(r.minLeafSize, (leafHistogram.get(r.minLeafSize) ?? 0) + 1);
-
-        if ((i + 1) % 100 === 0 || i + 1 === tiles.length) {
-            const pct = (((i + 1) / tiles.length) * 100).toFixed(1);
-            process.stdout.write(
-                `\r  ${i + 1}/${tiles.length} (${pct}%)  ${(totalBytes / 1048576).toFixed(1)} MB`,
-            );
-        }
     }
-    process.stdout.write('\n');
 
     const heightMaxZoom = Math.min(11, src.maxZoom);
     const heightBytes = copyHeightTiles(args.src, args.out, heightMaxZoom);
@@ -698,4 +698,7 @@ function main(): void {
     }
 }
 
-main();
+main().catch(err => {
+    console.error(err);
+    process.exit(1);
+});
