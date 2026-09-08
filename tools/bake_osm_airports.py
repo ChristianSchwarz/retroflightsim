@@ -1186,6 +1186,24 @@ def area_bounds(manifest: dict) -> List[Tuple[str, Bounds]]:
     return [('terrain', Bounds(cov['west'], cov['south'], cov['east'], cov['north']))]
 
 
+def bbox_area_name(manifest: dict, bbox: Bounds, tol: float = 1e-6) -> str:
+    """The registered area an explicit --bbox belongs to, if any.
+
+    An area baked by hand with --bbox used to be stamped with the literal
+    name 'bbox' rather than the area it actually covers, which left every
+    airfield inside it invisible at runtime: airfieldsInArea() filters by
+    name, and nothing is ever called 'bbox'. Matching the box against the
+    manifest's own areas (the common case: the caller copied its bounds
+    from bake_planet_dem.py --name) keeps the name real; an unregistered
+    box - genuine ad-hoc exploration - still falls back to 'bbox'.
+    """
+    for name, bounds in area_bounds(manifest):
+        if (abs(bounds.west - bbox.west) < tol and abs(bounds.south - bbox.south) < tol
+                and abs(bounds.east - bbox.east) < tol and abs(bounds.north - bbox.north) < tol):
+            return name
+    return 'bbox'
+
+
 def report_airfield(airfield: Airfield, rejected: str = '') -> None:
     head = f'{airfield.icao or "----"}  {airfield.name}'
     if rejected:
@@ -1247,7 +1265,8 @@ def bake(args: argparse.Namespace) -> int:
     max_zoom = manifest.get('maxZoom', 12)
 
     if args.bbox:
-        targets = [('bbox', parse_bbox(args.bbox))]
+        bbox = parse_bbox(args.bbox)
+        targets = [(bbox_area_name(manifest, bbox), bbox)]
     else:
         targets = area_bounds(manifest)
     print(f'targets     {len(targets)}: ' + ', '.join(name for name, _ in targets))
