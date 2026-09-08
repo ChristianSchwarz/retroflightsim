@@ -196,10 +196,12 @@ WARN_RESIDUAL_M = 15.0
 # not by 25.
 MAX_REF_DELTA_DEG = 25.0
 
-# Airfields kept per baked area, best first. A cap rather than a filter: an
-# area the size of Berlin has dozens of aeroways in it and most are gliding
-# clubs, but which ones matter is a ranking question, not a threshold one.
-DEFAULT_PER_AREA = 6
+# Airfields kept per baked area, unlimited by default: a real area has plenty
+# of small grass strips and gliding clubs alongside its one international
+# field, and dropping them by rank silently made "the airfields of this area"
+# mean "the biggest few of them". `--per-area N` still caps it for anyone who
+# wants a lighter bake.
+DEFAULT_PER_AREA = None
 
 
 # --- local metric frame -----------------------------------------------------
@@ -1306,11 +1308,12 @@ def bake(args: argparse.Namespace) -> int:
         found = [a for a in found
                  if bounds.west <= a.lon <= bounds.east and bounds.south <= a.lat <= bounds.north]
         found.sort(key=score)
-        print(f'  {len(found)} aerodromes with runways; keeping up to {args.per_area}')
+        cap = 'all' if args.per_area is None else f'up to {args.per_area}'
+        print(f'  {len(found)} aerodromes with runways; keeping {cap}')
 
         kept: List[dict] = []
         for airfield in found:
-            if len(kept) >= args.per_area:
+            if args.per_area is not None and len(kept) >= args.per_area:
                 break
             airfield.area = name
             airfield.pads = platform_pads(airfield)
@@ -1403,7 +1406,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument('--out', default='assets/planet', help='planet asset directory')
     parser.add_argument('--bbox', help='west,south,east,north degrees (default: every baked area)')
     parser.add_argument('--per-area', type=int, default=DEFAULT_PER_AREA,
-                        help=f'airfields kept per area, best first (default {DEFAULT_PER_AREA})')
+                        help='airfields kept per area, best first (default: unlimited)')
     parser.add_argument('--refresh-osm', action='store_true',
                         help='ignore the cached Overpass response and re-fetch')
     parser.add_argument('--dry-run', action='store_true',
