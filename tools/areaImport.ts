@@ -274,6 +274,22 @@ export function splitStream(tail: string, chunk: string): { lines: string[]; tai
     return { tail: parts.pop() ?? '', lines: parts.filter(l => l.trim().length > 0) };
 }
 
+/** `93s` under a minute, `4m 12s` at or past one - readable at either scale
+ * without ever printing "0m 8s". */
+export function formatDuration(ms: number): string {
+    const totalSeconds = ms / 1000;
+    if (totalSeconds < 60) {
+        return `${totalSeconds.toFixed(1)}s`;
+    }
+    // Round the whole duration first, not just the seconds remainder - 119.6s
+    // is 2m 0s, and rounding 59.6 leftover seconds on its own would print the
+    // impossible "1m 60s".
+    const roundedSeconds = Math.round(totalSeconds);
+    const minutes = Math.floor(roundedSeconds / 60);
+    const seconds = roundedSeconds - minutes * 60;
+    return `${minutes}m ${seconds}s`;
+}
+
 function runStep(
     job: Job, label: string, index: number, cmd: string, args: string[],
 ): Promise<void> {
@@ -283,6 +299,7 @@ function runStep(
         job.percent = 0;
         line(job, `\n[${index + 1}/${job.stepCount}] ${label}`);
         line(job, `$ ${cmd} ${args.join(' ')}`);
+        const startedAt = Date.now();
         const child = spawn(cmd, args, { cwd: PROJECT_ROOT });
         let tail = '';
         const feed = (d: Buffer) => {
@@ -303,10 +320,12 @@ function runStep(
             if (tail.trim()) {
                 line(job, tail);
             }
+            const elapsed = formatDuration(Date.now() - startedAt);
             if (code === 0) {
+                line(job, `${label} - done in ${elapsed}`);
                 resolve();
             } else {
-                reject(new Error(`${label} exited with code ${code}`));
+                reject(new Error(`${label} exited with code ${code} after ${elapsed}`));
             }
         });
     });
@@ -380,16 +399,17 @@ function runningJob(): Job | undefined {
 
 /** Wire a job's outcome into its state, log and subscribers. */
 function finishJob(job: Job, work: Promise<void>, doneLine: string): void {
+    const startedAt = Date.now();
     work.then(() => {
         job.state = 'done';
         job.step = 'done';
         job.stepIndex = Math.max(0, job.stepCount - 1);
         job.percent = 100;
-        line(job, `\n${doneLine}`);
+        line(job, `\n${doneLine} (${formatDuration(Date.now() - startedAt)} total)`);
     }).catch((err: Error) => {
         job.state = 'failed';
         job.error = err.message;
-        line(job, `\nFAILED: ${err.message}`);
+        line(job, `\nFAILED after ${formatDuration(Date.now() - startedAt)}: ${err.message}`);
     }).finally(() => {
         emit(job, { line: '' });
         for (const sub of job.subscribers) {

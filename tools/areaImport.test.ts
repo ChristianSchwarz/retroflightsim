@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
-    isProgressLine, parseProgress, snapBboxToTiles, splitStream,
+    formatDuration, isProgressLine, parseProgress, snapBboxToTiles, splitStream,
 } from './areaImport';
 
 /**
@@ -138,5 +138,22 @@ describe('snapBboxToTiles', () => {
         onEdge(w, -180);
         onEdge(e, -180);
         assert.ok(w <= -113.61 && e >= -110.79 && s <= 35.60 && n >= 37.10);
+    });
+});
+
+describe('formatDuration', () => {
+    it('renders sub-minute durations with one decimal of seconds', () => {
+        assert.equal(formatDuration(1234), '1.2s');
+        assert.equal(formatDuration(59900), '59.9s');
+    });
+
+    it('switches to minutes and whole seconds at one minute', () => {
+        assert.equal(formatDuration(60000), '1m 0s');
+        assert.equal(formatDuration(252000), '4m 12s');
+    });
+
+    it('never prints a fractional second once it is showing minutes', () => {
+        // 119.6s must round to 2m 0s, not 1m 60s.
+        assert.equal(formatDuration(119600), '2m 0s');
     });
 });
