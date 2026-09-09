@@ -32,8 +32,11 @@ already needs.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -203,6 +206,14 @@ MAX_REF_DELTA_DEG = 25.0
 # wants a lighter bake.
 DEFAULT_PER_AREA = None
 
+# Fitting one airfield - sampling every pad's DEM points and least-squaring a
+# plane through them - is pure Python per point and independent of every other
+# airfield, the same shape of work the DEM and coast bakes already split
+# across worker processes. It only pays off once the per-area cap above was
+# removed: a handful of airfields is over before a process pool would even
+# finish starting, but an unlimited area can now hold dozens.
+DEFAULT_JOBS = max(1, (os.cpu_count() or 1) - 1)
+
 
 # --- local metric frame -----------------------------------------------------
 
@@ -368,6 +379,10 @@ class Airfield:
     taxiways: List[dict] = field(default_factory=list)
     aprons: List[dict] = field(default_factory=list)
     buildings: List[dict] = field(default_factory=list)
+    #: Displaced thresholds, blast pads and stopways - real pavement that is
+    #: not a landing surface of its own, kept as ready-made pad rectangles
+    #: rather than as `Runway`s. See `pavement_pad`.
+    extra_pads: List[dict] = field(default_factory=list)
     #: Filled in by the DEM pass.
     plane: Optional[dict] = None
     fit: Optional[dict] = None
@@ -487,9 +502,12 @@ def runway_from_way(
     if len(coords) < 2:
         return None
     tags = way.get('tags', {}) or {}
-    # A displaced threshold is mapped as its own `aeroway=runway` way lying on
-    # top of the real one - it is paint, not pavement. La Palma has one; taken
-    # as a runway it would be a second, shorter, coincident strip.
+    # A displaced threshold, blast pad or stopway is mapped as its own
+    # `aeroway=runway` way alongside the real one - not a landing surface with
+    # its own designator, so turning it into a `Runway` would be a second,
+    # often coincident, strip. The caller still keeps its pavement: see
+    # `pavement_pad`, which is what `assemble_airfields` sends these to
+    # instead of here.
     if tags.get('runway') in ('displaced_threshold', 'blast_pad', 'stopway'):
         return None
     lon0 = sum(c[0] for c in coords) / len(coords)
@@ -573,6 +591,58 @@ def runway_from_way(
     )
 
 
+def pavement_pad(
+    way: dict,
+    nodes: Dict[int, Tuple[float, float]],
+    default_width: float,
+) -> Optional[dict]:
+    """A displaced threshold, blast pad or stopway as a flatten pad of its own.
+
+    `runway_from_way` turns these away rather than double them up as landing
+    strips, but they are still real pavement - Holzdorf's displaced threshold
+    is hundreds of metres of concrete beyond where the runway way itself ends,
+    and left unpadded that is a slab of the airfield perimeter the terrain
+    never gets flattened or painted under. No ICAO strip overrun here: unlike
+    a runway there is no regulatory graded area implied, just the mapped
+    pavement plus the usual pad feather.
+    """
+    coords = [nodes[nid] for nid in way.get('nodes', []) if nid in nodes]
+    if len(coords) < 2:
+        return None
+    tags = way.get('tags', {}) or {}
+    lon0 = sum(c[0] for c in coords) / len(coords)
+    lat0 = sum(c[1] for c in coords) / len(coords)
+    frame = LocalFrame(lat0, lon0)
+    pts = [frame.to_m(lon, lat) for lon, lat in coords]
+
+    closed = len(coords) >= 4 and coords[0] == coords[-1]
+    if closed:
+        pts = pts[:-1]
+    centre_m, direction = fit_axis(pts)
+    a_min, a_max, c_min, c_max = axis_extent(pts, centre_m, direction)
+
+    length = a_max - a_min
+    if length <= 0.0:
+        return None
+    measured_width = c_max - c_min
+    width = measured_width if closed and measured_width > 5.0 else (
+        tagged_width_m(tags) or default_width)
+
+    mid = (a_min + a_max) / 2.0
+    cx = centre_m[0] + direction[0] * mid
+    cy = centre_m[1] + direction[1] * mid
+    lon_c, lat_c = frame.to_lonlat(cx, cy)
+
+    return {
+        'lat': lat_c,
+        'lon': lon_c,
+        'headingDeg': bearing_deg(direction[0], direction[1]),
+        'halfD': length / 2.0 + PAD_FEATHER_M,
+        'halfW': max(width / 2.0, MIN_PLAUSIBLE_TAXIWAY_WIDTH_M) + PAD_FEATHER_M,
+        'featherM': PAD_FEATHER_M,
+    }
+
+
 def _ring_of(way: dict, nodes: Dict[int, Tuple[float, float]]) -> Optional[List[Tuple[float, float]]]:
     coords = [nodes[nid] for nid in way.get('nodes', []) if nid in nodes]
     if len(coords) < 4 or coords[0] != coords[-1]:
@@ -630,13 +700,11 @@ def overpass_airports(b: Bounds, refresh: bool = False) -> dict:
     the wrong trade.
     """
     box = b.as_overpass()
-    required = (
-        ('aerodromes', _aeroway_query(
-            [f'{kind}["aeroway"="aerodrome"]({box})'
-             for kind in ('node', 'way', 'relation')])),
-        ('runways', _aeroway_query(
-            [f'way["aeroway"="{kind}"]({box})' for kind in ('runway', 'helipad')])),
-    )
+    aerodromes_query = _aeroway_query(
+        [f'{kind}["aeroway"="aerodrome"]({box})'
+         for kind in ('node', 'way', 'relation')])
+    runways_query = _aeroway_query(
+        [f'way["aeroway"="{kind}"]({box})' for kind in ('runway', 'helipad')])
     optional = (
         ('taxiways', _aeroway_query([f'way["aeroway"="taxiway"]({box})'])),
         ('aprons and buildings', _aeroway_query(
@@ -647,11 +715,34 @@ def overpass_airports(b: Bounds, refresh: bool = False) -> dict:
     )
 
     elements: List[dict] = []
-    for label, query in required:
-        elements.extend(overpass_fetch(query, label, refresh).get('elements', []))
+    aerodrome_elements = overpass_fetch(aerodromes_query, 'aerodromes', refresh).get('elements', [])
+    elements.extend(aerodrome_elements)
+
+    def reject_if_suspiciously_empty(label: str, data: dict) -> None:
+        # A bbox with aerodromes and zero elements from another aeroway query
+        # over the same box is what overpass.osm.ch answers - HTTP 200, no
+        # remark - when it silently truncates the query instead of failing
+        # it, and a bbox with hundreds of aerodromes (this one has 2208
+        # elements' worth, including Berlin Brandenburg Airport) coming back
+        # with not one single taxiway or apron anywhere is that, not a
+        # genuinely bare region. A bbox that has no aerodromes at all never
+        # reaches here, since `aerodrome_elements` would itself be empty and
+        # there would be nothing left to validate.
+        if aerodrome_elements and not data.get('elements'):
+            raise RuntimeError(
+                f'{label} came back empty for a bbox with aerodromes - '
+                'likely a truncated answer, not a bbox with none')
+
+    elements.extend(overpass_fetch(
+        runways_query, 'runways', refresh,
+        validate=lambda data: reject_if_suspiciously_empty('runways', data),
+    ).get('elements', []))
     for label, query in optional:
         try:
-            elements.extend(overpass_fetch(query, label, refresh).get('elements', []))
+            elements.extend(overpass_fetch(
+                query, label, refresh,
+                validate=lambda data, label=label: reject_if_suspiciously_empty(label, data),
+            ).get('elements', []))
         except Exception as err:
             print(f'  {label} unavailable ({err}) - baking without them', file=sys.stderr)
     return {'elements': elements}
@@ -784,6 +875,12 @@ def assemble_airfields(data: dict) -> List[Airfield]:
         if aeroway == 'runway':
             if host is None:
                 orphan_runways.append((el, (lon, lat)))
+                continue
+            if tags.get('runway') in ('displaced_threshold', 'blast_pad', 'stopway'):
+                default_width = DEFAULT_RUNWAY_WIDTH_M.get(host.kind, DEFAULT_RUNWAY_WIDTH_M['ga'])
+                pad = pavement_pad(el, nodes, default_width)
+                if pad is not None:
+                    host.extra_pads.append(pad)
                 continue
             runway = runway_from_way(el, nodes, host.kind)
             if runway is not None:
@@ -1015,10 +1112,12 @@ def platform_pads(airfield: Airfield) -> List[dict]:
     """Oriented rectangles the terrain has to be cut flat under.
 
     One per runway, grown to the ICAO strip rather than to the pavement, plus a
-    box around each apron. Every one of them is flattened to the same plane -
-    fitted once for the airfield, not once per rectangle - because two
-    rectangles fitted separately meet at a step, and a step across the taxiway
-    between the apron and the runway is exactly where it would be seen.
+    box around each apron and one for every displaced threshold, blast pad or
+    stopway `pavement_pad` recorded. Every one of them is flattened to the
+    same plane - fitted once for the airfield, not once per rectangle -
+    because two rectangles fitted separately meet at a step, and a step
+    across the taxiway between the apron and the runway is exactly where it
+    would be seen.
     """
     pads: List[dict] = []
     for runway in airfield.runways:
@@ -1030,6 +1129,7 @@ def platform_pads(airfield: Airfield) -> List[dict]:
             'halfW': max(STRIP_HALF_WIDTH_M, runway.width_m / 2.0 + 30.0) + PAD_FEATHER_M,
             'featherM': PAD_FEATHER_M,
         })
+    pads.extend(airfield.extra_pads)
     primary = max(airfield.runways, key=lambda r: r.length_m)
     apron_pads: List[Tuple[float, dict]] = []
     for apron in airfield.aprons:
@@ -1254,6 +1354,106 @@ def report_airfield(airfield: Airfield, rejected: str = '') -> None:
           f'{len(airfield.aprons)} aprons, {len(airfield.buildings)} buildings')
 
 
+def evaluate_airfield(
+    airfield: Airfield, dem: DemSampler, mask: Optional[LandMask],
+) -> Optional[dict]:
+    """DEM-samples, fits and reports one airfield. None if it is rejected.
+
+    Factored out of `bake()`'s per-area loop so a multiprocessing worker can
+    call it too, one airfield per call - `airfield.pads` and `.area` must
+    already be set (`bake()` does that before dispatch, cheap work that stays
+    serial). Every candidate is independent of every other: nothing here reads
+    or writes state another airfield's evaluation touches.
+    """
+    samples, asked, valid, water = sample_platform(airfield, dem, mask)
+    if asked == 0 or valid / asked < MIN_VALID_SAMPLE_FRACTION:
+        report_airfield(airfield, f'DEM covers {valid}/{asked} of the platform')
+        return None
+    if asked and water / asked > MAX_WATER_FRACTION:
+        report_airfield(airfield, f'{100.0 * water / asked:.0f}% of the platform is water')
+        return None
+    longest = max(r.length_m for r in airfield.runways)
+    fit = fit_plane(samples, gradient_limit(longest))
+    if not fit:
+        report_airfield(airfield, 'too few DEM samples to fit a plane')
+        return None
+    if fit['residualMaxM'] > MAX_RESIDUAL_M:
+        report_airfield(
+            airfield,
+            f'{fit["residualMaxM"]:.0f} m of cut/fill - the DEM and OSM '
+            f'disagree about where the ground is')
+        return None
+    airfield.fit = fit
+    airfield.plane = {
+        'heightMsl': fit['heightMsl'],
+        'gradient': fit['gradient'],
+        'headingDeg': max(airfield.runways, key=lambda r: r.length_m).heading_deg,
+    }
+    stamp_pad_planes(airfield)
+    report_airfield(airfield)
+    return airfield_to_json(airfield)
+
+
+# Per-worker state for evaluate_airfields_parallel, set once by _init_airfield_worker.
+# DemSampler/LandMask each hold an on-disk tile cache that is pointless to
+# share across processes - and cannot be, a plain dict does not survive a
+# spawn boundary - so every worker opens its own, the same trade
+# `open_sampler` documents for the DEM bake's own worker pool.
+_af_dem: Optional[DemSampler] = None
+_af_mask: Optional[LandMask] = None
+
+
+def _init_airfield_worker(out_dir: str, max_zoom: int, tile_size: int, has_mask: bool) -> None:
+    global _af_dem, _af_mask
+    _af_dem = DemSampler(out_dir, max_zoom, tile_size)
+    _af_mask = LandMask(out_dir, max_zoom, tile_size) if has_mask else None
+
+
+def _airfield_worker(airfield: Airfield) -> Tuple[Optional[dict], str]:
+    """Runs `evaluate_airfield` with its prints captured, for the parent to
+    replay in submission order - workers finish in whatever order the DEM
+    happens to answer them, and interleaving several airfields' reports would
+    read as garbage."""
+    assert _af_dem is not None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = evaluate_airfield(airfield, _af_dem, _af_mask)
+    return result, buf.getvalue()
+
+
+def evaluate_airfields_parallel(
+    found: Sequence[Airfield],
+    dem: DemSampler,
+    mask: Optional[LandMask],
+    out_dir: str,
+    max_zoom: int,
+    tile_size: int,
+    jobs: int,
+) -> List[dict]:
+    """Evaluates every candidate in `found`, across `jobs` worker processes.
+
+    Every candidate is evaluated - there is no cap to short-circuit against,
+    which is what makes this worth pooling at all (see `bake()`: a finite
+    `--per-area` keeps the serial early-break instead, since most of its
+    candidates are never looked at).
+    """
+    jobs = max(1, min(jobs, len(found))) if found else 1
+    if jobs == 1:
+        return [r for a in found if (r := evaluate_airfield(a, dem, mask)) is not None]
+
+    kept: List[dict] = []
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(
+        jobs, initializer=_init_airfield_worker,
+        initargs=(out_dir, max_zoom, tile_size, mask is not None),
+    ) as pool:
+        for result, report_text in pool.imap(_airfield_worker, found, chunksize=4):
+            sys.stdout.write(report_text)
+            if result is not None:
+                kept.append(result)
+    return kept
+
+
 def bake(args: argparse.Namespace) -> int:
     started = time.time()
     manifest_path = args.manifest or os.path.join(args.out, 'manifest.json')
@@ -1311,39 +1511,29 @@ def bake(args: argparse.Namespace) -> int:
         cap = 'all' if args.per_area is None else f'up to {args.per_area}'
         print(f'  {len(found)} aerodromes with runways; keeping {cap}')
 
-        kept: List[dict] = []
         for airfield in found:
-            if args.per_area is not None and len(kept) >= args.per_area:
-                break
             airfield.area = name
             airfield.pads = platform_pads(airfield)
-            samples, asked, valid, water = sample_platform(airfield, dem, mask)
-            if asked == 0 or valid / asked < MIN_VALID_SAMPLE_FRACTION:
-                report_airfield(airfield, f'DEM covers {valid}/{asked} of the platform')
-                continue
-            if asked and water / asked > MAX_WATER_FRACTION:
-                report_airfield(airfield, f'{100.0 * water / asked:.0f}% of the platform is water')
-                continue
-            longest = max(r.length_m for r in airfield.runways)
-            fit = fit_plane(samples, gradient_limit(longest))
-            if not fit:
-                report_airfield(airfield, 'too few DEM samples to fit a plane')
-                continue
-            if fit['residualMaxM'] > MAX_RESIDUAL_M:
-                report_airfield(
-                    airfield,
-                    f'{fit["residualMaxM"]:.0f} m of cut/fill - the DEM and OSM '
-                    f'disagree about where the ground is')
-                continue
-            airfield.fit = fit
-            airfield.plane = {
-                'heightMsl': fit['heightMsl'],
-                'gradient': fit['gradient'],
-                'headingDeg': max(airfield.runways, key=lambda r: r.length_m).heading_deg,
-            }
-            stamp_pad_planes(airfield)
-            report_airfield(airfield)
-            kept.append(airfield_to_json(airfield))
+
+        if args.per_area is not None:
+            # A finite cap is usually reached long before the end of a sorted
+            # `found`, so the serial early-break - stop the moment enough are
+            # kept - skips sampling candidates a pool would have spun up a
+            # worker for nothing. Pooling only pays when every candidate gets
+            # evaluated anyway, which is the (now default) uncapped case.
+            kept: List[dict] = []
+            for airfield in found:
+                if len(kept) >= args.per_area:
+                    break
+                result = evaluate_airfield(airfield, dem, mask)
+                if result is not None:
+                    kept.append(result)
+        else:
+            t_af = time.time()
+            kept = evaluate_airfields_parallel(
+                found, dem, mask, out_dir, max_zoom, tile_size, args.jobs)
+            if len(found) > 1:
+                print(f'  fitted {len(found)} candidates in {time.time() - t_af:.1f}s')
 
         items = merge_items(items, kept, bounds)
         coverage = union_bounds(coverage, bounds)
@@ -1409,6 +1599,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         help='airfields kept per area, best first (default: unlimited)')
     parser.add_argument('--refresh-osm', action='store_true',
                         help='ignore the cached Overpass response and re-fetch')
+    parser.add_argument('--jobs', type=int, default=DEFAULT_JOBS,
+                        help=f'airfields fitted concurrently when --per-area is unset '
+                             f'(default {DEFAULT_JOBS})')
     parser.add_argument('--dry-run', action='store_true',
                         help='report what would be baked without writing the manifest')
     raw = list(argv) if argv is not None else sys.argv[1:]

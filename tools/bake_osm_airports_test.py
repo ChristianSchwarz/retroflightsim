@@ -27,6 +27,7 @@ from bake_osm_airports import (
     merge_items,
     metres_per_degree,
     parse_ref,
+    pavement_pad,
     platform_pads,
     runway_from_way,
     taxiway_width_m,
@@ -194,6 +195,35 @@ class RunwayFromWayTest(unittest.TestCase):
             8, 179.0, 900.0,
             {'aeroway': 'runway', 'runway': 'displaced_threshold'})
         self.assertIsNone(runway_from_way(way, nodes, 'regional'))
+
+
+class PavementPadTest(unittest.TestCase):
+    """The pavement `runway_from_way` turns away still gets flattened.
+
+    Holzdorf's displaced threshold is hundreds of metres of real concrete
+    beyond the mapped runway strip - dropped outright, that pavement is never
+    cut flat or painted as built ground.
+    """
+
+    def test_a_displaced_threshold_becomes_a_pad(self):
+        way, nodes = way_from_bearing(
+            8, 179.0, 300.0,
+            {'aeroway': 'runway', 'runway': 'displaced_threshold', 'surface': 'concrete'})
+        pad = pavement_pad(way, nodes, default_width=45.0)
+        self.assertIsNotNone(pad)
+        self.assertAlmostEqual(pad['headingDeg'] % 180.0, 179.0 % 180.0, places=1)
+        self.assertAlmostEqual(pad['halfD'] - pad['featherM'], 150.0, delta=1.0)
+        self.assertAlmostEqual(pad['halfW'] - pad['featherM'], 45.0 / 2.0, delta=0.5)
+
+    def test_a_tagged_width_beats_the_default(self):
+        way, nodes = way_from_bearing(
+            9, 90.0, 300.0, {'aeroway': 'runway', 'runway': 'blast_pad', 'width': '60'})
+        pad = pavement_pad(way, nodes, default_width=18.0)
+        self.assertAlmostEqual(pad['halfW'] - pad['featherM'], 30.0, delta=0.5)
+
+    def test_a_degenerate_way_yields_no_pad(self):
+        way, nodes = way_from_bearing(10, 90.0, 0.0, {'aeroway': 'runway', 'runway': 'stopway'})
+        self.assertIsNone(pavement_pad(way, nodes, default_width=18.0))
 
     def test_keeps_the_length_tag_beside_the_measured_one(self):
         # La Palma again: the way measures 2112 m and the tag declares 2200.
@@ -381,6 +411,15 @@ class PlatformPadsTest(unittest.TestCase):
         # Not the apron's own axis: an irregular blob's principal direction
         # swings with its shape and would tilt the pad against the runway.
         self.assertAlmostEqual(pads[1]['headingDeg'], 32.0)
+
+    def test_extra_pads_from_displaced_thresholds_are_included(self):
+        # Otherwise a real displaced threshold - pavement the runway strip's
+        # own overrun does not reach - never gets flattened or painted.
+        way, nodes = way_from_bearing(20, 32.0, 300.0, {}, lat=LAT0, lon=LON0)
+        extra = pavement_pad(way, nodes, default_width=45.0)
+        pads = platform_pads(self.airfield(extra_pads=[extra]))
+        self.assertEqual(len(pads), 2)
+        self.assertIn(extra, pads)
 
 
 class MergeItemsTest(unittest.TestCase):

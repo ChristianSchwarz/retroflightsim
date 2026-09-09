@@ -27,7 +27,7 @@ import sys
 import time
 import zlib
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import requests
@@ -213,7 +213,10 @@ def overpass_cache_path(query: str) -> str:
     return os.path.join(OSM_CACHE_DIR, f'{key}.json.gz')
 
 
-def overpass_fetch(query: str, label: str, refresh: bool) -> dict:
+def overpass_fetch(
+    query: str, label: str, refresh: bool,
+    validate: Optional[Callable[[dict], None]] = None,
+) -> dict:
     """One Overpass request, cached by query hash.
 
     Every mirror (in :func:`mirror_order`) is tried once per round before any
@@ -225,6 +228,17 @@ def overpass_fetch(query: str, label: str, refresh: bool) -> dict:
     the mirror's failure count goes up and the next mirror gets a turn. A 4xx
     is the query's own fault and no mirror or wait will fix it, so that fails
     the whole fetch at once.
+
+    `validate`, when given, is a last check before the answer is trusted: it
+    raises on a response that parsed fine and carried no `remark` but is
+    still wrong. overpass.osm.ch has been seen returning HTTP 200 with a
+    clean, remark-free body and zero elements for a runways query over a bbox
+    its own aerodromes query just answered with thousands - a truncated
+    answer that looks exactly like "this bbox has none", not a fetch that
+    failed. A response `validate` rejects is treated like any other mirror
+    failure - counted against that mirror, retried on the next one - and,
+    importantly, never cached: caching it would make the mirror's mistake
+    permanent for every later run of the same bbox.
     """
     cache = overpass_cache_path(query)
     if not refresh and os.path.isfile(cache):
@@ -280,6 +294,15 @@ def overpass_fetch(query: str, label: str, refresh: bool) -> dict:
                 continue
             if remark:
                 print(f'  overpass remark: {remark}', file=sys.stderr)
+
+            if validate is not None:
+                try:
+                    validate(data)
+                except Exception as err:
+                    last_err = str(err)
+                    print(f'  overpass answer rejected: {last_err}', file=sys.stderr)
+                    _mirror_failed(url)
+                    continue
 
             _mirror_succeeded(url)
             try:

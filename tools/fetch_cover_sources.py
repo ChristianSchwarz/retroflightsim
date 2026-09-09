@@ -44,7 +44,9 @@ import json
 import math
 import os
 import sys
+import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -79,6 +81,15 @@ STAC_SEARCH = 'https://earth-search.aws.element84.com/v1/search'
 MAX_STAC_PAGES = 12
 
 DEG_PER_M = 1.0 / 111320.0
+
+# Each source is one HTTP-backed GDAL read (a WorldCover tile or a Sentinel-2
+# scene, both /vsicurl/), so this is latency-bound, not CPU-bound: a scene
+# spends most of its time waiting on the network, and GDAL releases the GIL
+# while it does, which is what makes a thread pool - not a process pool - the
+# right tool here. 8 keeps a single run well under any per-host connection
+# limit the S3 buckets impose while still overlapping enough scenes that a
+# `--max-scenes 60` imagery mosaic is minutes, not the better part of an hour.
+DEFAULT_JOBS = 8
 
 
 def worldcover_tiles(west: float, south: float, east: float, north: float) -> List[str]:
@@ -135,6 +146,59 @@ def decimation_for(src, target_m: float) -> int:
     return max(1, int(target_m / src_m))
 
 
+def _source_name(url: str) -> str:
+    return url.rsplit('/', 2)[-2] if url.endswith(('TCI.tif', 'visual.tif')) \
+        else url.rsplit('/', 1)[-1]
+
+
+def _fetch_reprojected(
+    url: str,
+    dst_transform,
+    dst_shape: Tuple[int, int, int],
+    dst_dtype,
+    bands: Sequence[int],
+    resampling: Resampling,
+    nodata: int,
+    target_m: float,
+) -> Tuple[str, Optional[np.ndarray], Optional[str]]:
+    """Read and reproject one source onto the target grid.
+
+    Standalone (no shared `out` array) so a thread pool can run several of
+    these at once - the network wait for one scene overlaps the read/reproject
+    CPU work of another instead of the two queueing behind each other.
+    Returns (name, reprojected array or None, error message or None).
+    """
+    name = _source_name(url)
+    try:
+        with rasterio.open(url) as src:
+            factor = decimation_for(src, target_m)
+            out_w = max(1, src.width // factor)
+            out_h = max(1, src.height // factor)
+            data = src.read(
+                list(bands),
+                out_shape=(len(bands), out_h, out_w),
+                resampling=resampling,
+            )
+            src_transform = src.transform * rasterio.Affine.scale(
+                src.width / out_w, src.height / out_h)
+            tmp = np.zeros(dst_shape, dtype=dst_dtype)
+            reproject(
+                source=data,
+                destination=tmp,
+                src_transform=src_transform,
+                src_crs=src.crs,
+                dst_transform=dst_transform,
+                dst_crs='EPSG:4326',
+                dst_nodata=nodata,
+                src_nodata=src.nodata if src.nodata is not None else nodata,
+                resampling=resampling,
+                num_threads=4,
+            )
+    except Exception as exc:  # noqa: BLE001 - one bad scene must not sink the run
+        return name, None, str(exc)
+    return name, tmp, None
+
+
 def mosaic_into(
     out: np.ndarray,
     dst_transform,
@@ -143,55 +207,40 @@ def mosaic_into(
     resampling: Resampling,
     nodata: int,
     target_m: float,
+    jobs: int = DEFAULT_JOBS,
 ) -> int:
     """Reproject each source onto the target grid, first non-nodata wins.
 
     Sources are taken in the order given, so the caller decides precedence -
-    for imagery that means cloud-free scenes first.
+    for imagery that means cloud-free scenes first. The fetch+reproject of
+    each source is independent of every other, so up to `jobs` of them run at
+    once; only the merge into `out` - where order decides which source wins a
+    pixel two of them cover - stays a sequential pass over the results in the
+    original, caller-decided order.
     """
     used = 0
     filled = np.zeros(out.shape[1:], dtype=bool)
-    for url in sources:
-        name = url.rsplit('/', 2)[-2] if url.endswith(('TCI.tif', 'visual.tif')) \
-            else url.rsplit('/', 1)[-1]
-        try:
-            with rasterio.open(url) as src:
-                factor = decimation_for(src, target_m)
-                out_w = max(1, src.width // factor)
-                out_h = max(1, src.height // factor)
-                data = src.read(
-                    list(bands),
-                    out_shape=(len(bands), out_h, out_w),
-                    resampling=resampling,
-                )
-                src_transform = src.transform * rasterio.Affine.scale(
-                    src.width / out_w, src.height / out_h)
-                tmp = np.zeros_like(out)
-                reproject(
-                    source=data,
-                    destination=tmp,
-                    src_transform=src_transform,
-                    src_crs=src.crs,
-                    dst_transform=dst_transform,
-                    dst_crs='EPSG:4326',
-                    dst_nodata=nodata,
-                    src_nodata=src.nodata if src.nodata is not None else nodata,
-                    resampling=resampling,
-                    num_threads=4,
-                )
-        except Exception as exc:  # noqa: BLE001 - one bad scene must not sink the run
-            print(f'  skipped {name}: {exc}')
-            continue
-        fresh = np.any(tmp != nodata, axis=0) & ~filled
-        if not fresh.any():
-            print(f'  nothing new from {name}')
-            continue
-        for b in range(out.shape[0]):
-            out[b][fresh] = tmp[b][fresh]
-        filled |= fresh
-        used += 1
-        pct = 100.0 * filled.mean()
-        print(f'  merged {name} -> {pct:.1f}% covered')
+    jobs = max(1, min(jobs, len(sources))) if sources else 1
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        results = pool.map(
+            lambda url: _fetch_reprojected(
+                url, dst_transform, out.shape, out.dtype, bands, resampling, nodata, target_m),
+            sources,
+        )
+        for name, tmp, err in results:
+            if err is not None:
+                print(f'  skipped {name}: {err}')
+                continue
+            fresh = np.any(tmp != nodata, axis=0) & ~filled
+            if not fresh.any():
+                print(f'  nothing new from {name}')
+                continue
+            for b in range(out.shape[0]):
+                out[b][fresh] = tmp[b][fresh]
+            filled |= fresh
+            used += 1
+            pct = 100.0 * filled.mean()
+            print(f'  merged {name} -> {pct:.1f}% covered')
     return used
 
 
@@ -303,7 +352,10 @@ def main() -> None:
     ap.add_argument('--max-scenes', type=int, default=60)
     ap.add_argument('--no-landcover', action='store_true')
     ap.add_argument('--no-imagery', action='store_true')
+    ap.add_argument('--jobs', type=int, default=DEFAULT_JOBS,
+                    help=f'sources fetched concurrently (default {DEFAULT_JOBS})')
     args = ap.parse_args()
+    started = time.time()
 
     if args.bbox:
         west, south, east, north = (float(v) for v in args.bbox.split(','))
@@ -328,9 +380,10 @@ def main() -> None:
         # Mode, not nearest: at 20 m each output pixel covers four source ones,
         # and the majority of them is a truer answer than whichever happens to
         # land under the sample point.
+        t0 = time.time()
         used = mosaic_into(
             out, transform, urls, [1], Resampling.mode,
-            nodata=0, target_m=args.landcover_m,
+            nodata=0, target_m=args.landcover_m, jobs=args.jobs,
         )
         if used == 0:
             print('error: no landcover tiles could be read', file=sys.stderr)
@@ -338,6 +391,7 @@ def main() -> None:
         path = os.path.join(args.out, 'landcover.tif')
         write_tif(path, out, transform, nodata=0)
         sources['landcover'] = path
+        print(f'  landcover merged in {time.time() - t0:.1f}s')
 
     if not args.no_imagery:
         print('\nimagery: searching Sentinel-2 L2A')
@@ -351,10 +405,12 @@ def main() -> None:
         else:
             transform, width, height = target_grid(bounds, args.imagery_m)
             out = np.zeros((3, height, width), dtype=np.uint8)
+            t0 = time.time()
             used = mosaic_into(
                 out, transform, [vsicurl(h) for h in hrefs], [1, 2, 3],
-                Resampling.average, nodata=0, target_m=args.imagery_m,
+                Resampling.average, nodata=0, target_m=args.imagery_m, jobs=args.jobs,
             )
+            print(f'  imagery merged in {time.time() - t0:.1f}s')
             if used > 0:
                 path = os.path.join(args.out, 'imagery.tif')
                 write_tif(path, out, transform, nodata=0)
@@ -375,6 +431,7 @@ def main() -> None:
         json.dump(sources, fh, indent=2)
         fh.write('\n')
     print(f'\nwrote {index}')
+    print(f'done in {time.time() - started:.1f}s')
     print('next: python tools/bake_planet_cover.py')
 
 

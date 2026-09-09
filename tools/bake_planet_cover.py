@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
 import os
 import struct
 import sys
@@ -80,6 +81,14 @@ PLC_FLAG_REAL_IMAGERY = 1 << 0
 
 DEFAULT_SRC = 'assets/planet'
 DEFAULT_SOURCES = 'data/cover/sources.json'
+
+# Every tile reads its own window of the same landcover/imagery rasters and
+# writes its own .plc - independent of every other tile, so this is the same
+# shape of embarrassingly-parallel work `bake_planet_dem.py` and
+# `bake_osm_coast.py` already split across worker processes. Threads would not
+# do it: the per-node numpy work (LUT indexing, the patch filter, colour
+# compositing) holds the GIL, so only separate processes actually overlap.
+DEFAULT_JOBS = max(1, (os.cpu_count() or 1) - 1)
 
 # Ground distance a landcover patch should read as. Measured on tile
 # 12/3744/1411, this takes the raster from 1550 regions with a 33 m median to
@@ -337,6 +346,200 @@ def encode_plc(size: int, flags: int, classes: np.ndarray, colors: np.ndarray) -
     return zlib.compress(header + classes.tobytes() + colors.tobytes(), 6)
 
 
+def bake_tile(
+    z: int, x: int, y: int,
+    src_dir: str,
+    out_root: str,
+    landcover: Sequence[Source],
+    imagery: Sequence[Source],
+    class_lut: np.ndarray,
+    color_lut: np.ndarray,
+    patch_m: float,
+    pads: Sequence[dict],
+) -> Optional[Tuple[int, bool, int]]:
+    """Bakes and writes one tile's .plc. Returns (bytes written, has real
+    imagery, nodes repainted as airfield pavement), or None if this tile has
+    no .pdm to bake against.
+
+    Factored out of `bake()` so a multiprocessing worker can call it too, one
+    tile per call - the same split `sample_leaf_level_parallel` in
+    `bake_planet_dem.py` makes for the same reason (independent-per-tile work,
+    no ordering to preserve).
+    """
+    stem = os.path.join(src_dir, str(z), str(x), str(y))
+    pdm = f'{stem}.pdm'
+    if not os.path.exists(pdm):
+        return None
+    size = pdm_size(pdm)
+    bounds = tile_bounds(z, x, y)
+    west, south, east, north = bounds
+    node_m = ((north - south) / (size - 1)) * 110540
+
+    # Read the class raster with a halo, so the majority filter below sees the
+    # same neighbourhood a node would have had in the whole coverage. Without
+    # it the outermost nodes are filtered against a truncated window and
+    # adjacent tiles disagree along their shared edge.
+    halo = halo_nodes(patch_m, node_m)
+    pad = halo * ((north - south) / (size - 1))
+    read_bounds = (west - pad, south - pad, east + pad, north + pad)
+    read_size = size + 2 * halo
+
+    # Classes. Mode resampling, because averaging category codes invents
+    # categories that are not there - halfway between built-up and bare is not
+    # "somewhat built-up", it is a different class entirely.
+    classes = np.zeros((read_size, read_size), dtype=np.uint8)
+    for src_lc in landcover:
+        got = src_lc.read_onto(read_bounds, read_size, Resampling.mode)
+        if got is None:
+            continue
+        fresh = (classes == CLS_UNKNOWN) & (got[0] != 0)
+        classes[fresh] = class_lut[got[0]][fresh]
+
+    classes = enlarge_patches(classes, patch_m, node_m)
+    if halo:
+        classes = classes[halo:halo + size, halo:halo + size]
+    # The crop leaves a view into the padded array; the encoder needs the
+    # bytes contiguous.
+    classes = np.ascontiguousarray(classes)
+    paved_nodes = stamp_airfield_classes(classes, bounds, size, pads)
+
+    # Colour. Average, because this one really is a continuous quantity.
+    colors = np.zeros((size, size, 3), dtype=np.uint8)
+    covered = np.zeros((size, size), dtype=bool)
+    for src_img in imagery:
+        got = src_img.read_onto(bounds, size, Resampling.average)
+        if got is None:
+            continue
+        fresh = (~covered) & np.any(got != 0, axis=0)
+        if not fresh.any():
+            continue
+        for b in range(3):
+            colors[..., b][fresh] = got[b][fresh]
+        covered |= fresh
+
+    gaps = ~covered
+    if gaps.any():
+        colors[gaps] = color_lut[classes][gaps]
+
+    flags = PLC_FLAG_REAL_IMAGERY if covered.any() else 0
+
+    out_dir = os.path.join(out_root, str(z), str(x))
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f'{y}.plc')
+    blob = encode_plc(size, flags, classes, colors)
+    with open(out_path, 'wb') as fh:
+        fh.write(blob)
+    return len(blob), bool(covered.any()), paved_nodes
+
+
+# Per-worker state for cover_level_parallel, set once by _init_cover_worker.
+# A rasterio Dataset does not survive being pickled across a process boundary
+# (see the same note on `open_sampler` in bake_planet_dem.py), so each worker
+# opens its own handles on the same landcover/imagery files rather than
+# sharing the caller's.
+_cover_src_dir = ''
+_cover_out_root = ''
+_cover_landcover: List[Source] = []
+_cover_imagery: List[Source] = []
+_cover_class_lut: Optional[np.ndarray] = None
+_cover_color_lut: Optional[np.ndarray] = None
+_cover_patch_m = 0.0
+_cover_pads: Sequence[dict] = ()
+
+
+def _init_cover_worker(
+    src_dir: str, out_root: str,
+    landcover_paths: Sequence[str], imagery_paths: Sequence[str],
+    patch_m: float, pads: Sequence[dict],
+) -> None:
+    global _cover_src_dir, _cover_out_root, _cover_landcover, _cover_imagery
+    global _cover_class_lut, _cover_color_lut, _cover_patch_m, _cover_pads
+
+    def vsicurl(p: str) -> str:
+        return f'/vsicurl/{p}' if p.startswith('http') else p
+
+    _cover_src_dir = src_dir
+    _cover_out_root = out_root
+    _cover_landcover = [Source(vsicurl(p), [1], 0) for p in landcover_paths]
+    _cover_imagery = [Source(vsicurl(p), [1, 2, 3], 0) for p in imagery_paths]
+    _cover_class_lut = build_class_lut()
+    _cover_color_lut = build_color_lut()
+    _cover_patch_m = patch_m
+    _cover_pads = pads
+
+
+def _cover_worker(zxy: Tuple[int, int, int]) -> Optional[Tuple[int, bool, int]]:
+    z, x, y = zxy
+    assert _cover_class_lut is not None and _cover_color_lut is not None
+    return bake_tile(
+        z, x, y, _cover_src_dir, _cover_out_root,
+        _cover_landcover, _cover_imagery,
+        _cover_class_lut, _cover_color_lut, _cover_patch_m, _cover_pads,
+    )
+
+
+def bake_tiles(
+    tiles: Sequence[Tuple[int, int, int]],
+    src_dir: str,
+    out_root: str,
+    landcover: Sequence[Source],
+    imagery: Sequence[Source],
+    landcover_paths: Sequence[str],
+    imagery_paths: Sequence[str],
+    class_lut: np.ndarray,
+    color_lut: np.ndarray,
+    patch_m: float,
+    pads: Sequence[dict],
+    jobs: int,
+) -> Tuple[int, int, int, int]:
+    """Bakes every tile, across `jobs` worker processes. Returns
+    (written, with_imagery, paved_nodes, total_bytes)."""
+    written = 0
+    with_imagery = 0
+    paved_nodes = 0
+    total_bytes = 0
+    total = len(tiles)
+
+    def accept(result: Optional[Tuple[int, bool, int]]) -> None:
+        nonlocal written, with_imagery, paved_nodes, total_bytes
+        if result is None:
+            return
+        blob_len, has_imagery, paved = result
+        written += 1
+        total_bytes += blob_len
+        paved_nodes += paved
+        if has_imagery:
+            with_imagery += 1
+
+    def report(done: int) -> None:
+        if done % 50 == 0 or done == total:
+            pct = 100.0 * done / max(1, total)
+            sys.stdout.write(f'\r  {done}/{total} ({pct:.1f}%)  {total_bytes / 1048576:.1f} MB')
+            sys.stdout.flush()
+
+    jobs = max(1, min(jobs, total)) if total else 1
+    if jobs == 1:
+        for i, (z, x, y) in enumerate(tiles):
+            accept(bake_tile(
+                z, x, y, src_dir, out_root, landcover, imagery,
+                class_lut, color_lut, patch_m, pads,
+            ))
+            report(i + 1)
+        sys.stdout.write('\n')
+        return written, with_imagery, paved_nodes, total_bytes
+
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(
+        jobs, initializer=_init_cover_worker,
+        initargs=(src_dir, out_root, landcover_paths, imagery_paths, patch_m, pads),
+    ) as pool:
+        for i, result in enumerate(pool.imap_unordered(_cover_worker, tiles, chunksize=8)):
+            accept(result)
+            report(i + 1)
+    sys.stdout.write('\n')
+    return written, with_imagery, paved_nodes, total_bytes
+
+
 def glue_negative_bbox(argv: Sequence[str]) -> List[str]:
     """Rewrite ``--bbox -9.7,...`` into the ``--bbox=-9.7,...`` argparse takes.
 
@@ -402,6 +605,8 @@ def main() -> None:
     ap.add_argument('--only', action='append', default=[], help='z/x/y, repeatable')
     ap.add_argument('--bbox', help='west,south,east,north degrees; bake only tiles '
                                    'overlapping it (default: every tile in the pyramid)')
+    ap.add_argument('--jobs', type=int, default=DEFAULT_JOBS,
+                    help=f'tiles baked concurrently (default {DEFAULT_JOBS})')
     args = ap.parse_args(glue_negative_bbox(sys.argv[1:]))
 
     manifest_path = os.path.join(args.src, 'manifest.json')
@@ -462,92 +667,18 @@ def main() -> None:
 
     out_root = args.out or args.src
     patch = f'{args.patch_m:.0f} m patches' if args.patch_m > 0 else 'raw classes'
-    print(f'baking cover for {len(tiles)} tiles -> {out_root} ({patch})')
+    jobs = max(1, min(args.jobs, len(tiles))) if tiles else 1
+    print(f'baking cover for {len(tiles)} tiles -> {out_root} ({patch}), {jobs} job(s)')
 
     pads = airfield_pads(manifest)
     if pads:
         print(f'airfields: {len(pads)} platform rectangles painted as built ground')
 
-    written = 0
-    with_imagery = 0
-    paved_nodes = 0
-    total_bytes = 0
     t0 = time.time()
-    for i, (z, x, y) in enumerate(tiles):
-        stem = os.path.join(args.src, str(z), str(x), str(y))
-        pdm = f'{stem}.pdm'
-        if not os.path.exists(pdm):
-            continue
-        size = pdm_size(pdm)
-        bounds = tile_bounds(z, x, y)
-        west, south, east, north = bounds
-        node_m = ((north - south) / (size - 1)) * 110540
-
-        # Read the class raster with a halo, so the majority filter below sees
-        # the same neighbourhood a node would have had in the whole coverage.
-        # Without it the outermost nodes are filtered against a truncated
-        # window and adjacent tiles disagree along their shared edge.
-        halo = halo_nodes(args.patch_m, node_m)
-        pad = halo * ((north - south) / (size - 1))
-        read_bounds = (west - pad, south - pad, east + pad, north + pad)
-        read_size = size + 2 * halo
-
-        # Classes. Mode resampling, because averaging category codes invents
-        # categories that are not there - halfway between built-up and bare is
-        # not "somewhat built-up", it is a different class entirely.
-        classes = np.zeros((read_size, read_size), dtype=np.uint8)
-        for src_lc in landcover:
-            got = src_lc.read_onto(read_bounds, read_size, Resampling.mode)
-            if got is None:
-                continue
-            fresh = (classes == CLS_UNKNOWN) & (got[0] != 0)
-            classes[fresh] = class_lut[got[0]][fresh]
-
-        classes = enlarge_patches(classes, args.patch_m, node_m)
-        if halo:
-            classes = classes[halo:halo + size, halo:halo + size]
-        # The crop leaves a view into the padded array; the encoder needs the
-        # bytes contiguous.
-        classes = np.ascontiguousarray(classes)
-        paved_nodes += stamp_airfield_classes(classes, bounds, size, pads)
-
-        # Colour. Average, because this one really is a continuous quantity.
-        colors = np.zeros((size, size, 3), dtype=np.uint8)
-        covered = np.zeros((size, size), dtype=bool)
-        for src_img in imagery:
-            got = src_img.read_onto(bounds, size, Resampling.average)
-            if got is None:
-                continue
-            fresh = (~covered) & np.any(got != 0, axis=0)
-            if not fresh.any():
-                continue
-            for b in range(3):
-                colors[..., b][fresh] = got[b][fresh]
-            covered |= fresh
-
-        gaps = ~covered
-        if gaps.any():
-            colors[gaps] = color_lut[classes][gaps]
-
-        flags = PLC_FLAG_REAL_IMAGERY if covered.any() else 0
-        if covered.any():
-            with_imagery += 1
-
-        out_dir = os.path.join(out_root, str(z), str(x))
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f'{y}.plc')
-        blob = encode_plc(size, flags, classes, colors)
-        with open(out_path, 'wb') as fh:
-            fh.write(blob)
-        written += 1
-        total_bytes += len(blob)
-
-        if (i + 1) % 50 == 0 or i + 1 == len(tiles):
-            pct = 100.0 * (i + 1) / max(1, len(tiles))
-            sys.stdout.write(
-                f'\r  {i + 1}/{len(tiles)} ({pct:.1f}%)  {total_bytes / 1048576:.1f} MB')
-            sys.stdout.flush()
-    sys.stdout.write('\n')
+    written, with_imagery, paved_nodes, total_bytes = bake_tiles(
+        tiles, args.src, out_root, landcover, imagery,
+        landcover_paths, imagery_paths, class_lut, color_lut, args.patch_m, pads, jobs,
+    )
 
     for s in landcover + imagery:
         s.close()
