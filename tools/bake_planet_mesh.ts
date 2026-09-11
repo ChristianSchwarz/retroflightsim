@@ -496,6 +496,8 @@ async function main(): Promise<void> {
     let inlandBodies = 0;
     let riverTiles = 0;
     let riverTriangles = 0;
+    let landuseTiles = 0;
+    let landuseRegions = 0;
     const colorHistogram = args.bbox !== undefined
         ? loadHistogram(args.out)
         : newColorHistogram();
@@ -545,6 +547,10 @@ async function main(): Promise<void> {
         if (r.riverTile) {
             riverTiles++;
         }
+        if (r.landuseTile) {
+            landuseTiles++;
+            landuseRegions += r.landuseRegions;
+        }
 
         written.push({ z, x, y });
         totalBytes += r.bytesGz;
@@ -576,6 +582,9 @@ async function main(): Promise<void> {
     }
     if (riverTiles > 0) {
         console.log(`watercourses: ${riverTriangles} stroke triangles across ${riverTiles} tiles`);
+    }
+    if (landuseTiles > 0) {
+        console.log(`landuse regions: ${landuseRegions} regions across ${landuseTiles} tiles`);
     }
 
     // The index has to list every .ptm on disk, not just the ones this run

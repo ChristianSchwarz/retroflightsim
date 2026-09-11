@@ -167,10 +167,19 @@ def _fetch_reprojected(
     these at once - the network wait for one scene overlaps the read/reproject
     CPU work of another instead of the two queueing behind each other.
     Returns (name, reprojected array or None, error message or None).
+
+    GDAL's `/vsicurl/` has no timeout by default - libcurl waits forever on a
+    stalled S3/CloudFront connection - and `mosaic_into`'s `pool.map()` yields
+    results in submission order, so one stuck read blocks every other source
+    behind it and the whole run hangs with nothing printed (stdout is fully
+    buffered once it isn't a tty). Bounding it here turns that into an
+    exception the existing `except` below already knows how to skip past.
     """
     name = _source_name(url)
     try:
-        with rasterio.open(url) as src:
+        with rasterio.Env(
+            GDAL_HTTP_CONNECTTIMEOUT=10, GDAL_HTTP_TIMEOUT=60, GDAL_HTTP_MAX_RETRY=2,
+        ), rasterio.open(url) as src:
             factor = decimation_for(src, target_m)
             out_w = max(1, src.width // factor)
             out_h = max(1, src.height // factor)

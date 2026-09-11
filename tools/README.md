@@ -333,11 +333,21 @@ npm run fetch:dem -- --bbox 7.6,45.9,7.8,46.0 --out data/imports/matterhorn.tif
 python tools/bake_planet_dem.py --input data/imports/matterhorn.tif --out assets/planet
 ```
 
-`fetch_planet_dem.py` reads the public Copernicus DEM GLO-30 archive on AWS
-Open Data over `/vsicurl/`, so only the windows overlapping the bbox are
-transferred. The archive publishes 1 degree squares only where there is land,
-and the tool caches `tileList.txt` under `data/imports/` so an all-ocean square
-is skipped by name rather than by waiting for a 404.
+`fetch_planet_dem.py` reads a public 1 degree squares archive over
+`/vsicurl/`, so only the windows overlapping the bbox are transferred. By
+default that archive is **FABDEM** (Forest And Buildings removed Copernicus
+DEM, University of Bristol, mirrored on Hugging Face) rather than raw
+Copernicus DEM GLO-30: Copernicus GLO-30 is a surface model, so a hangar or a
+forest canopy bakes in as terrain height, while FABDEM applies a learned
+correction back to bare earth on the same 1 arcsec grid and datum. Pass
+`--source copernicus` to fetch the uncorrected archive instead — useful for
+reproducing an old bake, or for `compare_planet_dem.py` diffs against one.
+
+Copernicus publishes squares only where there is land, and the tool caches
+`tileList.txt` under `data/imports/` so an all-ocean square is skipped by name
+rather than by waiting for a 404. FABDEM has no such index here, so an
+all-ocean FABDEM square is skipped only once the fetch itself comes back
+empty.
 
 The 1 arcsec default resolution is load-bearing rather than arbitrary. Stage 1
 derives the pyramid's max zoom from the source pixel, and 1 arcsec lands on
@@ -349,6 +359,7 @@ and an imported area joins the pyramid at a uniform depth; fetch coarser (say
 | --- | --- |
 | `--bbox` | **(required)** `west,south,east,north` in degrees. Spans crossing the antimeridian are refused. |
 | `--out` | Output GeoTIFF (default `data/imports/dem.tif`). |
+| `--source` | `fabdem` (default) or `copernicus`. |
 | `--arcsec` | Output pixel in arcseconds (default 1.0, the archive spacing). |
 | `--max-span` | Refuse a bbox wider or taller than this (default 6 degrees). Bake cost grows with area. |
 | `--no-snap` | Do not align the box to tiles and the shared lattice. See below — only useful for reproducing the seam bug. |
@@ -387,9 +398,15 @@ npm run merge:dem -- --input data/imports/alps.tif --out assets/planet
 python tools/bake_osm_coast.py --bbox 7.6,45.9,7.8,46.0
 npm run bake:airports -- --bbox 7.6,45.9,7.8,46.0
 npm run fetch:cover -- --bbox 7.6,45.9,7.8,46.0
-npm run bake:cover -- --bbox 7.6,45.9,7.8,46.0
+npm run bake:cover -- --bbox 7.6,45.9,7.8,46.0 --osm-landuse
 npm run bake:mesh -- --bbox 7.6,45.9,7.8,46.0
 ```
+
+`--osm-landuse` (the F9 import pipeline passes it too — see
+[`--osm-landuse`](#--osm-landuse-real-vector-edges-instead-of-raster-stairsteps)
+below) paints real OSM vector polygon edges over the raster classes for this
+area; drop it from the `bake:cover` line to fall back to the raster-only
+behaviour above.
 
 **Pass the same `--bbox` to every stage.** It is what makes each one additive.
 Without it a stage walks the whole pyramid, and since its sources only cover
@@ -656,6 +673,36 @@ ran and the whole bake died with `WindowError: Intersection is empty` instead of
 skipping one tile. It shows up on a bbox about a tile wide — the raster comes
 out ~123 px across and a tile asks for column 123. The window is clamped by hand
 now; see `Source.read_onto`.
+
+#### `--osm-landuse`: real vector edges instead of raster stairsteps
+
+Every boundary the raster path produces is a WorldCover-pixel stairstep,
+smoothed by the majority filter above but never a real edge — because there
+never was a vector edge to begin with. `--osm-landuse` paints actual OSM
+`natural=wood`/`landuse=farmland`/etc. polygons (fetched via Overpass, same
+client as stage 2/3) over the class grid *after* the majority filter and
+*before* the airfield stamp, so a facet boundary can trace the real mapped
+shape wherever OSM has one. It is a layer on top of the raster, not a
+replacement: OSM landuse tagging is patchy the same way stage 2's own
+coastline coverage is, so anywhere OSM has nothing, the raster class (and its
+majority-filtered patch) is left exactly as it would be without the flag.
+
+```
+python tools/bake_planet_cover.py --osm-landuse --bbox=west,south,east,north
+```
+
+A `bake_planet_cover.py` flag, not a default — it's passed explicitly by both
+the F9 import pipeline (`areaImport.ts`'s `plan()`) and the manual recipe
+above, but a bare `npm run bake:cover` with no `--bbox` still omits it: it
+requires `shapely` (`pip install shapely`) and either `--bbox` or `--only`,
+refusing to run bare since a full-pyramid rebake's tile list spans every baked
+area (Crimea to the Grand Canyon) and a planet-wide Overpass fetch is not
+something to trigger by omission. Add
+`--refresh-osm` to bypass the Overpass cache (`data/osm-cache`, shared with
+stages 2/3) the way `bake_osm_coast.py --refresh` does. Painted classes never
+include Sand (bake-assigned downstream by stage 5's shore-adjacency logic) or
+Water (stage 2 already owns the land/water split geometrically) — see
+`tools/osm_landuse.py`'s `LANDUSE_TAG_TO_CLASS` for the full tag table.
 
 ### Inland water
 

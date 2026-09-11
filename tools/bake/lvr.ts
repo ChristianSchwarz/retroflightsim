@@ -17,6 +17,10 @@ import { unzlibSync } from 'fflate';
 export const LVR_MAGIC = 0x3152564c; // 'LVR1' little-endian
 export const LVR2_MAGIC = 0x3252564c; // 'LVR2' little-endian
 export const LVR3_MAGIC = 0x3352564c; // 'LVR3' little-endian
+export const LVR4_MAGIC = 0x3452564c; // 'LVR4' little-endian
+
+/** No OSM landuse tag on this region — bare land, or water. */
+export const REGION_CLASS_NONE = 0xff;
 
 export interface LonLat {
     lon: number;
@@ -60,12 +64,28 @@ export interface Watercourse {
     points: LonLat[];
 }
 
+/**
+ * One piece of a combined land/water + landuse partition, clipped to this
+ * tile: `isLand` is the strict base layer (a region never claims water area),
+ * `landuseClass` is the OSM tag that won this piece, or undefined for bare
+ * land or water with no tag. Regions are non-overlapping by construction —
+ * the overlap between real OSM polygons is already resolved before baking.
+ */
+export interface LanduseRegion {
+    exterior: LonLat[];
+    holes: LonLat[][];
+    isLand: boolean;
+    landuseClass: number | undefined;
+}
+
 export interface CoastVectorTile {
     polygons: CoastPolygon[];
     /** Empty for an LVR1 tile, which cannot carry inland water. */
     inland: InlandBody[];
     /** Empty below LVR3, which is where watercourse centrelines start. */
     watercourses: Watercourse[];
+    /** Empty below LVR4, which is where combined land+landuse regions start. */
+    regions: LanduseRegion[];
 }
 
 /**
@@ -77,14 +97,14 @@ export function decodeLvr(bytes: ArrayBuffer | Uint8Array): CoastVectorTile {
     // 'LVR' plus a version digit means the payload arrived already inflated.
     const bare = raw.byteLength >= 4
         && raw[0] === 0x4c && raw[1] === 0x56 && raw[2] === 0x52
-        && (raw[3] === 0x31 || raw[3] === 0x32 || raw[3] === 0x33);
+        && (raw[3] === 0x31 || raw[3] === 0x32 || raw[3] === 0x33 || raw[3] === 0x34);
     const payload = bare ? raw : unzlibSync(raw);
     if (payload.byteLength < 6) {
         throw new Error(`LVR too short: ${payload.byteLength}`);
     }
     const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
     const magic = view.getUint32(0, true);
-    if (magic !== LVR_MAGIC && magic !== LVR2_MAGIC && magic !== LVR3_MAGIC) {
+    if (magic !== LVR_MAGIC && magic !== LVR2_MAGIC && magic !== LVR3_MAGIC && magic !== LVR4_MAGIC) {
         throw new Error(`Bad LVR magic: 0x${magic.toString(16)}`);
     }
     let offset = 4;
@@ -129,7 +149,7 @@ export function decodeLvr(bytes: ArrayBuffer | Uint8Array): CoastVectorTile {
     }
 
     const inland: InlandBody[] = [];
-    if (magic === LVR2_MAGIC || magic === LVR3_MAGIC) {
+    if (magic === LVR2_MAGIC || magic === LVR3_MAGIC || magic === LVR4_MAGIC) {
         if (offset + 2 > payload.byteLength) {
             throw new Error('LVR2 truncated before the inland layer');
         }
@@ -155,7 +175,7 @@ export function decodeLvr(bytes: ArrayBuffer | Uint8Array): CoastVectorTile {
     }
 
     const watercourses: Watercourse[] = [];
-    if (magic === LVR3_MAGIC) {
+    if (magic === LVR3_MAGIC || magic === LVR4_MAGIC) {
         if (offset + 2 > payload.byteLength) {
             throw new Error('LVR3 truncated before the watercourse layer');
         }
@@ -187,14 +207,43 @@ export function decodeLvr(bytes: ArrayBuffer | Uint8Array): CoastVectorTile {
             }
         }
     }
-    return { polygons, inland, watercourses };
+
+    const regions: LanduseRegion[] = [];
+    if (magic === LVR4_MAGIC) {
+        if (offset + 2 > payload.byteLength) {
+            throw new Error('LVR4 truncated before the region layer');
+        }
+        const regionCount = view.getUint16(offset, true);
+        offset += 2;
+        for (let g = 0; g < regionCount; g++) {
+            if (offset + 2 > payload.byteLength) {
+                throw new Error(`LVR4 truncated at region ${g}`);
+            }
+            const isLand = payload[offset] !== 0;
+            const cls = payload[offset + 1];
+            offset += 2;
+            const rings = readRings(`region ${g}`);
+            if (rings.length === 0) {
+                continue;
+            }
+            regions.push({
+                exterior: rings[0],
+                holes: rings.slice(1),
+                isLand,
+                landuseClass: cls === REGION_CLASS_NONE ? undefined : cls,
+            });
+        }
+    }
+
+    return { polygons, inland, watercourses, regions };
 }
 
-/** Encode an uncompressed LVR1/LVR2/LVR3 payload (used by tests). */
+/** Encode an uncompressed LVR1/LVR2/LVR3/LVR4 payload (used by tests). */
 export function encodeLvrUncompressed(
     polygons: CoastPolygon[],
     inland: InlandBody[] = [],
     watercourses: Watercourse[] = [],
+    regions: LanduseRegion[] = [],
 ): Uint8Array {
     let byteLen = 6;
     for (const poly of polygons) {
@@ -204,7 +253,8 @@ export function encodeLvrUncompressed(
             byteLen += 2 + ring.length * 8;
         }
     }
-    const layered = inland.length > 0 || watercourses.length > 0;
+    const layered = inland.length > 0 || watercourses.length > 0 || regions.length > 0;
+    const withLines = watercourses.length > 0 || regions.length > 0;
     if (layered) {
         byteLen += 2;
         for (const body of inland) {
@@ -214,18 +264,27 @@ export function encodeLvrUncompressed(
             }
         }
     }
-    if (watercourses.length > 0) {
+    if (withLines) {
         byteLen += 2;
         for (const course of watercourses) {
             byteLen += 4 + 2 + course.points.length * 8;
         }
     }
+    if (regions.length > 0) {
+        byteLen += 2;
+        for (const region of regions) {
+            byteLen += 2 + 2 + (1 + region.holes.length) * 2;
+            for (const ring of [region.exterior, ...region.holes]) {
+                byteLen += ring.length * 8;
+            }
+        }
+    }
     const out = new Uint8Array(byteLen);
     const view = new DataView(out.buffer);
-    view.setUint32(
-        0,
-        watercourses.length > 0 ? LVR3_MAGIC : (layered ? LVR2_MAGIC : LVR_MAGIC),
-        true);
+    const magic = regions.length > 0
+        ? LVR4_MAGIC
+        : (watercourses.length > 0 ? LVR3_MAGIC : (layered ? LVR2_MAGIC : LVR_MAGIC));
+    view.setUint32(0, magic, true);
     view.setUint16(4, polygons.length, true);
     let offset = 6;
     for (const poly of polygons) {
@@ -260,7 +319,7 @@ export function encodeLvrUncompressed(
             }
         }
     }
-    if (watercourses.length > 0) {
+    if (withLines) {
         view.setUint16(offset, watercourses.length, true);
         offset += 2;
         for (const course of watercourses) {
@@ -272,6 +331,26 @@ export function encodeLvrUncompressed(
                 view.setFloat32(offset, pt.lon, true);
                 view.setFloat32(offset + 4, pt.lat, true);
                 offset += 8;
+            }
+        }
+    }
+    if (regions.length > 0) {
+        view.setUint16(offset, regions.length, true);
+        offset += 2;
+        for (const region of regions) {
+            out[offset] = region.isLand ? 1 : 0;
+            out[offset + 1] = region.landuseClass ?? REGION_CLASS_NONE;
+            offset += 2;
+            view.setUint16(offset, 1 + region.holes.length, true);
+            offset += 2;
+            for (const ring of [region.exterior, ...region.holes]) {
+                view.setUint16(offset, ring.length, true);
+                offset += 2;
+                for (const pt of ring) {
+                    view.setFloat32(offset, pt.lon, true);
+                    view.setFloat32(offset + 4, pt.lat, true);
+                    offset += 8;
+                }
             }
         }
     }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { CoastPolygon, LonLatBounds, __testing, buildShoreline } from './shoreline';
 import { decimate } from './decimate';
+import { regionFieldFromShoreline } from './regions';
 
 const BOUNDS: LonLatBounds = { west: 0, south: 0, east: 1, north: 1 };
 const SIZE = 33; // 32 cells
@@ -170,13 +171,14 @@ describe('shoreline feeding the decimator', () => {
     it('produces a watertight mesh for an island', () => {
         const poly = ringFromGrid([[8, 6], [25, 9], [23, 26], [7, 22]]);
         const s = buildShoreline({ polygons: [poly], bounds: BOUNDS, size: SIZE });
+        const field = regionFieldFromShoreline(s);
         const r = decimate({
             size: SIZE,
             heights: flat,
-            landNodes: s.landNodes,
+            regionNodes: field.regionNodes,
             maxErrorM: 1000,
-            edgeCrossing: s.edgeCrossing,
-            centreIsLand: s.centreIsLand,
+            edgeCrossing: field.edgeCrossing,
+            regionAt: field.regionAt,
         });
         const cells = SIZE - 1;
         const total = r.triangles.reduce((acc, t) => {
@@ -184,8 +186,8 @@ describe('shoreline feeding the decimator', () => {
             return acc + Math.abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) / 2;
         }, 0);
         assert.ok(Math.abs(total - cells * cells) < 1e-6, `area ${total}`);
-        assert.ok(r.triangles.some(t => t.land), 'some land');
-        assert.ok(r.triangles.some(t => !t.land), 'some water');
+        assert.ok(r.triangles.some(t => t.regionId === 1), 'some land');
+        assert.ok(r.triangles.some(t => t.regionId === 0), 'some water');
     });
 
     it('cuts fewer cells once the ring is simplified', () => {
@@ -200,14 +202,17 @@ describe('shoreline feeding the decimator', () => {
         const simplified = buildShoreline({
             polygons: [poly], bounds: BOUNDS, size: SIZE, simplifyCells: 2,
         });
-        const run = (s: ReturnType<typeof buildShoreline>) => decimate({
-            size: SIZE,
-            heights: flat,
-            landNodes: s.landNodes,
-            maxErrorM: 1000,
-            edgeCrossing: s.edgeCrossing,
-            centreIsLand: s.centreIsLand,
-        });
+        const run = (s: ReturnType<typeof buildShoreline>) => {
+            const field = regionFieldFromShoreline(s);
+            return decimate({
+                size: SIZE,
+                heights: flat,
+                regionNodes: field.regionNodes,
+                maxErrorM: 1000,
+                edgeCrossing: field.edgeCrossing,
+                regionAt: field.regionAt,
+            });
+        };
         const a = run(raw);
         const b = run(simplified);
         assert.ok(

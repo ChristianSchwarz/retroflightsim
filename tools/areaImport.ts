@@ -367,7 +367,7 @@ function plan(job: Job, withCover: boolean): Step[] {
         });
         steps.push({
             label: 'baking cover', cmd: PYTHON,
-            args: ['tools/bake_planet_cover.py', `--bbox=${bbox}`],
+            args: ['tools/bake_planet_cover.py', `--bbox=${bbox}`, '--osm-landuse'],
         });
     }
     steps.push({

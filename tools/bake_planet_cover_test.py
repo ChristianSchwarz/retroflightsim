@@ -16,7 +16,10 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 
-from bake_planet_cover import CLS_BUILT, CLS_GRASS, Source, stamp_airfield_classes
+from bake_planet_cover import (
+    CLS_BUILT, CLS_GRASS, CLS_TREE, CLS_UNKNOWN, PLC_FLAG_REAL_IMAGERY, Source,
+    build_parent_cover, decode_plc, encode_plc, majority_decimate, stamp_airfield_classes,
+)
 
 NODATA = 255
 
@@ -133,6 +136,99 @@ class StampAirfieldClassesTest(unittest.TestCase):
     def test_no_pads_is_a_no_op(self):
         classes = self.grid()
         self.assertEqual(stamp_airfield_classes(classes, self.BOUNDS, self.SIZE, []), 0)
+
+
+class DecodePlcTest(unittest.TestCase):
+    def roundtrip(self, flags: int) -> None:
+        size = 5
+        classes = np.arange(size * size, dtype=np.uint8).reshape(size, size) % CLS_BUILT
+        colors = np.arange(size * size * 3, dtype=np.uint8).reshape(size, size, 3)
+        blob = encode_plc(size, flags, classes, colors)
+        path = os.path.join(tempfile.mkdtemp(), 'tile.plc')
+        with open(path, 'wb') as fh:
+            fh.write(blob)
+        out_classes, out_colors, out_flags = decode_plc(path)
+        np.testing.assert_array_equal(out_classes, classes)
+        np.testing.assert_array_equal(out_colors, colors)
+        self.assertEqual(out_flags, flags)
+
+    def test_roundtrips_with_real_imagery_flag_set(self):
+        self.roundtrip(PLC_FLAG_REAL_IMAGERY)
+
+    def test_roundtrips_with_no_flags(self):
+        self.roundtrip(0)
+
+
+class MajorityDecimateTest(unittest.TestCase):
+    def test_picks_the_neighbourhood_majority_over_a_lone_point_sample(self):
+        # A 5x5 all-Grass child except node (2,2), which is Built. Decimated
+        # at stride 2, node (1,1) in the output corresponds to child (2,2) -
+        # a bare point sample would read Built; the majority in its
+        # neighbourhood is Grass.
+        child = np.full((5, 5), CLS_GRASS, dtype=np.uint8)
+        child[2, 2] = CLS_BUILT
+        self.assertEqual(child[0::2, 0::2][1, 1], CLS_BUILT, 'test setup: point sample must disagree')
+        result = majority_decimate(child, r=1)
+        self.assertEqual(result[1, 1], CLS_GRASS)
+
+    def test_ties_go_to_the_lowest_class_id(self):
+        # A 2x2 neighbourhood split evenly between Tree and Grass at the
+        # decimated node - cover_patches.py's own tie-break convention says
+        # the lower id (Tree=1 < Grass=3) wins.
+        child = np.array([
+            [CLS_TREE, CLS_GRASS],
+            [CLS_GRASS, CLS_TREE],
+        ], dtype=np.uint8)
+        result = majority_decimate(child, r=1)
+        self.assertEqual(result[0, 0], CLS_TREE)
+
+    def test_zero_radius_is_a_plain_point_sample(self):
+        child = np.full((5, 5), CLS_GRASS, dtype=np.uint8)
+        child[2, 2] = CLS_BUILT
+        result = majority_decimate(child, r=0)
+        np.testing.assert_array_equal(result, child[0::2, 0::2])
+
+
+class BuildParentCoverTest(unittest.TestCase):
+    SIZE = 5  # half = 2, each quadrant contributes a 3x3 block
+
+    def child(self, cls: int, color: int, flags: int = 0):
+        classes = np.full((self.SIZE, self.SIZE), cls, dtype=np.uint8)
+        colors = np.full((self.SIZE, self.SIZE, 3), color, dtype=np.uint8)
+        return classes, colors, flags
+
+    def test_all_four_quadrants_vote_and_point_decimate(self):
+        children = {
+            (0, 0): self.child(CLS_TREE, 10, PLC_FLAG_REAL_IMAGERY),
+            (1, 0): self.child(CLS_GRASS, 20),
+            (0, 1): self.child(CLS_BUILT, 30),
+            (1, 1): self.child(CLS_TREE, 40),
+        }
+        classes, colors, flags = build_parent_cover(children, self.SIZE, r=1)
+        self.assertEqual(classes.shape, (self.SIZE, self.SIZE))
+        self.assertEqual(classes[0, 0], CLS_TREE, 'top-left quadrant')
+        self.assertEqual(classes[0, self.SIZE - 1], CLS_GRASS, 'top-right quadrant')
+        self.assertEqual(classes[self.SIZE - 1, 0], CLS_BUILT, 'bottom-left quadrant')
+        self.assertEqual(classes[self.SIZE - 1, self.SIZE - 1], CLS_TREE, 'bottom-right quadrant')
+        self.assertEqual(colors[0, 0, 0], 10)
+        self.assertEqual(flags, PLC_FLAG_REAL_IMAGERY, 'ORs across children, even if only one has it')
+
+    def test_a_missing_quadrant_stays_at_the_default_rather_than_raising(self):
+        # The routine coastal case: an ocean-only sibling was never baked.
+        children = {
+            (0, 0): self.child(CLS_TREE, 10),
+        }
+        classes, colors, flags = build_parent_cover(children, self.SIZE, r=1)
+        self.assertEqual(classes[0, 0], CLS_TREE, 'present quadrant is voted/decimated normally')
+        self.assertEqual(classes[self.SIZE - 1, self.SIZE - 1], CLS_UNKNOWN, 'absent quadrant keeps the default')
+        self.assertEqual(colors[self.SIZE - 1, self.SIZE - 1, 0], 0)
+        self.assertEqual(flags, 0)
+
+    def test_no_quadrants_is_all_default(self):
+        classes, colors, flags = build_parent_cover({}, self.SIZE, r=1)
+        self.assertTrue(np.all(classes == CLS_UNKNOWN))
+        self.assertTrue(np.all(colors == 0))
+        self.assertEqual(flags, 0)
 
 
 if __name__ == '__main__':

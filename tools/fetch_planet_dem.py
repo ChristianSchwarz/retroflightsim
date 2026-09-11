@@ -4,14 +4,25 @@
 ``bake_planet_dem.py`` takes one axis-aligned EPSG:4326 GeoTIFF and turns it
 into the .pdm pyramid. That has always meant ``data/output_hh.tif``, which only
 covers the Canaries, so no other part of the world could be baked at all. This
-tool writes the same kind of file for any bbox, out of the public Copernicus
-DEM GLO-30 archive on AWS Open Data.
+tool writes the same kind of file for any bbox, out of a public 1 arcsec DEM
+archive - FABDEM by default, or raw Copernicus DEM GLO-30 with ``--source
+copernicus``.
 
-The archive is 1 degree squares of COG-encoded float32 height, read over
-``/vsicurl/`` so only the windows overlapping the bbox are transferred. Squares
-are named by their south-west corner and are only published where there is
-land, so ``tileList.txt`` is fetched once and cached: an all-ocean square is
-skipped by name rather than by waiting for a 404.
+Both archives are 1 degree squares read over ``/vsicurl/`` so only the windows
+overlapping the bbox are transferred, and both are named by their south-west
+corner - but they are not the same data. Copernicus GLO-30 is a *surface*
+model: its height at a runway includes the hangar sitting on it, and in a
+forest it is canopy height, not ground. FABDEM (Forest And Buildings removed
+Copernicus DEM, University of Bristol) is Copernicus GLO-30 with a machine-
+learned correction that strips that bias back out, so a flat airfield reads
+flat and a forested valley reads as the valley floor. Same 1 arcsec grid, same
+EGM2008-referenced heights, so it drops into this pipeline as a straight
+replacement.
+
+Copernicus publishes squares only where there is land, so ``tileList.txt`` is
+fetched once and cached: an all-ocean square is skipped by name rather than by
+waiting for a 404. FABDEM has no equivalent published index here, so an
+all-ocean FABDEM square is simply skipped when the fetch 404s.
 
 Output resolution defaults to 1 arcsec, the archive's own latitude spacing.
 That matters more than it looks. ``bake_planet_dem.py`` derives the pyramid's
@@ -36,6 +47,9 @@ merges with no special handling.
 Usage::
 
     python tools/fetch_planet_dem.py --bbox 6.0,45.6,8.0,46.6 --out data/imports/alps.tif
+
+Add ``--source copernicus`` to fetch the raw surface model instead, e.g. for
+reproducing an old bake or comparing the two with ``compare_planet_dem.py``.
 
 Then bake it as usual::
 
@@ -80,6 +94,16 @@ COP_BUCKET = 'https://copernicus-dem-30m.s3.amazonaws.com'
 COP_TILE_URL = COP_BUCKET + '/{name}/{name}.tif'
 COP_TILE_LIST = COP_BUCKET + '/tileList.txt'
 TILE_LIST_CACHE = 'data/imports/.copernicus-tiles.txt'
+
+# Public HF-hosted mirror of FABDEM v1.2 (links-ads/fabdem-v12), one COG per 1
+# degree tile, bundled under 10x10 degree "block" folders that mirror how the
+# University of Bristol ships the original zips. Verified directly (not just
+# documented): the resolve URL 302s to a presigned, range-request-capable CDN
+# location, so /vsicurl/ windowed reads work the same as against Copernicus's
+# S3 bucket.
+FABDEM_VERSION = 'V1-2'
+FABDEM_BUCKET = 'https://huggingface.co/buckets/links-ads/fabdem/resolve/tiles'
+DEFAULT_SOURCE = 'fabdem'
 
 ARCSEC_DEG = 1.0 / 3600.0
 
@@ -130,17 +154,43 @@ def tile_name(lat: int, lon: int) -> str:
     return f'Copernicus_DSM_COG_10_{ns}{abs(lat):02d}_00_{ew}{abs(lon):03d}_00_DEM'
 
 
-def tiles_for_bbox(bounds: Tuple[float, float, float, float]) -> List[str]:
+def iter_bbox_cells(bounds: Tuple[float, float, float, float]):
+    """Every 1 degree (lat, lon) south-west corner the bbox touches."""
     west, south, east, north = bounds
-    names: List[str] = []
     lat = int(math.floor(south))
     while lat < north:
         lon = int(math.floor(west))
         while lon < east:
-            names.append(tile_name(lat, lon))
+            yield lat, lon
             lon += 1
         lat += 1
-    return names
+
+
+def tiles_for_bbox(bounds: Tuple[float, float, float, float]) -> List[str]:
+    return [tile_name(lat, lon) for lat, lon in iter_bbox_cells(bounds)]
+
+
+def fabdem_coord_tag(lat: int, lon: int) -> str:
+    """e.g. (44, 7) -> 'N44E007' - the archive's per-tile and per-block corner tag."""
+    ns = 'N' if lat >= 0 else 'S'
+    ew = 'E' if lon >= 0 else 'W'
+    return f'{ns}{abs(lat):02d}{ew}{abs(lon):03d}'
+
+
+def fabdem_tile_name(lat: int, lon: int) -> str:
+    return f'{fabdem_coord_tag(lat, lon)}_FABDEM_{FABDEM_VERSION}'
+
+
+def fabdem_block_name(lat: int, lon: int) -> str:
+    """The 10x10 degree folder a tile ships under, named by its own SW/NE corners."""
+    lat0, lon0 = 10 * (lat // 10), 10 * (lon // 10)
+    return (f'{fabdem_coord_tag(lat0, lon0)}-{fabdem_coord_tag(lat0 + 10, lon0 + 10)}'
+            f'_FABDEM_{FABDEM_VERSION}')
+
+
+def fabdem_tile_url(lat: int, lon: int) -> str:
+    tile = fabdem_tile_name(lat, lon)
+    return f'{FABDEM_BUCKET}/{fabdem_block_name(lat, lon)}/{tile}.tif'
 
 
 def load_tile_list(refresh: bool = False) -> Optional[Set[str]]:
@@ -367,9 +417,13 @@ def glue_negative_values(argv: Sequence[str]) -> List[str]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description='Fetch a Copernicus GLO-30 DEM for a bbox.')
+    ap = argparse.ArgumentParser(description='Fetch a 1 arcsec DEM for a bbox.')
     ap.add_argument('--bbox', required=True, help='west,south,east,north in degrees')
     ap.add_argument('--out', default=DEFAULT_OUT, help=f'output GeoTIFF (default {DEFAULT_OUT})')
+    ap.add_argument('--source', choices=['fabdem', 'copernicus'], default=DEFAULT_SOURCE,
+                    help='DEM archive to fetch (default fabdem - Copernicus GLO-30 with its '
+                         'forest/building height bias removed; copernicus fetches the raw '
+                         'surface model instead)')
     ap.add_argument('--arcsec', type=float, default=1.0,
                     help='output pixel in arcseconds (default 1.0, the archive spacing)')
     ap.add_argument('--max-span', type=float, default=DEFAULT_MAX_SPAN_DEG,
@@ -427,27 +481,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f'margin    +{MARGIN_PX} px each side, so tile-edge nodes '
               'interpolate instead of clamping')
 
-    candidates = tiles_for_bbox(bounds)
-    published = load_tile_list(args.refresh_tile_list)
-    if published is not None:
-        wanted = [n for n in candidates if n in published]
-        skipped = len(candidates) - len(wanted)
-        print(f'squares   {len(wanted)} of {len(candidates)} published'
-              + (f' ({skipped} all-ocean skipped)' if skipped else ''))
-    else:
-        wanted = candidates
-        print(f'squares   {len(wanted)} candidates')
+    print(f'source    {args.source}')
+    if args.source == 'copernicus':
+        candidates = tiles_for_bbox(bounds)
+        published = load_tile_list(args.refresh_tile_list)
+        if published is not None:
+            wanted = [n for n in candidates if n in published]
+            skipped = len(candidates) - len(wanted)
+            print(f'squares   {len(wanted)} of {len(candidates)} published'
+                  + (f' ({skipped} all-ocean skipped)' if skipped else ''))
+        else:
+            wanted = candidates
+            print(f'squares   {len(wanted)} candidates')
 
-    if not wanted:
-        print('error: the archive publishes no squares for this bbox - it is all '
-              'open ocean. Pick an area with land in it.', file=sys.stderr)
-        return 1
+        if not wanted:
+            print('error: the archive publishes no squares for this bbox - it is all '
+                  'open ocean. Pick an area with land in it.', file=sys.stderr)
+            return 1
+        urls = [f'/vsicurl/{COP_TILE_URL.format(name=n)}' for n in wanted]
+    else:
+        cells = list(iter_bbox_cells(bounds))
+        print(f'squares   {len(cells)} candidates (no published land index - '
+              f'all-ocean squares are skipped on fetch instead)')
+        urls = [f'/vsicurl/{fabdem_tile_url(lat, lon)}' for lat, lon in cells]
 
     transform, width, height = target_grid(bounds, step_deg)
     print(f'grid      {width} x {height} px ({width * height * 4 / 1048576:.0f} MB in memory)')
     out = np.full((height, width), NODATA, dtype=np.float32)
 
-    urls = [f'/vsicurl/{COP_TILE_URL.format(name=n)}' for n in wanted]
     used = mosaic_into(out, transform, urls, step_deg)
     if used == 0:
         print('error: no DEM squares could be read', file=sys.stderr)

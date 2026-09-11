@@ -9,6 +9,7 @@ import { TerrainClass } from '../../src/script/terrain/tones';
 import { Watercourse } from './lvr';
 import { CoastPolygon, LonLatBounds } from './shoreline';
 import { BuildTileInput, COAST_BUDGET_CEILING, TileCover, buildTile } from './buildTile';
+import { RegionPolygon } from './regions';
 
 const SIZE = 33;
 const CELLS = SIZE - 1;
@@ -40,6 +41,26 @@ function coastAt(edgeCells: number): CoastPolygon {
             { lon: lonAt(-1), lat: BOUNDS.south - 1 },
         ],
         holes: [],
+    };
+}
+
+/** A rectangular region in grid-space corners, converted to lon/lat. */
+function regionAt(
+    x0: number, y0: number, x1: number, y1: number,
+    isLand: boolean, landuseClass: number | undefined,
+): RegionPolygon {
+    const lonAt = (gx: number) => BOUNDS.west + (gx / CELLS) * (BOUNDS.east - BOUNDS.west);
+    const latAt = (gy: number) => BOUNDS.north - (gy / CELLS) * (BOUNDS.north - BOUNDS.south);
+    return {
+        exterior: [
+            { lon: lonAt(x0), lat: latAt(y0) },
+            { lon: lonAt(x1), lat: latAt(y0) },
+            { lon: lonAt(x1), lat: latAt(y1) },
+            { lon: lonAt(x0), lat: latAt(y1) },
+        ],
+        holes: [],
+        isLand,
+        landuseClass,
     };
 }
 
@@ -653,11 +674,42 @@ describe('buildTile cover', () => {
         }
     });
 
+    it('splits geometry at a real cover-class boundary instead of voting it away', () => {
+        // Flat, all-land, split straight down the middle: Tree on the west
+        // half, Crop on the east. Height alone would merge the whole tile
+        // into one leaf/two triangles - the boundary must force real facets
+        // on both sides to survive into the baked mesh.
+        const cover = uniformCover(TerrainClass.Tree, [40, 90, 40]);
+        for (let y = 0; y < SIZE; y++) {
+            for (let x = Math.ceil(SIZE / 2); x < SIZE; x++) {
+                const i = y * SIZE + x;
+                cover.classes[i] = TerrainClass.Crop;
+                cover.colors[i * 3] = 150;
+                cover.colors[i * 3 + 1] = 160;
+                cover.colors[i * 3 + 2] = 70;
+            }
+        }
+        const r = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            maxErrorM: 1e9, // nothing here forces refinement except the boundary
+            cover,
+        }));
+        assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Tree, TerrainClass.Crop]),
+            'both classes must survive - the boundary is not a minority to be voted away');
+        const tile = decodePtm(r.bytes);
+        assert.ok(tile.landAttrs.length / 4 > 6,
+            'a real boundary needs more than the two-triangle fan a flat, uniform tile gets');
+    });
+
     it('takes the majority class over a facet, not whatever is at its centre', () => {
         // A single stripe of built-up two cells wide down the middle of an
-        // otherwise shrubby tile. Facets here span several cells, so a facet
-        // straddling the stripe must still come out shrub: the stripe is the
-        // minority of the ground it covers.
+        // otherwise shrubby tile. A real cover-class boundary now refuses a
+        // decimator merge on its own (see DecimateInput.coverClasses), so
+        // minLeafSize is pinned coarser than the stripe is wide - the floor
+        // it cannot subdivide past - to keep a facet straddling the stripe
+        // for majority-vote to resolve. Without that floor every facet would
+        // simply split around the stripe instead, which is the new feature
+        // working as intended, not a case this test is about.
         const cover = uniformCover(TerrainClass.Shrub, [90, 100, 60]);
         for (let y = 0; y < SIZE; y++) {
             for (let x = 15; x < 17; x++) {
@@ -667,6 +719,7 @@ describe('buildTile cover', () => {
         const r = buildTile(base({
             polygons: [coastAt(CELLS + 2)],
             maxErrorM: 1e9,       // coarse facets, so each spans many cells
+            minLeafSize: 8,       // coarser than the 2-cell stripe
             cover,
         }));
         assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Shrub]));
@@ -726,6 +779,91 @@ describe('buildTile cover', () => {
         }));
         assert.equal(r.landColors.length, r.landTriangles * 3);
         assert.equal(r.landColors[0], 90);
+    });
+});
+
+describe('buildTile regions', () => {
+    /** Every absolute vertex height (ENU up) among the land facets. */
+    function landHeights(r: ReturnType<typeof buildTile>): number[] {
+        const tile = decodePtm(r.bytes);
+        const centre = tileCentreEnu(r.centerHeightM);
+        const p = tile.landPositions;
+        const s = tile.quantScale;
+        const out: number[] = [];
+        for (let v = 0; v * 3 < p.length; v++) {
+            out.push(centre.u + p[v * 3 + 1] * s);
+        }
+        return out;
+    }
+
+    it('cuts real geometry at a landuse boundary, with no cover data at all', () => {
+        // West half Tree, east half Crop, flat and all-land - height alone
+        // would merge this into a single leaf, same as the flat-uniform-tile
+        // case in the plain 'buildTile' suite.
+        const west = regionAt(-1, -1, SIZE / 2, CELLS + 1, true, TerrainClass.Tree);
+        const east = regionAt(SIZE / 2, -1, CELLS + 1, CELLS + 1, true, TerrainClass.Crop);
+        const r = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            heights: heightsFrom(() => 50),
+            maxErrorM: 1e9,
+            regions: [west, east],
+        }));
+        assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Tree, TerrainClass.Crop]),
+            'both classes must survive - the region cut is not a raster vote to be merged away');
+        const tile = decodePtm(r.bytes);
+        assert.ok(tile.landAttrs.length / 4 > 6,
+            'a real boundary needs more than the two-triangle fan a flat, uniform tile gets');
+    });
+
+    it('falls back to the raster cover vote wherever a region carries no landuse class', () => {
+        const bare = regionAt(-1, -1, CELLS + 1, CELLS + 1, true, undefined);
+        const r = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            cover: uniformCover(TerrainClass.Shrub, [90, 100, 60]),
+            regions: [bare],
+        }));
+        assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Shrub]));
+    });
+
+    it('does not drop a landuse-only boundary down to sea level', () => {
+        // The regression case for a real bug found while building this
+        // feature: a crossing between two land regions was being tagged the
+        // same way as a genuine shoreline crossing, and the shore-wall pass
+        // built a wall from the 200 m plateau down to sea level along every
+        // Tree/Crop edge. Flat at 200 m: legitimate vertices sit either on
+        // that surface or, at the tile border only, on the 25 m skirt
+        // (175 m) - nothing legitimate belongs anywhere near sea level (0 m),
+        // which is exactly where a spurious wall would reach.
+        const west = regionAt(-1, -1, SIZE / 2, CELLS + 1, true, TerrainClass.Tree);
+        const east = regionAt(SIZE / 2, -1, CELLS + 1, CELLS + 1, true, TerrainClass.Crop);
+        const r = buildTile(base({
+            polygons: [coastAt(CELLS + 2)],
+            heights: heightsFrom(() => 200),
+            maxErrorM: 1e9,
+            regions: [west, east],
+        }));
+        for (const h of landHeights(r)) {
+            assert.ok(h > 100, `vertex at ${h} - a spurious wall reached down toward sea level`);
+        }
+    });
+
+    it('cuts a cell where the shoreline and a landuse edge cross at once', () => {
+        // Water on the west third; the remaining land is Tree in the north,
+        // Crop in the south - so cells near the middle of that seam face
+        // water, Tree and Crop all at once, the case only cutCellRegions
+        // (not the plain two-region cutter) can resolve.
+        const third = Math.round(SIZE / 3);
+        const water = regionAt(-1, -1, third, CELLS + 1, false, undefined);
+        const north = regionAt(third, -1, CELLS + 1, SIZE / 2, true, TerrainClass.Tree);
+        const south = regionAt(third, SIZE / 2, CELLS + 1, CELLS + 1, true, TerrainClass.Crop);
+        const r = buildTile(base({
+            heights: heightsFrom(() => 50),
+            maxErrorM: 1e9,
+            minLeafSize: 1,
+            regions: [water, north, south],
+        }));
+        assert.ok(r.waterTriangles > 0, 'the water region must still produce water geometry');
+        assert.deepEqual(classesIn(r.bytes), new Set([TerrainClass.Tree, TerrainClass.Crop]));
     });
 });
 

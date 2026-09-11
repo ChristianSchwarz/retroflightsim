@@ -30,6 +30,7 @@ import { PTM_MAX_RIVER_VERTS, PtmTileId, encodePtm } from '../../src/script/terr
 import { GridTriangle, decimate } from './decimate';
 import { CoastPolygon, InlandPolygon, LonLatBounds, buildShoreline } from './shoreline';
 import { Watercourse } from './lvr';
+import { RegionPolygon, buildRegionField, regionFieldFromShoreline } from './regions';
 
 /** Heights at or below seaLevel + this are open water. Matches the old bake. */
 export const WATER_HEIGHT_EPS_M = 0.5;
@@ -76,7 +77,11 @@ const DRY_SEARCH_CELLS = 4;
 /** Skirt tops sit this far below the surface so they cannot z-fight it. */
 export const SKIRT_TOP_EPS_M = 0.05;
 
-/** How far past the triangle budget the shoreline may push before coarsening. */
+/**
+ * How far past the triangle budget the shoreline - and, since cover-class
+ * boundaries are refused a merge the same way, real landcover edges too -
+ * may push before coarsening.
+ */
 export const COAST_BUDGET_CEILING = 3;
 
 /**
@@ -155,6 +160,15 @@ export interface BuildTileInput {
      * cell reach the screen at all.
      */
     watercourses?: Watercourse[];
+    /**
+     * A combined land/water + landuse partition for this tile, already
+     * resolved into non-overlapping pieces (see tools/osm_regions.py). Omit
+     * and every facet's colour and class comes from the raster cover vote
+     * alone, exactly as before — this is what every tile below
+     * LANDUSE_REGION_MIN_ZOOM, and every tile predating this feature, still
+     * does.
+     */
+    regions?: RegionPolygon[];
 }
 
 export interface BuildTileResult {
@@ -327,7 +341,7 @@ function chamferDistanceCells(
  * on the tile border belongs to exactly one triangle and becomes a skirt quad,
  * so the budget has to include them or a tile silently lands over budget.
  */
-function costWithSkirts(tris: GridTriangle[], cells: number): number {
+function costWithSkirts(tris: GridTriangle[], cells: number, isLand: (t: GridTriangle) => boolean): number {
     let quads = 0;
     for (const t of tris) {
         for (let e = 0; e < 3; e++) {
@@ -339,7 +353,7 @@ function costWithSkirts(tris: GridTriangle[], cells: number): number {
                 quads++;
             }
             // Land edge along the shore chord -> shore wall quad.
-            if (t.land && a.shore && b.shore) {
+            if (isLand(t) && a.shore && b.shore) {
                 quads++;
             }
         }
@@ -382,6 +396,16 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         paved,
     });
 
+    // A combined land/landuse partition, when this tile has one — see
+    // tools/bake/regions.ts. The common case (no LVR4 data at this zoom, or
+    // at all yet) falls back to the plain land/water Shoreline reinterpreted
+    // as a 2-entry table, so decimate() always sees a region field and the
+    // rest of this function never needs to branch on whether one was given.
+    const regionField = input.regions && input.regions.length > 0
+        ? buildRegionField({ regions: input.regions, bounds, size })
+        : regionFieldFromShoreline(shoreline);
+    const isLandTriangle = (t: GridTriangle): boolean => regionField.regionTable[t.regionId].isLand;
+
     // --- 3. budget-constrained decimation ---------------------------------
     //
     // Two knobs pull in different directions. Raising maxErrorM coarsens the
@@ -419,6 +443,17 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     // replacing them. See padNodeHeights and DecimateInput.padHeights.
     const drawnHeights = padNodeHeights(heights, size, bounds, input.pads);
 
+    // Forces the decimator to refuse a merge across a real cover-class
+    // boundary the same way it already refuses one across the coast - see
+    // DecimateInput.coverClasses. Checked here, ahead of every use below,
+    // rather than where `classify()` reads `input.cover` again further down:
+    // a mismatched cover raster must fail before decimation runs on it, not
+    // after.
+    if (input.cover && input.cover.size !== size) {
+        throw new Error(`cover size ${input.cover.size} != DEM size ${size}`);
+    }
+    const coverClasses = input.cover?.classes;
+
     let attempts = 0;
     const run = (err: number, leaf: number) => {
         attempts++;
@@ -427,11 +462,13 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             heights,
             padHeights: drawnHeights === heights ? undefined : drawnHeights,
             padErrorM: PAD_ERROR_M,
-            landNodes: shoreline.landNodes,
+            regionNodes: regionField.regionNodes,
+            coverClasses,
             maxErrorM: err,
             minLeafSize: leaf,
-            edgeCrossing: shoreline.edgeCrossing,
-            centreIsLand: shoreline.centreIsLand,
+            edgeCrossing: regionField.edgeCrossing,
+            regionAt: regionField.regionAt,
+            isLandRegion: (id: number) => regionField.regionTable[id].isLand,
         });
     };
 
@@ -443,8 +480,13 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     if (!budget) {
         tris = run(maxErrorM, minLeafSize).triangles;
     } else {
-        // 1. The shoreline is cut at full resolution, at every zoom level, and
-        //    the budget is met out of the interior alone.
+        // 1. The shoreline - and any real cover-class boundary, which refuses
+        //    a merge the same unconditional way (DecimateInput.coverClasses) -
+        //    is cut at full resolution, at every zoom level, and the budget is
+        //    met out of the interior alone. `coastOnly` below is named for the
+        //    original, larger cost driver, but at HUGE_ERROR_M every height-
+        //    driven merge is already free to happen, so what is left refusing
+        //    to merge is exactly the shoreline plus any cover boundary.
         //
         //    It used to coarsen the leaf size here until the coast fitted, and
         //    that is what broke the rivers. A watercourse two or three nodes
@@ -463,7 +505,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         //    rather than dropping detail the water needs - up to
         //    COAST_BUDGET_CEILING, past which even the cut has to give way.
         let coastOnly = run(HUGE_ERROR_M, minLeafSize);
-        while (costWithSkirts(coastOnly.triangles, cells) > budget * COAST_BUDGET_CEILING
+        while (costWithSkirts(coastOnly.triangles, cells, isLandTriangle) > budget * COAST_BUDGET_CEILING
             && minLeafSize < cells) {
             minLeafSize *= 2;
             coastOnly = run(HUGE_ERROR_M, minLeafSize);
@@ -473,7 +515,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         //    requested tolerance, then bisect.
         let best = coastOnly;
         let fine = run(maxErrorM, minLeafSize);
-        if (costWithSkirts(fine.triangles, cells) <= budget) {
+        if (costWithSkirts(fine.triangles, cells, isLandTriangle) <= budget) {
             best = fine;
         } else {
             let lo = maxErrorM;          // too fine
@@ -482,7 +524,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             for (let i = 0; i < 24 && !hiFits; i++) {
                 hi *= 2;
                 fine = run(hi, minLeafSize);
-                hiFits = costWithSkirts(fine.triangles, cells) <= budget;
+                hiFits = costWithSkirts(fine.triangles, cells, isLandTriangle) <= budget;
             }
             if (!hiFits) {
                 best = coastOnly;
@@ -493,7 +535,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             for (let i = 0; i < 8; i++) {
                 const mid = Math.sqrt(lo * hi) || (lo + hi) / 2;
                 const r = run(mid, minLeafSize);
-                if (costWithSkirts(r.triangles, cells) <= budget) {
+                if (costWithSkirts(r.triangles, cells, isLandTriangle) <= budget) {
                     hi = mid;
                     best = r;
                 } else {
@@ -516,7 +558,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         while (minLeafSize > 1) {
             const finer = minLeafSize / 2;
             const candidate = run(maxErrorM, finer);
-            if (costWithSkirts(candidate.triangles, cells) <= budget) {
+            if (costWithSkirts(candidate.triangles, cells, isLandTriangle) <= budget) {
                 best = candidate;
                 minLeafSize = finer;
                 continue;
@@ -531,7 +573,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             for (let i = 0; i < 24 && !fitted; i++) {
                 err *= 2;
                 const r = run(err, finer);
-                if (costWithSkirts(r.triangles, cells) <= budget) {
+                if (costWithSkirts(r.triangles, cells, isLandTriangle) <= budget) {
                     fitted = r;
                 }
             }
@@ -687,6 +729,11 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
      * same place. Those positions are integers, so matching them is exact; it
      * is only true crossings, computed independently by adjacent leaves, that
      * cannot be compared numerically. So: trust the tag, fall back to position.
+     *
+     * The tag itself is only ever set on a genuine land/water crossing, never
+     * a landuse-only one between two regions on the same side of it — see
+     * DecimateInput.isLandRegion — so nothing here needs to re-derive that
+     * distinction.
      */
     const shorePositions = new Set<string>();
     for (const t of tris) {
@@ -820,10 +867,9 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     // whichever pixel happened to sit under its middle, and the result
     // flickers between LOD levels. So: walk the facet's grid footprint, take
     // the majority class and the mean colour.
+    // Already validated against `size` where `coverClasses` was pulled out
+    // for the decimator, above.
     const cover = input.cover;
-    if (cover && cover.size !== size) {
-        throw new Error(`cover size ${cover.size} != DEM size ${size}`);
-    }
 
     // One histogram for the whole tile, cleared per facet. Allocating it
     // inside classify meant a kilobyte per triangle across five thousand
@@ -988,9 +1034,15 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         return idx;
     };
 
-    /** `cover` is [class, r, g, b], as returned by classify. */
+    /**
+     * `cover` is [class, r, g, b], as returned by classify. `t` is the source
+     * facet, whose region may carry a real vector-cut landuse class that
+     * overrides the raster vote in `facet[0]` - the colour still comes from
+     * the raster either way, since the region layer carries no colour of its
+     * own.
+     */
     const pushLandTriangle = (
-        a: Enu, b: Enu, c: Enu, facet: readonly [number, number, number, number],
+        a: Enu, b: Enu, c: Enu, facet: readonly [number, number, number, number], t: GridTriangle,
     ) => {
         const ax = a.e - centre.e, ay = a.u - centre.u, az = centre.n - a.n;
         const bx = b.e - centre.e, by = b.u - centre.u, bz = centre.n - b.n;
@@ -1012,18 +1064,19 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
         }
         landPos.push(ax, ay, az, bx, by, bz, cx, cy, cz);
         landNrm.push(nx, ny, nz);
-        landClass.push(facet[0]);
+        landClass.push(regionField.regionTable[t.regionId].landuseClass ?? facet[0]);
         landColor.push(facet[1], facet[2], facet[3]);
     };
 
     for (const t of tris) {
         const [p0, p1, p2] = t.pts;
-        if (t.land) {
+        if (isLandTriangle(t)) {
             pushLandTriangle(
                 project(p0.x, p0.y, true, p0.shore),
                 project(p1.x, p1.y, true, p1.shore),
                 project(p2.x, p2.y, true, p2.shore),
                 coverOf(t),
+                t,
             );
         } else {
             const shore = Math.min(
@@ -1061,7 +1114,7 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
     // that step is usually small — a lake is measured against its own shore —
     // and the "nothing to close" test below drops the wall entirely.
     for (const t of tris) {
-        if (!t.land) {
+        if (!isLandTriangle(t)) {
             continue;
         }
         for (let e = 0; e < 3; e++) {
@@ -1081,8 +1134,8 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             // A wall is the cut face of the facet above it, so it wears that
             // facet's cover rather than a colour of its own.
             const facet = coverOf(t);
-            pushLandTriangle(topA, topB, botB, facet);
-            pushLandTriangle(topA, botB, botA, facet);
+            pushLandTriangle(topA, topB, botB, facet, t);
+            pushLandTriangle(topA, botB, botA, facet, t);
         }
     }
 
@@ -1102,14 +1155,14 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             if (!onBorder(a) || !onBorder(b) || !sameBorder(a, b)) {
                 continue;
             }
-            if (t.land) {
+            if (isLandTriangle(t)) {
                 const topA = project(a.x, a.y, true, false, SKIRT_TOP_EPS_M);
                 const topB = project(b.x, b.y, true, false, SKIRT_TOP_EPS_M);
                 const botA = project(a.x, a.y, true, false, skirt);
                 const botB = project(b.x, b.y, true, false, skirt);
                 const facet = coverOf(t);
-                pushLandTriangle(topA, topB, botB, facet);
-                pushLandTriangle(topA, botB, botA, facet);
+                pushLandTriangle(topA, topB, botB, facet, t);
+                pushLandTriangle(topA, botB, botA, facet, t);
             } else {
                 const ia = waterVertex(a.x, a.y);
                 const ib = waterVertex(b.x, b.y);
@@ -1249,9 +1302,10 @@ export function buildTile(input: BuildTileInput): BuildTileResult {
             if (l0 < -EDGE_EPS || l1 < -EDGE_EPS || l2 < -EDGE_EPS) {
                 continue;
             }
-            const a = project(p0.x, p0.y, tri.land, p0.shore);
-            const b = project(p1.x, p1.y, tri.land, p1.shore);
-            const c = project(p2.x, p2.y, tri.land, p2.shore);
+            const triIsLand = isLandTriangle(tri);
+            const a = project(p0.x, p0.y, triIsLand, p0.shore);
+            const b = project(p1.x, p1.y, triIsLand, p1.shore);
+            const c = project(p2.x, p2.y, triIsLand, p2.shore);
             const hit = {
                 e: a.e * l0 + b.e * l1 + c.e * l2,
                 n: a.n * l0 + b.n * l1 + c.n * l2,

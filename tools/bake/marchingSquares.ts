@@ -54,6 +54,16 @@ export interface CellCutInput {
      * water on the other). True when the cell centre is land.
      */
     centreIsLand?: boolean;
+    /**
+     * Whether edge i's crossing (if any) is a genuine land/water transition,
+     * worth a shore wall downstream, as opposed to two same-side regions this
+     * cutter's own boolean `corners` collapses together (a landuse-only split
+     * mapped onto true/false, say). Defaults to every edge being one, which
+     * is what a caller working in real land/water terms wants; a caller that
+     * synthesizes the boolean split from something coarser should pass this
+     * explicitly. See {@link Vec2.shore}.
+     */
+    shoreEdges?: readonly boolean[];
 }
 
 export interface CellCutResult {
@@ -69,11 +79,12 @@ const CORNERS: readonly Vec2[] = [
     { x: 0, y: 1 },
 ];
 
-function lerpOnEdge(edge: number, t: number): Vec2 {
+function lerpOnEdge(edge: number, t: number, shore = true): Vec2 {
     const a = CORNERS[edge];
     const b = CORNERS[(edge + 1) % 4];
-    // Every point this produces lies on the shoreline by construction.
-    return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, shore: true };
+    // Every point this produces lies on a cell boundary by construction; only
+    // a genuine land/water crossing is tagged `shore` - see the callers.
+    return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, shore };
 }
 
 function signedArea(p: Vec2[]): number {
@@ -156,7 +167,7 @@ export function cutCell(input: CellCutInput): CellCutResult {
             t = 0.5;
         }
         t = t < SNAP_EPS ? 0 : t > 1 - SNAP_EPS ? 1 : t;
-        cross.push(lerpOnEdge(e, t));
+        cross.push(lerpOnEdge(e, t, input.shoreEdges ? input.shoreEdges[e] : true));
     }
 
     const isSaddle = nLand === 2 && corners[0] === corners[2] && corners[1] === corners[3];
@@ -217,4 +228,161 @@ export function cutCell(input: CellCutInput): CellCutResult {
     fan(dedupe(hex), majorityOut);
 
     return { land, water };
+}
+
+/**
+ * Cut one cell into more than two regions at once — a real landuse boundary
+ * crossing the same cell as the shoreline, or two landuse boundaries meeting
+ * in one cell. `cutCell` above is kept untouched and unreachable-by-shoreline
+ * paths keep calling it directly; this is additive.
+ *
+ * The construction generalizes `cutCell`'s own hex/corner-triangle split
+ * rather than replacing it: every corner not belonging to the cell-centre's
+ * region becomes its own small wedge, bounded only by the crossings just
+ * before and after it — exactly `cutCell`'s minority corner triangles, just
+ * allowed to span more than one corner. What is left after removing every
+ * such wedge is, by construction, a single region around the centre point,
+ * bounded by the *other* crossings plus whichever corners do belong to the
+ * centre's region — fanned from the centre, this is `cutCell`'s majority hex,
+ * generalized the same way. A region whose corner is not adjacent to any
+ * other corner of its own colour can still appear more than once (e.g.
+ * corners tagged A, B, A, C): each occurrence becomes its own wedge, which is
+ * correct on its own — nothing about being the same class requires two
+ * disconnected patches to share a triangle.
+ */
+export interface RegionCellCutInput {
+    /** Region id for c0..c3, same corner order as {@link CellCutInput}. */
+    corners: readonly [number, number, number, number];
+    /** Crossing parameter on edge i, or undefined iff corners[i] === corners[(i+1)%4]. */
+    edgeCrossings: readonly (number | undefined)[];
+    /**
+     * Region id at the cell centre (0.5, 0.5). Only load-bearing for a
+     * genuinely ambiguous cell — one whose centre region does not already
+     * follow from the corners alone (the direct generalization of `cutCell`'s
+     * saddle case). Defaults to c0's region otherwise, same as `cutCell`.
+     */
+    centreRegion?: number;
+    /**
+     * Whether edge i's crossing (if any) is a genuine land/water transition
+     * rather than two regions on the same side of it (a landuse edge, say).
+     * Defaults to every edge being one. See {@link CellCutInput.shoreEdges}.
+     */
+    shoreEdges?: readonly boolean[];
+}
+
+export interface RegionCellCutResult {
+    /** Cell-local triangles per region id, ccw in (x, y-down). */
+    byRegion: Map<number, Vec2[][]>;
+}
+
+/** Fan a boundary ring from an external apex point, both directions handled. */
+function fanFromCentre(centre: Vec2, ring: Vec2[], out: Vec2[][]): void {
+    if (ring.length < 3) {
+        return;
+    }
+    const ccw = signedArea(ring) >= 0;
+    for (let i = 0; i < ring.length; i++) {
+        const a = ring[i];
+        const b = ring[(i + 1) % ring.length];
+        const tri = ccw ? [centre, a, b] : [centre, b, a];
+        if (Math.abs(signedArea(tri)) > MIN_AREA) {
+            out.push(tri);
+        }
+    }
+}
+
+export function cutCellRegions(input: RegionCellCutInput): RegionCellCutResult {
+    const { corners } = input;
+    const byRegion = new Map<number, Vec2[][]>();
+    const add = (id: number, tris: Vec2[][]): void => {
+        if (tris.length === 0) {
+            return;
+        }
+        const existing = byRegion.get(id);
+        if (existing) {
+            existing.push(...tris);
+        } else {
+            byRegion.set(id, tris);
+        }
+    };
+
+    if (new Set(corners).size === 1) {
+        const tris: Vec2[][] = [];
+        fan([CORNERS[0], CORNERS[1], CORNERS[2], CORNERS[3]], tris);
+        add(corners[0], tris);
+        return { byRegion };
+    }
+
+    // Snap crossings onto corners exactly as cutCell does, so a would-be
+    // sliver collapses to zero area instead of surviving as a degenerate tri.
+    const cross: (Vec2 | undefined)[] = [];
+    for (let e = 0; e < 4; e++) {
+        if (corners[e] === corners[(e + 1) % 4]) {
+            cross.push(undefined);
+            continue;
+        }
+        let t = input.edgeCrossings[e];
+        if (t === undefined || !Number.isFinite(t)) {
+            t = 0.5;
+        }
+        t = t < SNAP_EPS ? 0 : t > 1 - SNAP_EPS ? 1 : t;
+        cross.push(lerpOnEdge(e, t, input.shoreEdges ? input.shoreEdges[e] : true));
+    }
+
+    const centreRegion = input.centreRegion !== undefined && corners.includes(input.centreRegion)
+        ? input.centreRegion
+        : corners[0];
+
+    // The centre region claims every crossing — each one is a shared boundary
+    // point between two runs, whichever of which may be the centre's own —
+    // plus any corner that belongs to it.
+    const reduced: Vec2[] = [];
+    for (let c = 0; c < 4; c++) {
+        if (corners[c] === centreRegion) {
+            reduced.push(CORNERS[c]);
+        }
+        const x = cross[c];
+        if (x) {
+            reduced.push(x);
+        }
+    }
+    const centreTris: Vec2[][] = [];
+    fanFromCentre({ x: 0.5, y: 0.5 }, dedupe(reduced), centreTris);
+    add(centreRegion, centreTris);
+
+    // Every other run - a maximal sequence of consecutive corners sharing one
+    // id, none of them the centre region - is bounded by the crossings just
+    // before and after it, with no centre point of its own.
+    for (let s = 0; s < 4; s++) {
+        if (corners[s] === corners[(s + 3) % 4]) {
+            continue; // not a run start
+        }
+        const runId = corners[s];
+        if (runId === centreRegion) {
+            continue;
+        }
+        const poly: Vec2[] = [];
+        const before = cross[(s + 3) % 4];
+        if (before) {
+            poly.push(before);
+        }
+        let c = s;
+        for (let k = 0; k < 4; k++) {
+            poly.push(CORNERS[c]);
+            const next = (c + 1) % 4;
+            if (corners[next] !== runId) {
+                const after = cross[c];
+                if (after) {
+                    poly.push(after);
+                }
+                break;
+            }
+            c = next;
+        }
+        const tris: Vec2[][] = [];
+        fan(dedupe(poly), tris);
+        add(runId, tris);
+    }
+
+    return { byRegion };
 }

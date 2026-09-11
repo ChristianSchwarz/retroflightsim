@@ -80,10 +80,35 @@ try:
 except ImportError:
     HAS_RASTERIO = False
 
+# Optional: only needed for --osm-landuse. Same guarded shape as
+# bake_planet_cover.py's own HAS_OSM_LANDUSE - a bake that never passes
+# --osm-landuse never needs shapely's STRtree or the landuse tag table.
+try:
+    from osm_landuse import assemble_landuse_polygons, build_landuse_index, overpass_landuse_query
+    from osm_regions import Region, assemble_tile_regions
+    HAS_OSM_LANDUSE = True
+except ImportError:
+    HAS_OSM_LANDUSE = False
+
 
 LVR_MAGIC = b'LVR1'
 LVR2_MAGIC = b'LVR2'
 LVR3_MAGIC = b'LVR3'
+LVR4_MAGIC = b'LVR4'
+
+# Below this zoom a tile's own grid is already coarser than any landuse
+# boundary is worth cutting precisely (see the cell-size table in the
+# feature's design notes: ~19-150 m per cell across z9-z12, the range the
+# boundary-adaptive mesh tessellation actually engages). A low-zoom tile's
+# box is also huge - near-hemisphere at z0/z1 - so its landuse STRtree query
+# would return far more candidates than any single leaf tile ever does; below
+# this zoom the tile simply keeps its LVR1-3 layers, and the raster `.plc`
+# pyramid stays the source of truth for colour there, same as today.
+LANDUSE_REGION_MIN_ZOOM = 9
+
+# No OSM landuse tag on this region - bare land, or water. Matches
+# tools/bake/lvr.ts's REGION_CLASS_NONE.
+REGION_CLASS_NONE = 0xFF
 
 # Rasterizing and clipping are one tile against a fixed set of polygons each,
 # with no interaction between tiles, so both loops are split across this many
@@ -712,12 +737,22 @@ def vector_simplify_tol(z: int, max_zoom: int, tile_size: int) -> float:
     return cell * 0.15 * (2 ** max(0, max_zoom - z))
 
 
-def clip_vector_polys(
+def simplified_clipped_land(
     land: MultiPolygon,
     b: Bounds,
     tolerance: float,
-) -> List[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]]:
-    """Clip OSM land to a tile and return (exterior, holes) coord lists."""
+) -> List[Polygon]:
+    """Land clipped to a tile and simplified, as a flat list of Polygons.
+
+    The shared first half of `clip_vector_polys` below, split out so
+    `osm_regions.assemble_tile_regions` can overlay landuse polygons against
+    exactly the same simplified boundary the `.lvr` polygon layer itself
+    uses at this tile - not a second, independently-simplified copy of it,
+    which is exactly the failure mode that made inland water rings
+    unsimplified in the first place (see shoreline.ts's own docstring on
+    that). Whatever this returns is final: nothing downstream simplifies it
+    again.
+    """
     tile_box = box(b.west, b.south, b.east, b.north)
     clipped = land.intersection(tile_box)
     if clipped.is_empty:
@@ -733,14 +768,25 @@ def clip_vector_polys(
         # scrap of land on the tile, and it came out as open water from edge to
         # edge - 12/4391/856 in the Berlin bake, 77.6% land by area.
         geoms = [g for g in getattr(clipped, 'geoms', []) if isinstance(g, Polygon)]
-    out: List[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]] = []
+    out: List[Polygon] = []
     for geom in geoms:
         if geom.is_empty:
             continue
-        for poly in _simplified_parts(geom, tolerance):
-            rings = _rings_of(poly)
-            if rings is not None:
-                out.append(rings)
+        out.extend(_simplified_parts(geom, tolerance))
+    return out
+
+
+def clip_vector_polys(
+    land: MultiPolygon,
+    b: Bounds,
+    tolerance: float,
+) -> List[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]]:
+    """Clip OSM land to a tile and return (exterior, holes) coord lists."""
+    out: List[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]] = []
+    for poly in simplified_clipped_land(land, b, tolerance):
+        rings = _rings_of(poly)
+        if rings is not None:
+            out.append(rings)
     return out
 
 
@@ -874,20 +920,30 @@ def encode_lvr(
     polys: Sequence[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]],
     inland: Sequence[Tuple[Optional[float], List[Tuple[float, float]], List[List[Tuple[float, float]]]]] = (),
     lines: Sequence[Tuple[float, List[Tuple[float, float]]]] = (),
+    regions: Sequence[
+        Tuple[bool, Optional[int], List[Tuple[float, float]], List[List[Tuple[float, float]]]]
+    ] = (),
 ) -> bytes:
-    """LVR3 with watercourses, LVR2 with inland water, LVR1 with neither.
+    """LVR4 with combined regions, LVR3 with watercourses, LVR2 with inland
+    water, LVR1 with none of those.
 
     The version is the highest layer the tile actually has something in, so a
-    tile with no lake and no river stays LVR1 and byte-identical to what is
-    already baked - adding a layer re-writes only the tiles it has something to
-    say about.
+    tile with no lake, no river and no landuse region stays LVR1 and
+    byte-identical to what is already baked - adding a layer re-writes only
+    the tiles it has something to say about. Layers below the chosen version
+    are still written in full (an LVR4 tile carries its inland and
+    watercourse sections even when both are empty) - `decodeLvr` in
+    tools/bake/lvr.ts reads every section up to and including its own magic,
+    unconditionally.
 
     A body with no resolved height writes NaN, which the mesh bake reads as
-    "follow the DEM" - the same treatment flowing water gets.
+    "follow the DEM" - the same treatment flowing water gets. A region with
+    no OSM landuse tag (bare land, or water) writes REGION_CLASS_NONE.
     """
-    if not inland and not lines:
+    if not inland and not lines and not regions:
         return zlib.compress(bytes(bytearray(LVR_MAGIC) + _encode_polys(polys)), 6)
-    payload = bytearray(LVR3_MAGIC if lines else LVR2_MAGIC)
+    magic = LVR4_MAGIC if regions else (LVR3_MAGIC if lines else LVR2_MAGIC)
+    payload = bytearray(magic)
     payload += _encode_polys(polys)
     payload += struct.pack('<H', len(inland))
     for height, ext, holes in inland:
@@ -896,11 +952,20 @@ def encode_lvr(
         payload += _encode_ring(ext)
         for hole in holes:
             payload += _encode_ring(hole)
-    if lines:
+    if magic in (LVR3_MAGIC, LVR4_MAGIC):
         payload += struct.pack('<H', len(lines))
         for width_m, pts in lines:
             payload += struct.pack('<f', float(width_m))
             payload += _encode_ring(pts)
+    if magic == LVR4_MAGIC:
+        payload += struct.pack('<H', len(regions))
+        for is_land, cls, ext, holes in regions:
+            payload += struct.pack(
+                '<BB', 1 if is_land else 0, REGION_CLASS_NONE if cls is None else cls)
+            payload += struct.pack('<H', 1 + len(holes))
+            payload += _encode_ring(ext)
+            for hole in holes:
+                payload += _encode_ring(hole)
     return zlib.compress(bytes(payload), 6)
 
 
@@ -1001,28 +1066,33 @@ _clip_tile_size = 0
 _clip_land: Optional[MultiPolygon] = None
 _clip_inland: Sequence['WaterBody'] = ()
 _clip_courses: Sequence['Watercourse'] = ()
+_clip_landuse_tree: Optional['STRtree'] = None
+_clip_landuse_polys: Sequence[Polygon] = ()
+_clip_landuse_classes: Sequence[int] = ()
 
 
-def _init_clip_worker(out_dir: str, tile_size: int, land, inland, courses) -> None:
+def _init_clip_worker(
+    out_dir: str, tile_size: int, land, inland, courses,
+    landuse_tree=None, landuse_polys: Sequence[Polygon] = (), landuse_classes: Sequence[int] = (),
+) -> None:
     global _clip_out_dir, _clip_tile_size, _clip_land, _clip_inland, _clip_courses
+    global _clip_landuse_tree, _clip_landuse_polys, _clip_landuse_classes
     _clip_out_dir = out_dir
     _clip_tile_size = tile_size
     _clip_land = land
     _clip_inland = inland
     _clip_courses = courses
+    _clip_landuse_tree = landuse_tree
+    _clip_landuse_polys = landuse_polys
+    _clip_landuse_classes = landuse_classes
 
 
 def _clip_worker(task: Tuple[int, int, int, bytearray, float, float]) -> Tuple[int, bool, int, int]:
     z, x, y, grid, tol, line_tol = task
-    lwm_bytes = write_lwm(_clip_out_dir, z, x, y, encode_lwm(bytes(grid), _clip_tile_size))
-    b = tile_bounds(z, x, y)
-    polys = clip_vector_polys(_clip_land, b, tol)
-    inland_polys = clip_inland_bodies(_clip_inland, b, tol) if _clip_inland else []
-    lines = clip_watercourses(_clip_courses, b, line_tol) if _clip_courses else []
-    if not (polys or inland_polys or lines):
-        return lwm_bytes, False, 0, 0
-    lvr_bytes = write_lvr(_clip_out_dir, z, x, y, encode_lvr(polys, inland_polys, lines))
-    return lwm_bytes, True, lvr_bytes, len(lines)
+    return _clip_worker_inline(
+        _clip_out_dir, _clip_tile_size, _clip_land, _clip_inland, _clip_courses, z, x, y, grid, tol, line_tol,
+        _clip_landuse_tree, _clip_landuse_polys, _clip_landuse_classes,
+    )
 
 
 def clip_level_parallel(
@@ -1036,6 +1106,9 @@ def clip_level_parallel(
     line_tol: float,
     items: Sequence[Tuple[Tuple[int, int], bytearray]],
     jobs: int,
+    landuse_tree: Optional['STRtree'] = None,
+    landuse_polys: Sequence[Polygon] = (),
+    landuse_classes: Sequence[int] = (),
 ) -> Tuple[int, int, int, int, int]:
     """Writes .lwm and clips+writes .lvr for one level, across worker processes.
 
@@ -1072,32 +1145,80 @@ def clip_level_parallel(
     jobs = max(1, min(jobs, total))
     if jobs == 1:
         for (x, y), grid in items:
-            accept(*_clip_worker_inline(out_dir, tile_size, land, inland, courses, z, x, y, grid, tol, line_tol))
+            accept(*_clip_worker_inline(
+                out_dir, tile_size, land, inland, courses, z, x, y, grid, tol, line_tol,
+                landuse_tree, landuse_polys, landuse_classes,
+            ))
         return total_bytes, written, lvr_written, total_lvr_bytes, total_lines
 
     tasks = [(z, x, y, grid, tol, line_tol) for (x, y), grid in items]
     ctx = mp.get_context('spawn')
     with ctx.Pool(
-        jobs, initializer=_init_clip_worker, initargs=(out_dir, tile_size, land, inland, courses),
+        jobs, initializer=_init_clip_worker,
+        initargs=(out_dir, tile_size, land, inland, courses, landuse_tree, landuse_polys, landuse_classes),
     ) as pool:
         for lwm_bytes, has_lvr, lvr_bytes, num_lines in pool.imap_unordered(_clip_worker, tasks, chunksize=8):
             accept(lwm_bytes, has_lvr, lvr_bytes, num_lines)
     return total_bytes, written, lvr_written, total_lvr_bytes, total_lines
 
 
+def encode_regions_for_tile(
+    simplified_land: Sequence[Polygon],
+    landuse_tree: Optional['STRtree'],
+    landuse_polys: Sequence[Polygon],
+    landuse_classes: Sequence[int],
+    b: Bounds,
+) -> List[Tuple[bool, Optional[int], List[Tuple[float, float]], List[List[Tuple[float, float]]]]]:
+    """The tile's combined land/landuse partition, as LVR4-ready ring tuples.
+
+    `simplified_land` must be the same list `clip_vector_polys` builds this
+    tile's own `.lvr` polygon layer from - see `simplified_clipped_land`'s
+    docstring for why reusing it, rather than re-clipping and re-simplifying
+    independently, is what keeps this layer's outer boundary from cracking
+    against the plain coastline layer.
+    """
+    if landuse_tree is None:
+        return []
+    tile_box = box(b.west, b.south, b.east, b.north)
+    # Widens only the STRtree query below, guarding a candidate whose true
+    # geometry reaches the tile but whose envelope is a hair outside it after
+    # floating-point clipping - see assemble_tile_regions's own docstring.
+    halo_box = tile_box.buffer((b.east - b.west) * 0.02)
+    land_mp = MultiPolygon(list(simplified_land)) if simplified_land else MultiPolygon()
+    regions = assemble_tile_regions(tile_box, halo_box, land_mp, landuse_tree, landuse_polys, landuse_classes)
+    out: List[Tuple[bool, Optional[int], List[Tuple[float, float]], List[List[Tuple[float, float]]]]] = []
+    for region in regions:
+        rings = _rings_of(region.geom)
+        if rings is None:
+            continue
+        ext, holes = rings
+        out.append((region.is_land, region.landuse_class, ext, holes))
+    return out
+
+
 def _clip_worker_inline(
     out_dir: str, tile_size: int, land, inland, courses,
     z: int, x: int, y: int, grid: bytearray, tol: float, line_tol: float,
+    landuse_tree=None, landuse_polys: Sequence[Polygon] = (), landuse_classes: Sequence[int] = (),
 ) -> Tuple[int, bool, int, int]:
     """Same body as `_clip_worker`, without the module-global indirection - used for the `jobs == 1` path."""
     lwm_bytes = write_lwm(out_dir, z, x, y, encode_lwm(bytes(grid), tile_size))
     b = tile_bounds(z, x, y)
-    polys = clip_vector_polys(land, b, tol)
+    simplified_land = simplified_clipped_land(land, b, tol)
+    polys: List[Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]] = []
+    for poly in simplified_land:
+        rings = _rings_of(poly)
+        if rings is not None:
+            polys.append(rings)
     inland_polys = clip_inland_bodies(inland, b, tol) if inland else []
     lines = clip_watercourses(courses, b, line_tol) if courses else []
-    if not (polys or inland_polys or lines):
+    regions = (
+        encode_regions_for_tile(simplified_land, landuse_tree, landuse_polys, landuse_classes, b)
+        if landuse_tree is not None and z >= LANDUSE_REGION_MIN_ZOOM else []
+    )
+    if not (polys or inland_polys or lines or regions):
         return lwm_bytes, False, 0, 0
-    lvr_bytes = write_lvr(out_dir, z, x, y, encode_lvr(polys, inland_polys, lines))
+    lvr_bytes = write_lvr(out_dir, z, x, y, encode_lvr(polys, inland_polys, lines, regions))
     return lwm_bytes, True, lvr_bytes, len(lines)
 
 
@@ -1142,6 +1263,20 @@ def bake(args: argparse.Namespace) -> int:
     if land.is_empty:
         print('error: no land polygons assembled — check bbox / OSM data', file=sys.stderr)
         return 2
+
+    landuse_tree = None
+    landuse_polys: List[Polygon] = []
+    landuse_classes: List[int] = []
+    if getattr(args, 'osm_landuse', False):
+        if not HAS_OSM_LANDUSE:
+            print('error: --osm-landuse requires shapely and its own dependencies '
+                  '(the osm_landuse/osm_regions modules failed to import)', file=sys.stderr)
+            return 2
+        landuse_data = overpass_landuse_query((bbox.west, bbox.south, bbox.east, bbox.north), args.refresh_osm)
+        landuse_polys, landuse_classes = assemble_landuse_polygons(landuse_data)
+        print(f'landuse     {len(landuse_polys)} OSM polygons')
+        if landuse_polys:
+            landuse_tree = build_landuse_index(landuse_polys)
 
     # A mainland coast that fails to close comes out as a handful of islets
     # rather than as nothing, so `is_empty` above does not catch it and the
@@ -1229,7 +1364,8 @@ def bake(args: argparse.Namespace) -> int:
         line_tol = ((180.0 / (1 << z)) / max(1, tile_size - 1)) * LINE_SIMPLIFY_CELLS
         items = sorted(level_grids.items())
         level_bytes, written, lvr_written, level_lvr_bytes, level_lines = clip_level_parallel(
-            out_dir, tile_size, land, inland, courses, z, tol, line_tol, items, args.jobs)
+            out_dir, tile_size, land, inland, courses, z, tol, line_tol, items, args.jobs,
+            landuse_tree, landuse_polys, landuse_classes)
         total_bytes += level_bytes
         total_lvr_bytes += level_lvr_bytes
         total_lines += level_lines
@@ -1309,6 +1445,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         help='accept a bbox that really is almost all water')
     parser.add_argument('--refresh-osm', action='store_true',
                         help='ignore the cached Overpass response and re-fetch')
+    parser.add_argument('--osm-landuse', action='store_true',
+                        help='cut real landuse-polygon boundaries into the coast vector layer '
+                             '(z%d+ only); requires shapely' % LANDUSE_REGION_MIN_ZOOM)
     parser.add_argument('--include-ocean-tiles', action='store_true',
                         help='also bake every tile in the bbox at max zoom (slow; default: PDM tiles only)')
     parser.add_argument('--jobs', type=int, default=DEFAULT_JOBS,

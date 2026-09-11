@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { MIN_AREA, SNAP_EPS, Vec2, cutCell } from './marchingSquares';
+import { MIN_AREA, SNAP_EPS, Vec2, cutCell, cutCellRegions } from './marchingSquares';
 
 function area(tri: Vec2[]): number {
     return Math.abs(
@@ -193,5 +193,137 @@ describe('marching-squares cell cutting', () => {
         assert.ok(total(far.land) > total(near.land), 'crossing position drives the split');
         assert.ok(Math.abs(total(near.land) - 0.005) < 1e-9, `near ${total(near.land)}`);
         assert.ok(Math.abs(total(far.land) - 0.405) < 1e-9, `far ${total(far.land)}`);
+    });
+
+    describe('shoreEdges', () => {
+        it('tags every crossing as shore by default', () => {
+            const r = cutCell({ corners: cornersOf(1 | 2), edgeCrossings: MIDPOINTS });
+            const crossing = [...r.land, ...r.water].flat().find(p => p.shore);
+            assert.ok(crossing, 'expected a shore-tagged vertex');
+        });
+
+        it('suppresses the shore tag on an edge marked as not one', () => {
+            // c0+c1 land, c2+c3 water: the split runs along edge 1 (c1->c2)
+            // and edge 3 (c3->c0). Mark both as landuse-only, not real shore.
+            const r = cutCell({
+                corners: cornersOf(1 | 2),
+                edgeCrossings: MIDPOINTS,
+                shoreEdges: [true, false, true, false],
+            });
+            const anyShore = [...r.land, ...r.water].flat().some(p => p.shore);
+            assert.equal(anyShore, false, 'no crossing point should be tagged shore');
+            // The geometry itself is unaffected - only the tag changes.
+            assert.ok(Math.abs(total(r.land) - 0.5) < 1e-12);
+            assert.ok(Math.abs(total(r.water) - 0.5) < 1e-12);
+        });
+    });
+});
+
+function totalOf(byRegion: Map<number, Vec2[][]>): number {
+    let sum = 0;
+    for (const tris of byRegion.values()) {
+        sum += total(tris);
+    }
+    return sum;
+}
+
+describe('N-ary region cell cutting', () => {
+    const MID4 = [0.5, 0.5, 0.5, 0.5];
+
+    it('tiles the cell exactly for every 1..4-region corner pattern, with and without a centre id', () => {
+        const patterns: Array<readonly [number, number, number, number]> = [
+            [0, 0, 0, 0],       // k=1
+            [0, 0, 1, 1],       // k=2, adjacent pair
+            [0, 1, 0, 1],       // k=2, saddle
+            [0, 1, 0, 2],       // k=3, one id repeated on a diagonal
+            [0, 0, 1, 2],       // k=3, one id spans two adjacent corners
+            [0, 1, 2, 0],       // k=3, the repeated id wraps around corner 0
+            [0, 1, 2, 3],       // k=4, every corner distinct
+        ];
+        for (const corners of patterns) {
+            const ids = [...new Set(corners)];
+            for (const centreRegion of [...ids, undefined]) {
+                const r = cutCellRegions({ corners, edgeCrossings: MID4, centreRegion });
+                const sum = totalOf(r.byRegion);
+                assert.ok(
+                    Math.abs(sum - 1) < 1e-9,
+                    `corners ${corners} centre=${centreRegion}: area ${sum} != 1`,
+                );
+            }
+        }
+    });
+
+    it('keeps every vertex inside the cell and drops no region below MIN_AREA', () => {
+        const r = cutCellRegions({ corners: [0, 1, 2, 3], edgeCrossings: MID4, centreRegion: 1 });
+        for (const tris of r.byRegion.values()) {
+            for (const tri of tris) {
+                assert.ok(area(tri) > MIN_AREA);
+                for (const p of tri) {
+                    assert.ok(p.x >= -1e-12 && p.x <= 1 + 1e-12);
+                    assert.ok(p.y >= -1e-12 && p.y <= 1 + 1e-12);
+                }
+            }
+        }
+    });
+
+    it('matches cutCell exactly for a non-saddle 2-region split', () => {
+        const bool = cutCell({ corners: [false, false, true, true], edgeCrossings: MID4 });
+        const region = cutCellRegions({ corners: [0, 0, 1, 1], edgeCrossings: MID4, centreRegion: 0 });
+        assert.ok(Math.abs(total(region.byRegion.get(0)!) - total(bool.water)) < 1e-9);
+        assert.ok(Math.abs(total(region.byRegion.get(1)!) - total(bool.land)) < 1e-9);
+    });
+
+    it('matches cutCell exactly for a saddle, for both centre resolutions', () => {
+        for (const [centreIsLand, centreRegion] of [[true, 0], [false, 1]] as const) {
+            const bool = cutCell({ corners: [true, false, true, false], edgeCrossings: MID4, centreIsLand });
+            const region = cutCellRegions({
+                corners: [0, 1, 0, 1], edgeCrossings: MID4, centreRegion,
+            });
+            assert.ok(Math.abs(total(region.byRegion.get(0)!) - total(bool.land)) < 1e-9);
+            assert.ok(Math.abs(total(region.byRegion.get(1)!) - total(bool.water)) < 1e-9);
+        }
+    });
+
+    it('gives a region two disjoint corners its own two separate wedges, not one shared triangle', () => {
+        // corners 0 and 2 are the same id (A) but diagonal, not adjacent; the
+        // centre is a third id (C) touching only corner 3.
+        const r = cutCellRegions({ corners: [0, 1, 0, 2], edgeCrossings: MID4, centreRegion: 2 });
+        assert.equal(r.byRegion.get(0)!.length, 2, 'two disconnected corner-0 and corner-2 wedges');
+        assert.equal(r.byRegion.get(1)!.length, 1);
+        assert.ok(Math.abs(total(r.byRegion.get(0)!) - 0.25) < 1e-9);
+        assert.ok(Math.abs(total(r.byRegion.get(1)!) - 0.125) < 1e-9);
+        assert.ok(Math.abs(total(r.byRegion.get(2)!) - 0.625) < 1e-9, 'the centre region takes the rest');
+    });
+
+    it('falls back to the c0 region when no centre id, or an id absent from every corner, is supplied', () => {
+        const noCentre = cutCellRegions({ corners: [0, 1, 2, 0], edgeCrossings: MID4 });
+        const badCentre = cutCellRegions({ corners: [0, 1, 2, 0], edgeCrossings: MID4, centreRegion: 99 });
+        assert.ok(Math.abs(totalOf(noCentre.byRegion) - 1) < 1e-9);
+        assert.ok(Math.abs(totalOf(badCentre.byRegion) - 1) < 1e-9);
+        for (const r of [noCentre, badCentre]) {
+            assert.ok(r.byRegion.has(0), 'falls back to corner 0\'s id');
+        }
+    });
+
+    it('never puts two ids\' triangles on top of each other', () => {
+        const r = cutCellRegions({ corners: [0, 1, 2, 3], edgeCrossings: MID4, centreRegion: 2 });
+        assert.equal(r.byRegion.size, 4, 'all four ids present with 4 distinct corners');
+    });
+
+    it('suppresses the shore tag on edges marked as not a real shore', () => {
+        // A dual-boundary cell: id 0 is water, ids 1 and 2 are both land
+        // (a landuse edge between them). Only the edges bordering water (0)
+        // are a real shore; the edge between 1 and 2 (edge 1, c1->c2, whose
+        // MID4 crossing lands at grid point (1, 0.5)) is not - only that one
+        // crossing should lose its tag.
+        const r = cutCellRegions({
+            corners: [0, 1, 2, 0], edgeCrossings: MID4, centreRegion: 0,
+            shoreEdges: [true, false, true, true],
+        });
+        const allPts = [...r.byRegion.values()].flat().flat();
+        const at = (x: number, y: number) => allPts.find(p => Math.abs(p.x - x) < 1e-9 && Math.abs(p.y - y) < 1e-9);
+        assert.equal(at(0.5, 0)?.shore, true, 'edge 0 (water/region-1) is a real shore');
+        assert.equal(at(1, 0.5)?.shore, false, 'edge 1 (region-1/region-2) is landuse-only');
+        assert.equal(at(0.5, 1)?.shore, true, 'edge 2 (region-2/water) is a real shore');
     });
 });

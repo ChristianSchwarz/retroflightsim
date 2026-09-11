@@ -15,7 +15,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { decodePdm } from '../../src/script/terrain/demTile';
-import { Watercourse, decodeLvr } from './lvr';
+import { LanduseRegion, Watercourse, decodeLvr } from './lvr';
 import { PLC_FLAG_REAL_IMAGERY, decodePlc } from './plc';
 import { buildTile } from './buildTile';
 import { CoastPolygon, InlandPolygon, LonLatBounds } from './shoreline';
@@ -52,6 +52,8 @@ export interface TileProcessResult {
     inlandTile: boolean;
     inlandBodies: number;
     riverTile: boolean;
+    landuseTile: boolean;
+    landuseRegions: number;
     /** Only set for a tile with real imagery — the rest must not feed the swatch table. */
     landColors?: Uint8Array;
     skirtDepthM: number;
@@ -104,9 +106,12 @@ export function processTile(cfg: MeshTileConfig, task: TileTask): TileProcessRes
     let polygons: CoastPolygon[] | undefined;
     let inland: InlandPolygon[] | undefined;
     let watercourses: Watercourse[] | undefined;
+    let regions: LanduseRegion[] | undefined;
     let inlandTile = false;
     let inlandBodies = 0;
     let riverTile = false;
+    let landuseTile = false;
+    let landuseRegions = 0;
     const lvrPath = `${stem}.lvr`;
     if (fs.existsSync(lvrPath)) {
         const vec = decodeLvr(fs.readFileSync(lvrPath));
@@ -121,6 +126,13 @@ export function processTile(cfg: MeshTileConfig, task: TileTask): TileProcessRes
         if (vec.watercourses.length > 0) {
             watercourses = vec.watercourses;
             riverTile = true;
+        }
+        // Empty below LVR4 - most tiles below LANDUSE_REGION_MIN_ZOOM, and
+        // every tile predating this feature.
+        if (vec.regions.length > 0) {
+            regions = vec.regions;
+            landuseTile = true;
+            landuseRegions = vec.regions.length;
         }
     }
 
@@ -159,6 +171,7 @@ export function processTile(cfg: MeshTileConfig, task: TileTask): TileProcessRes
         pads: cfg.pads,
         cover,
         watercourses,
+        regions,
     });
 
     const outPath = path.join(cfg.out, String(z), String(x), `${y}.ptm`);
@@ -177,6 +190,8 @@ export function processTile(cfg: MeshTileConfig, task: TileTask): TileProcessRes
         inlandTile,
         inlandBodies,
         riverTile,
+        landuseTile,
+        landuseRegions,
         // Only tiles carrying real imagery feed the swatch table. A tile
         // without it is painted in ESA's landcover map colours - a scarlet
         // for built-up, a lemon for grassland - which are legible on a map

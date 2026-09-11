@@ -6,25 +6,33 @@ carries a river to the renderer as a stroke.
 """
 from __future__ import annotations
 
+import os
 import struct
+import tempfile
 import unittest
 import zlib
 
-from shapely.geometry import LineString
+from shapely.geometry import LineString, MultiPolygon, box
 
 from bake_osm_coast import (
+    LANDUSE_REGION_MIN_ZOOM,
     LVR_MAGIC,
     LVR2_MAGIC,
     LVR3_MAGIC,
+    LVR4_MAGIC,
+    REGION_CLASS_NONE,
     WATERWAY_FALLBACK_WIDTH_M,
     Bounds,
     Watercourse,
+    _clip_worker_inline,
     clip_watercourses,
     encode_lvr,
     snap_bounds_to_tiles,
     tile_range_for_bounds,
+    tile_bounds,
     waterway_width_m,
 )
+from osm_landuse import CLS_TREE, build_landuse_index
 
 TILE = Bounds(0.0, 0.0, 1.0, 1.0)
 MAX_ZOOM = 12
@@ -161,6 +169,111 @@ class EncodeLvrTest(unittest.TestCase):
             got = struct.unpack_from('<ff', payload, 16 + i * 8)
             self.assertAlmostEqual(got[0], lon, places=5)
             self.assertAlmostEqual(got[1], lat, places=5)
+
+    def test_a_region_bumps_the_version_to_lvr4(self):
+        region = (True, 1, self.RING[0], [])
+        self.assertEqual(
+            self.magic(encode_lvr([self.RING], [], [], [region])),
+            LVR4_MAGIC)
+
+    def test_lvr4_still_carries_the_inland_and_watercourse_sections_even_when_empty(self):
+        region = (True, 1, self.RING[0], [])
+        payload = zlib.decompress(encode_lvr([self.RING], [], [], [region]))
+        self.assertEqual(payload[:4], LVR4_MAGIC)
+        offset = 4
+        poly_count = struct.unpack_from('<H', payload, offset)[0]
+        self.assertEqual(poly_count, 1)
+        offset += 2
+        offset += 2 + 2 + len(self.RING[0]) * 8  # ring count + vert count + one ring, no holes
+        self.assertEqual(struct.unpack_from('<H', payload, offset)[0], 0, 'inland count')
+        offset += 2
+        self.assertEqual(struct.unpack_from('<H', payload, offset)[0], 0, 'watercourse count')
+        offset += 2
+        self.assertEqual(struct.unpack_from('<H', payload, offset)[0], 1, 'region count')
+
+    def test_a_region_carries_its_land_flag_and_landuse_class(self):
+        land_region = (True, 4, self.RING[0], [])
+        water_region = (False, None, self.RING[0], [])
+        payload = zlib.decompress(encode_lvr([], [], [], [land_region, water_region]))
+        self.assertEqual(payload[:4], LVR4_MAGIC)
+        offset = 4
+        offset += 2  # zero polygons
+        offset += 2  # zero inland
+        offset += 2  # zero watercourses
+        region_count = struct.unpack_from('<H', payload, offset)[0]
+        self.assertEqual(region_count, 2)
+        offset += 2
+        is_land, cls = struct.unpack_from('<BB', payload, offset)
+        self.assertEqual(is_land, 1)
+        self.assertEqual(cls, 4)
+        offset += 2 + 2 + 2 + len(self.RING[0]) * 8  # tag + ring count + vert count + one ring, no holes
+        is_land, cls = struct.unpack_from('<BB', payload, offset)
+        self.assertEqual(is_land, 0)
+        self.assertEqual(cls, REGION_CLASS_NONE)
+
+    def test_no_regions_leaves_the_version_at_whatever_the_other_layers_need(self):
+        self.assertEqual(self.magic(encode_lvr([self.RING])), LVR_MAGIC)
+        self.assertEqual(
+            self.magic(encode_lvr([self.RING], [], [(30.0, [(0.0, 0.0), (1.0, 1.0)])])),
+            LVR3_MAGIC)
+
+
+class ClipWorkerLanduseTest(unittest.TestCase):
+    """`_clip_worker_inline` end to end, with real land + landuse geometry.
+
+    Exercises the wiring `encode_regions_for_tile` sits behind - the part
+    the isolated `assemble_tile_regions`/`encode_lvr` unit tests above don't
+    reach - by actually writing a `.lvr` file and reading the bytes back.
+    """
+    Z = LANDUSE_REGION_MIN_ZOOM
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.b = tile_bounds(self.Z, 100, 100)
+        self.land = MultiPolygon([box(self.b.west, self.b.south, self.b.east, self.b.north)])
+        # A forest covering the western half of the tile.
+        mid = (self.b.west + self.b.east) / 2
+        self.forest = box(self.b.west, self.b.south, mid, self.b.north)
+        self.landuse_polys = [self.forest]
+        self.landuse_classes = [CLS_TREE]
+        self.landuse_tree = build_landuse_index(self.landuse_polys)
+
+    def _lvr_path(self, z: int, x: int, y: int) -> str:
+        return os.path.join(self.tmp, str(z), str(x), f'{y}.lvr')
+
+    def test_writes_an_lvr4_tile_with_a_real_landuse_region_at_or_above_the_min_zoom(self):
+        grid = bytearray(9 * 9)  # a tiny mask grid; its content doesn't matter here
+        _clip_worker_inline(
+            self.tmp, 9, self.land, (), (), self.Z, 100, 100, grid, 0.0, 0.0,
+            self.landuse_tree, self.landuse_polys, self.landuse_classes,
+        )
+        with open(self._lvr_path(self.Z, 100, 100), 'rb') as fh:
+            payload = zlib.decompress(fh.read())
+        self.assertEqual(payload[:4], LVR4_MAGIC)
+        offset = 4
+        poly_count = struct.unpack_from('<H', payload, offset)[0]
+        self.assertEqual(poly_count, 1, 'the plain land polygon is still written')
+
+    def test_leaves_a_tile_below_the_min_zoom_without_a_regions_layer(self):
+        below = self.Z - 1
+        bx, by = 50, 50
+        b = tile_bounds(below, bx, by)
+        land = MultiPolygon([box(b.west, b.south, b.east, b.north)])
+        grid = bytearray(9 * 9)
+        _clip_worker_inline(
+            self.tmp, 9, land, (), (), below, bx, by, grid, 0.0, 0.0,
+            self.landuse_tree, self.landuse_polys, self.landuse_classes,
+        )
+        with open(self._lvr_path(below, bx, by), 'rb') as fh:
+            payload = zlib.decompress(fh.read())
+        self.assertEqual(payload[:4], LVR_MAGIC, 'below the min zoom, no regions layer is added')
+
+    def test_omitting_osm_landuse_never_touches_the_regions_layer(self):
+        grid = bytearray(9 * 9)
+        _clip_worker_inline(self.tmp, 9, self.land, (), (), self.Z, 100, 100, grid, 0.0, 0.0)
+        with open(self._lvr_path(self.Z, 100, 100), 'rb') as fh:
+            payload = zlib.decompress(fh.read())
+        self.assertEqual(payload[:4], LVR_MAGIC)
 
 
 if __name__ == '__main__':

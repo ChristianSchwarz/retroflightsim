@@ -57,11 +57,11 @@ import sys
 import time
 import warnings
 import zlib
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from cover_patches import enlarge_patches, halo_nodes
+from cover_patches import FIXED_CLASSES, _box_sums, enlarge_patches, halo_nodes
 
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='rasterio')
 
@@ -74,6 +74,24 @@ except ImportError:  # pragma: no cover - dependency hint
     print('error: rasterio is required (pip install rasterio numpy)', file=sys.stderr)
     raise
 
+if TYPE_CHECKING:
+    from shapely.geometry import Polygon
+    from shapely.strtree import STRtree
+
+# Optional: only needed for --osm-landuse. This file otherwise depends on
+# rasterio/numpy alone (see _metres_per_degree's docstring below), so the
+# import is guarded rather than unconditional - a bake that never passes
+# --osm-landuse never needs shapely installed. Same shape as HAS_RASTERIO in
+# bake_osm_coast.py.
+try:
+    from osm_landuse import (
+        assemble_landuse_polygons, build_landuse_index,
+        overpass_landuse_query, stamp_landuse_classes,
+    )
+    HAS_OSM_LANDUSE = True
+except ImportError:
+    HAS_OSM_LANDUSE = False
+
 PLC_MAGIC = b'PLC1'
 PLC_VERSION = 1
 PLC_HEADER_BYTES = 16
@@ -81,6 +99,13 @@ PLC_FLAG_REAL_IMAGERY = 1 << 0
 
 DEFAULT_SRC = 'assets/planet'
 DEFAULT_SOURCES = 'data/cover/sources.json'
+
+# Window radius, in child nodes, majority_decimate votes over around each
+# decimated position when building an ancestor tile - "itself plus immediate
+# neighbours", not a wider smooth. A window this small still turns a single
+# noisy outlier node into the real local majority without eating into a
+# genuinely small class region the way a wider one could.
+ANCESTOR_VOTE_RADIUS = 1
 
 # Every tile reads its own window of the same landcover/imagery rasters and
 # writes its own .plc - independent of every other tile, so this is the same
@@ -346,6 +371,103 @@ def encode_plc(size: int, flags: int, classes: np.ndarray, colors: np.ndarray) -
     return zlib.compress(header + classes.tobytes() + colors.tobytes(), 6)
 
 
+def decode_plc(path: str) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Inverse of `encode_plc`. Returns (classes, colors, flags).
+
+    `flags` matters as much as the arrays here: it carries
+    PLC_FLAG_REAL_IMAGERY, and an ancestor built from this tile as a child
+    needs to OR that bit forward, or every ancestor silently loses track of
+    which of its descendants actually had real imagery.
+    """
+    with open(path, 'rb') as fh:
+        payload = zlib.decompress(fh.read())
+    magic, _version, flags, size, _pad0, _pad1 = struct.unpack_from('<4sBBHII', payload, 0)
+    if magic != PLC_MAGIC:
+        raise ValueError(f'{path}: not a {PLC_MAGIC.decode()} tile')
+    n = size * size
+    classes = np.frombuffer(payload, dtype=np.uint8, count=n, offset=PLC_HEADER_BYTES).reshape(size, size)
+    colors = np.frombuffer(
+        payload, dtype=np.uint8, count=n * 3, offset=PLC_HEADER_BYTES + n,
+    ).reshape(size, size, 3)
+    return classes, colors, flags
+
+
+def majority_decimate(child: np.ndarray, r: int, fixed=FIXED_CLASSES) -> np.ndarray:
+    """Vote-then-decimate: the majority class in a window around each even
+    node, then point-decimated at the same (0::2, 0::2) stride
+    bake_planet_dem.py's build_parent() and bake_osm_coast.py's
+    build_parent_mask() already use for height and land/water.
+
+    Not the same as subsample-then-vote (which would silently narrow the
+    neighbourhood to whatever survived the stride first) and not a 2x2
+    block-reshape (adjacent output nodes' windows overlap - a radius-1 window
+    around output node (1,2) and one around (1,3) share child column 5 -  so
+    non-overlapping block reduction answers a different question). Reuses
+    cover_patches.py's own vote/tie-break convention (FIXED_CLASSES never
+    vote and are never reassigned, ties go to the lowest class id) rather
+    than inventing a second one - this is that same convention, run once
+    over the whole child array via `_box_sums`, then subsampled.
+
+    Windows never cross into a sibling child's array - only `child` itself is
+    read - so a shared quadrant edge between two ancestors can occasionally
+    disagree on a marginal tie. That is the same order of risk DEM/coastline
+    already accept from silently double-writing a shared edge; not worth
+    engineering around for an occasional single-node flicker.
+    """
+    if r < 1:
+        return child[0::2, 0::2]
+    held = np.isin(child, fixed)
+    votes = None
+    winner = None
+    for value in np.unique(child):
+        if value in fixed:
+            continue
+        count = _box_sums(child == value, r)
+        if votes is None:
+            votes = count
+            winner = np.full(child.shape, value, dtype=child.dtype)
+        else:
+            better = count > votes
+            votes = np.where(better, count, votes)
+            winner = np.where(better, value, winner)
+    result = child if votes is None else np.where(held | (votes == 0), child, winner).astype(child.dtype)
+    return result[0::2, 0::2]
+
+
+def build_parent_cover(
+    children: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray, int]],
+    size: int, r: int,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Combine up to four child (classes, colors, flags) tiles into one
+    parent, the cover-bake analogue of build_parent/build_parent_mask.
+
+    Classes vote (majority_decimate); colours point-decimate, deliberately
+    not vote - a windowed mean would average two DISJOINT pixel sets at every
+    shared quadrant edge (quadrant A's neighbours vs quadrant B's), producing
+    a small but near-guaranteed colour seam wherever there's a gradient
+    nearby. Point decimation keeps the same "both quadrants provably agree at
+    the shared node" property DEM/coastline already rely on for height and
+    land/water.
+
+    A missing quadrant - the routine case for any coastal tile, since
+    ocean-only leaf tiles never get a .pdm/.plc at all - is simply never
+    written, left at the CLS_UNKNOWN/zero default. This mirrors
+    build_parent's flat sea_level fill for the same situation; it is not an
+    error case to guard against.
+    """
+    half = (size - 1) // 2
+    classes = np.full((size, size), CLS_UNKNOWN, dtype=np.uint8)
+    colors = np.zeros((size, size, 3), dtype=np.uint8)
+    flags = 0
+    for (qx, qy), (child_classes, child_colors, child_flags) in children.items():
+        y0, y1 = qy * half, qy * half + half + 1
+        x0, x1 = qx * half, qx * half + half + 1
+        classes[y0:y1, x0:x1] = majority_decimate(child_classes, r)
+        colors[y0:y1, x0:x1] = child_colors[0::2, 0::2, :]
+        flags |= child_flags & PLC_FLAG_REAL_IMAGERY
+    return classes, colors, flags
+
+
 def bake_tile(
     z: int, x: int, y: int,
     src_dir: str,
@@ -356,10 +478,13 @@ def bake_tile(
     color_lut: np.ndarray,
     patch_m: float,
     pads: Sequence[dict],
-) -> Optional[Tuple[int, bool, int]]:
+    osm_tree: Optional['STRtree'] = None,
+    osm_polys: Sequence['Polygon'] = (),
+    osm_classes: Sequence[int] = (),
+) -> Optional[Tuple[int, bool, int, int]]:
     """Bakes and writes one tile's .plc. Returns (bytes written, has real
-    imagery, nodes repainted as airfield pavement), or None if this tile has
-    no .pdm to bake against.
+    imagery, nodes repainted as airfield pavement, nodes repainted from OSM
+    landuse polygons), or None if this tile has no .pdm to bake against.
 
     Factored out of `bake()` so a multiprocessing worker can call it too, one
     tile per call - the same split `sample_leaf_level_parallel` in
@@ -401,6 +526,9 @@ def bake_tile(
     # The crop leaves a view into the padded array; the encoder needs the
     # bytes contiguous.
     classes = np.ascontiguousarray(classes)
+    osm_nodes = 0
+    if osm_tree is not None:
+        osm_nodes = stamp_landuse_classes(classes, bounds, size, osm_tree, osm_polys, osm_classes)
     paved_nodes = stamp_airfield_classes(classes, bounds, size, pads)
 
     # Colour. Average, because this one really is a continuous quantity.
@@ -429,7 +557,7 @@ def bake_tile(
     blob = encode_plc(size, flags, classes, colors)
     with open(out_path, 'wb') as fh:
         fh.write(blob)
-    return len(blob), bool(covered.any()), paved_nodes
+    return len(blob), bool(covered.any()), paved_nodes, osm_nodes
 
 
 # Per-worker state for cover_level_parallel, set once by _init_cover_worker.
@@ -445,15 +573,25 @@ _cover_class_lut: Optional[np.ndarray] = None
 _cover_color_lut: Optional[np.ndarray] = None
 _cover_patch_m = 0.0
 _cover_pads: Sequence[dict] = ()
+# Shapely structures, not file paths - unlike the raster Sources above,
+# these have no open OS handle to survive being pickled across the spawn
+# boundary, so they ship straight through initargs (the same thing
+# bake_osm_coast.py's own worker pool does with its land/inland/courses
+# geometries).
+_cover_osm_tree: Optional['STRtree'] = None
+_cover_osm_polys: Sequence['Polygon'] = ()
+_cover_osm_classes: Sequence[int] = ()
 
 
 def _init_cover_worker(
     src_dir: str, out_root: str,
     landcover_paths: Sequence[str], imagery_paths: Sequence[str],
     patch_m: float, pads: Sequence[dict],
+    osm_tree: Optional['STRtree'], osm_polys: Sequence['Polygon'], osm_classes: Sequence[int],
 ) -> None:
     global _cover_src_dir, _cover_out_root, _cover_landcover, _cover_imagery
     global _cover_class_lut, _cover_color_lut, _cover_patch_m, _cover_pads
+    global _cover_osm_tree, _cover_osm_polys, _cover_osm_classes
 
     def vsicurl(p: str) -> str:
         return f'/vsicurl/{p}' if p.startswith('http') else p
@@ -466,15 +604,19 @@ def _init_cover_worker(
     _cover_color_lut = build_color_lut()
     _cover_patch_m = patch_m
     _cover_pads = pads
+    _cover_osm_tree = osm_tree
+    _cover_osm_polys = osm_polys
+    _cover_osm_classes = osm_classes
 
 
-def _cover_worker(zxy: Tuple[int, int, int]) -> Optional[Tuple[int, bool, int]]:
+def _cover_worker(zxy: Tuple[int, int, int]) -> Optional[Tuple[int, bool, int, int]]:
     z, x, y = zxy
     assert _cover_class_lut is not None and _cover_color_lut is not None
     return bake_tile(
         z, x, y, _cover_src_dir, _cover_out_root,
         _cover_landcover, _cover_imagery,
         _cover_class_lut, _cover_color_lut, _cover_patch_m, _cover_pads,
+        _cover_osm_tree, _cover_osm_polys, _cover_osm_classes,
     )
 
 
@@ -491,23 +633,28 @@ def bake_tiles(
     patch_m: float,
     pads: Sequence[dict],
     jobs: int,
-) -> Tuple[int, int, int, int]:
+    osm_tree: Optional['STRtree'] = None,
+    osm_polys: Sequence['Polygon'] = (),
+    osm_classes: Sequence[int] = (),
+) -> Tuple[int, int, int, int, int]:
     """Bakes every tile, across `jobs` worker processes. Returns
-    (written, with_imagery, paved_nodes, total_bytes)."""
+    (written, with_imagery, paved_nodes, osm_nodes, total_bytes)."""
     written = 0
     with_imagery = 0
     paved_nodes = 0
+    osm_nodes = 0
     total_bytes = 0
     total = len(tiles)
 
-    def accept(result: Optional[Tuple[int, bool, int]]) -> None:
-        nonlocal written, with_imagery, paved_nodes, total_bytes
+    def accept(result: Optional[Tuple[int, bool, int, int]]) -> None:
+        nonlocal written, with_imagery, paved_nodes, osm_nodes, total_bytes
         if result is None:
             return
-        blob_len, has_imagery, paved = result
+        blob_len, has_imagery, paved, osm = result
         written += 1
         total_bytes += blob_len
         paved_nodes += paved
+        osm_nodes += osm
         if has_imagery:
             with_imagery += 1
 
@@ -523,21 +670,23 @@ def bake_tiles(
             accept(bake_tile(
                 z, x, y, src_dir, out_root, landcover, imagery,
                 class_lut, color_lut, patch_m, pads,
+                osm_tree, osm_polys, osm_classes,
             ))
             report(i + 1)
         sys.stdout.write('\n')
-        return written, with_imagery, paved_nodes, total_bytes
+        return written, with_imagery, paved_nodes, osm_nodes, total_bytes
 
     ctx = mp.get_context('spawn')
     with ctx.Pool(
         jobs, initializer=_init_cover_worker,
-        initargs=(src_dir, out_root, landcover_paths, imagery_paths, patch_m, pads),
+        initargs=(src_dir, out_root, landcover_paths, imagery_paths, patch_m, pads,
+                  osm_tree, osm_polys, osm_classes),
     ) as pool:
         for i, result in enumerate(pool.imap_unordered(_cover_worker, tiles, chunksize=8)):
             accept(result)
             report(i + 1)
     sys.stdout.write('\n')
-    return written, with_imagery, paved_nodes, total_bytes
+    return written, with_imagery, paved_nodes, osm_nodes, total_bytes
 
 
 def glue_negative_bbox(argv: Sequence[str]) -> List[str]:
@@ -569,6 +718,20 @@ def tile_overlaps(z: int, x: int, y: int, bbox: Tuple[float, float, float, float
     west, south, east, north = tile_bounds(z, x, y)
     bw, bs, be, bn = bbox
     return not (east <= bw or west >= be or north <= bs or south >= bn)
+
+
+def union_bounds(tiles: Sequence[Tuple[int, int, int]]) -> Tuple[float, float, float, float]:
+    """West/south/east/north spanning every tile, for the OSM landuse fetch.
+
+    Only meant for a same-zoom tile list (e.g. from ``--only``): ``tiles``
+    scoped by ``--bbox`` still holds every zoom from 0 up to ``--max-zoom``
+    that overlaps it, and a z0/z1 tile spans nearly a whole hemisphere, so
+    unioning across zooms would blow the fetch back out to roughly the
+    original --bbox's own scope was trying to avoid. Callers with a real
+    ``--bbox`` should use ``parse_bbox()`` directly instead of this.
+    """
+    wests, souths, easts, norths = zip(*(tile_bounds(z, x, y) for z, x, y in tiles))
+    return min(wests), min(souths), max(easts), max(norths)
 
 
 def walk_tiles(src: str, max_zoom: int) -> List[Tuple[int, int, int]]:
@@ -607,6 +770,11 @@ def main() -> None:
                                    'overlapping it (default: every tile in the pyramid)')
     ap.add_argument('--jobs', type=int, default=DEFAULT_JOBS,
                     help=f'tiles baked concurrently (default {DEFAULT_JOBS})')
+    ap.add_argument('--osm-landuse', action='store_true',
+                    help='paint OSM natural/landuse polygons over the raster class grid '
+                         '(opt-in; requires shapely and either --bbox or --only)')
+    ap.add_argument('--refresh-osm', action='store_true',
+                    help='bypass the Overpass cache for --osm-landuse')
     args = ap.parse_args(glue_negative_bbox(sys.argv[1:]))
 
     manifest_path = os.path.join(args.src, 'manifest.json')
@@ -674,14 +842,87 @@ def main() -> None:
     if pads:
         print(f'airfields: {len(pads)} platform rectangles painted as built ground')
 
+    osm_tree = None
+    osm_polys: List = []
+    osm_classes: List[int] = []
+    if args.osm_landuse:
+        if not HAS_OSM_LANDUSE:
+            print('error: --osm-landuse requires shapely (pip install shapely)', file=sys.stderr)
+            sys.exit(1)
+        if not args.bbox and not args.only:
+            print('error: --osm-landuse requires --bbox or --only (refusing a planet-wide '
+                  'Overpass fetch on a bare full-pyramid run)', file=sys.stderr)
+            sys.exit(1)
+        # Prefer the bbox the caller actually asked for. `tiles` (from
+        # --bbox) spans every zoom 0..max-zoom that overlaps it, and a
+        # z0/z1 tile is nearly a whole hemisphere wide - union_bounds() over
+        # that would blow the fetch back out past the point of scoping it.
+        # --only has no such mixture (it's whatever specific tiles were
+        # named), so union_bounds() over exactly those is correct there.
+        fetch_bbox = parse_bbox(args.bbox) if args.bbox else union_bounds(tiles)
+        print(f'fetching OSM landuse for {len(tiles)} tiles...')
+        data = overpass_landuse_query(fetch_bbox, args.refresh_osm)
+        osm_polys, osm_classes = assemble_landuse_polygons(data)
+        print(f'  {len(osm_polys)} landuse polygons assembled')
+        if osm_polys:
+            osm_tree = build_landuse_index(osm_polys)
+
+    # Named tiles make no promise their neighbours/children exist or were
+    # just baked this run - the wrong shape for a parent/child dependency
+    # chain, so --only keeps the old direct-raw-resample behaviour for every
+    # tile it names, unconditionally.
+    by_zoom: Dict[int, List[Tuple[int, int, int]]] = {}
+    for t in tiles:
+        by_zoom.setdefault(t[0], []).append(t)
+    finest = tiles if args.only else by_zoom.get(max_zoom, [])
+
     t0 = time.time()
-    written, with_imagery, paved_nodes, total_bytes = bake_tiles(
-        tiles, args.src, out_root, landcover, imagery,
+    written, with_imagery, paved_nodes, osm_nodes, total_bytes = bake_tiles(
+        finest, args.src, out_root, landcover, imagery,
         landcover_paths, imagery_paths, class_lut, color_lut, args.patch_m, pads, jobs,
+        osm_tree, osm_polys, osm_classes,
     )
 
     for s in landcover + imagery:
         s.close()
+
+    if not args.only:
+        # Every level above the finest is built by decimating its own four
+        # children, never by independently resampling the raw sources again
+        # - the cover-bake analogue of bake_planet_dem.py's build_parent()
+        # and bake_osm_coast.py's build_parent_mask(). Single-threaded, one
+        # level at a time: each parent needs all four (up to four - see
+        # build_parent_cover) children gathered first, and the per-tile cost
+        # here is small next to a raw-source resample.
+        ancestor_levels = sorted((z for z in by_zoom if z < max_zoom), reverse=True)
+        if ancestor_levels:
+            print(f'building {sum(len(by_zoom[z]) for z in ancestor_levels)} '
+                  f'ancestor tiles from their children...')
+        for z in ancestor_levels:
+            for (pz, px, py) in by_zoom[z]:
+                children: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray, int]] = {}
+                for qx in (0, 1):
+                    for qy in (0, 1):
+                        child_path = os.path.join(
+                            out_root, str(pz + 1), str(px * 2 + qx), f'{py * 2 + qy}.plc')
+                        if os.path.exists(child_path):
+                            children[(qx, qy)] = decode_plc(child_path)
+                if not children:
+                    # Every quadrant is itself ocean-only or otherwise never
+                    # baked - nothing to derive this ancestor from.
+                    continue
+                pdm_path = os.path.join(args.src, str(pz), str(px), f'{py}.pdm')
+                size = pdm_size(pdm_path)
+                classes, colors, flags = build_parent_cover(children, size, ANCESTOR_VOTE_RADIUS)
+                out_dir = os.path.join(out_root, str(pz), str(px))
+                os.makedirs(out_dir, exist_ok=True)
+                blob = encode_plc(size, flags, classes, colors)
+                with open(os.path.join(out_dir, f'{py}.plc'), 'wb') as fh:
+                    fh.write(blob)
+                written += 1
+                total_bytes += len(blob)
+                if flags & PLC_FLAG_REAL_IMAGERY:
+                    with_imagery += 1
 
     secs = time.time() - t0
     print(f'wrote {written} cover tiles, {total_bytes / 1048576:.1f} MB in {secs:.1f}s')
@@ -689,6 +930,8 @@ def main() -> None:
           f'the rest fall back to class colours')
     if paved_nodes:
         print(f'  {paved_nodes} nodes repainted as airfield pavement')
+    if osm_nodes:
+        print(f'  {osm_nodes} nodes repainted from OSM landuse polygons')
     print('next: npm run bake:mesh')
 
 

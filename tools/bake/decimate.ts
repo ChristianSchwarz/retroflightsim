@@ -3,40 +3,65 @@
  *
  * A tile arrives as `size x size` height nodes (so `size - 1` cells per side).
  * We build a quadtree over the cells and merge a block into a single leaf while
- * two conditions hold:
+ * four conditions hold:
  *
  *   1. the block's heights stay within `maxErrorM` of the bilinear surface
  *      through its four corners,
- *   2. the block does not straddle the shoreline, and
+ *   2. the block does not straddle a region boundary - the shoreline, a real
+ *      landuse edge, or both at once, wherever they cross the same cell,
  *   3. the same holds of the *padded* heights, against a tolerance the
- *      triangle budget is not allowed to relax - see `padHeights`.
+ *      triangle budget is not allowed to relax - see `padHeights`, and
+ *   4. the block does not straddle a landcover-class boundary, when one is
+ *      given - see `coverClasses`.
  *
- * Condition 2 is what keeps the coast crisp: any block containing a land/water
- * transition is refused, so shoreline blocks always bottom out at `minLeafSize`
- * and get handed to the marching-squares cutter at that scale.
+ * Condition 2 is what keeps every boundary crisp: any block containing a
+ * region transition is refused, so a boundary block always bottoms out at
+ * `minLeafSize` and gets handed to the marching-squares cutter at that scale
+ * - `cutCell` for the ordinary two-region case, `cutCellRegions` wherever
+ * three or four regions meet in one cell (a landuse edge crossing the coast,
+ * for instance). Condition 4 is a coarser-grained backstop for a boundary
+ * that exists only in the raster `.plc` cover and was never resolved into
+ * real region geometry: refusing the merge is enough there; nothing needs to
+ * know *where* through the block that boundary runs, since it never feeds
+ * `Leaf.uniform` and is never handed to either cutter.
  *
  * The tree is then *balanced* so neighbouring leaves differ by at most one
  * level. That bounds T-junctions to a single midpoint per edge, which the
  * triangulation absorbs by fanning the leaf from its centre through a ring that
  * includes the midpoint wherever the neighbour is finer. Nothing is finer than
- * `minLeafSize`, so a shoreline leaf never needs a midpoint of its own and the
+ * `minLeafSize`, so a boundary leaf never needs a midpoint of its own and the
  * cutter's output can be used verbatim.
  *
  * Everything here works in grid coordinates: x east, y south, matching the
  * row-major DEM layout with v=0 at the north edge.
  */
 
-import { Vec2, cutCell } from './marchingSquares';
+import { Vec2, cutCell, cutCellRegions } from './marchingSquares';
 
 export interface DecimateInput {
     /** Node count per side; cells per side is `size - 1`. */
     size: number;
     /** Row-major heights, `size * size`. */
     heights: Float32Array;
-    /** Row-major land flags per *node*, `size * size`. 1 = land. */
-    landNodes: Uint8Array;
+    /**
+     * Row-major region index per *node*, `size * size`. A region is the
+     * finest thing this file distinguishes geometrically: land vs water on a
+     * tile with no landuse data, or one of several combined land/landuse
+     * pieces on a tile that has it. Two different ids always means two
+     * different regions; nothing here needs to know what they mean.
+     */
+    regionNodes: Uint16Array;
     /** Vertical tolerance (m) for merging a block. */
     maxErrorM: number;
+    /**
+     * Row-major TerrainClass per *node*, `size * size` — the same `.plc`
+     * cover raster `classify()` samples later, one node per DEM node, no
+     * finer. Omit for a tile with no cover data (or none baked yet): every
+     * block is then free to merge purely on height/region terms, exactly
+     * today's behaviour. Given, a block also refuses to merge while it spans
+     * more than one class - see condition 4 above.
+     */
+    coverClasses?: Uint8Array;
     /**
      * The same heights with the flatten pads applied — the surface the tile
      * will actually be drawn at. Omit where no pad reaches the tile.
@@ -59,25 +84,40 @@ export interface DecimateInput {
     /** Tolerance (m) for {@link padHeights}. Never coarsened by the budget. */
     padErrorM?: number;
     /**
-     * Finest leaf, in cells. Raising it coarsens the shoreline as well as the
-     * interior, which is the lever the triangle budget turns.
+     * Finest leaf, in cells. Raising it coarsens every region boundary as
+     * well as the interior, which is the lever the triangle budget turns.
      */
     minLeafSize?: number;
     /** Largest leaf, in cells. Caps how flat a region may be drawn. */
     maxLeafSize?: number;
     /**
      * Crossing parameter along the cell edge from node `a` to node `b`, in
-     * [0, 1]. Supplied by the shoreline geometry; defaults to the midpoint.
+     * [0, 1]. Supplied by the region geometry; defaults to the midpoint.
      */
     edgeCrossing?: (ax: number, ay: number, bx: number, by: number) => number | undefined;
-    /** True when the centre of a saddle block is land. Defaults to corner c0. */
-    centreIsLand?: (x: number, y: number, size: number) => boolean;
+    /**
+     * Region id at an arbitrary interior point, in grid coordinates. Only
+     * consulted for a genuinely ambiguous cell - the two-region saddle case,
+     * or any cell with three or four regions on it - where the corners alone
+     * do not settle which region owns the centre. Defaults to the first
+     * corner's region otherwise, same as `cutCell`/`cutCellRegions`.
+     */
+    regionAt?: (x: number, y: number) => number;
+    /**
+     * Which regions are land, for deciding which cut vertices are a genuine
+     * shore - worth a wall down to the water surface downstream - as opposed
+     * to a landuse-only edge between two regions on the same side of it, land
+     * or water alike. Omit and every cut vertex is treated as a shore, which
+     * is exactly correct for a tile with no landuse regions at all: every
+     * `regionNodes` transition there really is land meeting water.
+     */
+    isLandRegion?: (regionId: number) => boolean;
 }
 
 export interface GridTriangle {
-    /** Grid-space corners; may be fractional where the shoreline cuts a cell. */
+    /** Grid-space corners; may be fractional where a region boundary cuts a cell. */
     pts: [Vec2, Vec2, Vec2];
-    land: boolean;
+    regionId: number;
 }
 
 export interface DecimateResult {
@@ -92,7 +132,7 @@ interface Leaf {
     y: number;
     size: number;
     uniform: boolean;
-    land: boolean;
+    regionId: number;
 }
 
 function isPow2(n: number): boolean {
@@ -100,7 +140,7 @@ function isPow2(n: number): boolean {
 }
 
 export function decimate(input: DecimateInput): DecimateResult {
-    const { size, heights, landNodes, maxErrorM } = input;
+    const { size, heights, regionNodes, coverClasses, maxErrorM } = input;
     const cells = size - 1;
     if (!isPow2(cells)) {
         throw new Error(`decimate: ${size} nodes gives ${cells} cells, which is not a power of two`);
@@ -111,14 +151,40 @@ export function decimate(input: DecimateInput): DecimateResult {
         throw new Error('decimate: minLeafSize and maxLeafSize must be powers of two');
     }
 
-    const isLand = (x: number, y: number) => landNodes[y * size + x] !== 0;
+    const regionIdAt = (x: number, y: number) => regionNodes[y * size + x];
 
-    /** True when every node of the block shares one class. */
+    /** True when every node of the block shares one region. */
     const blockUniform = (bx: number, by: number, s: number): boolean => {
-        const first = isLand(bx, by);
+        const first = regionIdAt(bx, by);
         for (let y = by; y <= by + s; y++) {
             for (let x = bx; x <= bx + s; x++) {
-                if (isLand(x, y) !== first) {
+                if (regionIdAt(x, y) !== first) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    /**
+     * True when every node of the block shares one landcover class, or no
+     * cover data was given at all.
+     *
+     * Deliberately separate from `blockUniform` above rather than folded into
+     * it: that flag also decides whether a leaf is triangulated as a plain
+     * fan or handed to a marching-squares cutter, which knows only region
+     * ids, not cover classes. A cover-class difference must never be mistaken
+     * for a region boundary - it only ever blocks a merge, here, never
+     * anything downstream.
+     */
+    const coverUniform = (bx: number, by: number, s: number): boolean => {
+        if (!coverClasses) {
+            return true;
+        }
+        const first = coverClasses[by * size + bx];
+        for (let y = by; y <= by + s; y++) {
+            for (let x = bx; x <= bx + s; x++) {
+                if (coverClasses[y * size + x] !== first) {
                     return false;
                 }
             }
@@ -164,13 +230,13 @@ export function decimate(input: DecimateInput): DecimateResult {
     const subdivide = (bx: number, by: number, s: number): void => {
         if (s <= minLeafSize) {
             const uniform = blockUniform(bx, by, s);
-            leaves.push({ x: bx, y: by, size: s, uniform, land: uniform && isLand(bx, by) });
+            leaves.push({ x: bx, y: by, size: s, uniform, regionId: uniform ? regionIdAt(bx, by) : 0 });
             return;
         }
         const uniform = blockUniform(bx, by, s);
         if (uniform && s <= maxLeafSize && blockError(heights, bx, by, s) <= maxErrorM
-            && padFits(bx, by, s)) {
-            leaves.push({ x: bx, y: by, size: s, uniform: true, land: isLand(bx, by) });
+            && padFits(bx, by, s) && coverUniform(bx, by, s)) {
+            leaves.push({ x: bx, y: by, size: s, uniform: true, regionId: regionIdAt(bx, by) });
             return;
         }
         const half = s / 2;
@@ -235,14 +301,14 @@ export function decimate(input: DecimateInput): DecimateResult {
             // Split this leaf into four and re-paint.
             const half = l.size / 2;
             const kids: Leaf[] = [
-                { x: l.x, y: l.y, size: half, uniform: false, land: false },
-                { x: l.x + half, y: l.y, size: half, uniform: false, land: false },
-                { x: l.x, y: l.y + half, size: half, uniform: false, land: false },
-                { x: l.x + half, y: l.y + half, size: half, uniform: false, land: false },
+                { x: l.x, y: l.y, size: half, uniform: false, regionId: 0 },
+                { x: l.x + half, y: l.y, size: half, uniform: false, regionId: 0 },
+                { x: l.x, y: l.y + half, size: half, uniform: false, regionId: 0 },
+                { x: l.x + half, y: l.y + half, size: half, uniform: false, regionId: 0 },
             ];
             for (const k of kids) {
                 k.uniform = blockUniform(k.x, k.y, k.size);
-                k.land = k.uniform && isLand(k.x, k.y);
+                k.regionId = k.uniform ? regionIdAt(k.x, k.y) : 0;
             }
             leaves[i] = kids[0];
             paint(i);
@@ -272,13 +338,13 @@ export function decimate(input: DecimateInput): DecimateResult {
     for (const l of leaves) {
         if (!l.uniform) {
             shorelineLeafCount++;
-            // Shoreline leaf: cut it with marching squares. Nothing is finer
+            // Boundary leaf: cut it with marching squares. Nothing is finer
             // than minLeafSize, so no T-junction midpoint can be required here.
-            const c: [boolean, boolean, boolean, boolean] = [
-                isLand(l.x, l.y),
-                isLand(l.x + l.size, l.y),
-                isLand(l.x + l.size, l.y + l.size),
-                isLand(l.x, l.y + l.size),
+            const c: [number, number, number, number] = [
+                regionIdAt(l.x, l.y),
+                regionIdAt(l.x + l.size, l.y),
+                regionIdAt(l.x + l.size, l.y + l.size),
+                regionIdAt(l.x, l.y + l.size),
             ];
             const nodes: Vec2[] = [
                 { x: l.x, y: l.y },
@@ -287,18 +353,15 @@ export function decimate(input: DecimateInput): DecimateResult {
                 { x: l.x, y: l.y + l.size },
             ];
             const crossings: (number | undefined)[] = [];
+            const shoreEdges: boolean[] = [];
             for (let e = 0; e < 4; e++) {
                 const a = nodes[e];
                 const b = nodes[(e + 1) % 4];
-                crossings.push(c[e] === c[(e + 1) % 4] ? undefined : edgeCrossing(a.x, a.y, b.x, b.y));
+                const idA = c[e];
+                const idB = c[(e + 1) % 4];
+                crossings.push(idA === idB ? undefined : edgeCrossing(a.x, a.y, b.x, b.y));
+                shoreEdges.push(input.isLandRegion ? input.isLandRegion(idA) !== input.isLandRegion(idB) : true);
             }
-            const cut = cutCell({
-                corners: c,
-                edgeCrossings: crossings,
-                centreIsLand: input.centreIsLand
-                    ? input.centreIsLand(l.x, l.y, l.size)
-                    : undefined,
-            });
             // Carry the shoreline tag through: the projection needs to know
             // which vertices land and water share.
             const lift = (p: Vec2): Vec2 => ({
@@ -306,11 +369,40 @@ export function decimate(input: DecimateInput): DecimateResult {
                 y: l.y + p.y * l.size,
                 shore: p.shore,
             });
-            for (const t of cut.land) {
-                triangles.push({ pts: [lift(t[0]), lift(t[1]), lift(t[2])], land: true });
-            }
-            for (const t of cut.water) {
-                triangles.push({ pts: [lift(t[0]), lift(t[1]), lift(t[2])], land: false });
+
+            const distinctIds = new Set(c);
+            if (distinctIds.size <= 2) {
+                // The ordinary case, including the plain shoreline-only path
+                // every existing tile still takes: at most two regions on
+                // this cell, so the well-tested boolean cutter handles it
+                // exactly as it always has.
+                const idA = c[0];
+                const boolCorners: [boolean, boolean, boolean, boolean] = [
+                    c[0] === idA, c[1] === idA, c[2] === idA, c[3] === idA,
+                ];
+                const cx = l.x + l.size / 2;
+                const cy = l.y + l.size / 2;
+                const centreIsLand = input.regionAt ? input.regionAt(cx, cy) === idA : undefined;
+                const cut = cutCell({ corners: boolCorners, edgeCrossings: crossings, centreIsLand, shoreEdges });
+                const idB = c.find(id => id !== idA) ?? idA;
+                for (const t of cut.land) {
+                    triangles.push({ pts: [lift(t[0]), lift(t[1]), lift(t[2])], regionId: idA });
+                }
+                for (const t of cut.water) {
+                    triangles.push({ pts: [lift(t[0]), lift(t[1]), lift(t[2])], regionId: idB });
+                }
+            } else {
+                // Three or four regions on one cell - a real landuse edge
+                // crossing the coast, or two landuse edges meeting at once.
+                const cx = l.x + l.size / 2;
+                const cy = l.y + l.size / 2;
+                const centreRegion = input.regionAt ? input.regionAt(cx, cy) : undefined;
+                const cut = cutCellRegions({ corners: c, edgeCrossings: crossings, centreRegion, shoreEdges });
+                for (const [regionId, tris] of cut.byRegion) {
+                    for (const t of tris) {
+                        triangles.push({ pts: [lift(t[0]), lift(t[1]), lift(t[2])], regionId });
+                    }
+                }
             }
             continue;
         }
@@ -340,14 +432,14 @@ export function decimate(input: DecimateInput): DecimateResult {
             }
         }
         if (ring.length === 4) {
-            triangles.push({ pts: [ring[0], ring[1], ring[2]], land: l.land });
-            triangles.push({ pts: [ring[0], ring[2], ring[3]], land: l.land });
+            triangles.push({ pts: [ring[0], ring[1], ring[2]], regionId: l.regionId });
+            triangles.push({ pts: [ring[0], ring[2], ring[3]], regionId: l.regionId });
         } else {
             const centre: Vec2 = { x: l.x + s / 2, y: l.y + s / 2 };
             for (let i = 0; i < ring.length; i++) {
                 const a = ring[i];
                 const b = ring[(i + 1) % ring.length];
-                triangles.push({ pts: [centre, a, b], land: l.land });
+                triangles.push({ pts: [centre, a, b], regionId: l.regionId });
             }
         }
     }

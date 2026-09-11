@@ -7,6 +7,9 @@ from fetch_planet_dem import (
     ARCSEC_DEG,
     TILE_SIZE,
     auto_max_zoom,
+    fabdem_block_name,
+    fabdem_tile_name,
+    fabdem_tile_url,
     glue_negative_values,
     lattice_step,
     parse_bbox,
@@ -113,6 +116,32 @@ class TilesForBboxTest(unittest.TestCase):
         # -15.5 sits in the square named W016, not W015.
         self.assertIn('Copernicus_DSM_COG_10_N28_00_W016_00_DEM',
                       tiles_for_bbox((-15.5, 28.2, -15.4, 28.3)))
+
+
+class FabdemNamingTest(unittest.TestCase):
+
+    def test_tile_name_matches_the_published_convention(self):
+        # N44E007_FABDEM_V1-2.tif is the archive's own documented example.
+        self.assertEqual(fabdem_tile_name(44, 7), 'N44E007_FABDEM_V1-2')
+
+    def test_southern_western_tile(self):
+        self.assertEqual(fabdem_tile_name(-25, -115), 'S25W115_FABDEM_V1-2')
+
+    def test_block_is_the_enclosing_ten_degree_square(self):
+        # Also a published example: N44E007 ships under N40E000-N50E010.
+        self.assertEqual(fabdem_block_name(44, 7), 'N40E000-N50E010_FABDEM_V1-2')
+
+    def test_block_floors_negative_coordinates_away_from_zero(self):
+        self.assertEqual(fabdem_block_name(-25, -115), 'S30W120-S20W110_FABDEM_V1-2')
+
+    def test_block_corner_exactly_on_a_ten_degree_line_belongs_to_the_square_above(self):
+        self.assertEqual(fabdem_block_name(40, 0), 'N40E000-N50E010_FABDEM_V1-2')
+
+    def test_url_nests_the_tile_under_its_block(self):
+        url = fabdem_tile_url(44, 7)
+        self.assertTrue(url.endswith(
+            '/N40E000-N50E010_FABDEM_V1-2/N44E007_FABDEM_V1-2.tif'))
+        self.assertTrue(url.startswith('https://'))
 
 
 class MaxZoomTest(unittest.TestCase):

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
-    CoastPolygon, InlandBody, Watercourse, decodeLvr, encodeLvrUncompressed,
+    CoastPolygon, InlandBody, LanduseRegion, Watercourse, decodeLvr, encodeLvrUncompressed,
 } from './lvr';
 
 const SQUARE: CoastPolygon = {
@@ -84,5 +84,52 @@ describe('LVR decode', () => {
     it('rejects a blob that is not an LVR tile', () => {
         const junk = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
         assert.throws(() => decodeLvr(junk));
+    });
+
+    describe('LVR4 regions', () => {
+        const forest: LanduseRegion = {
+            exterior: [
+                { lon: 0.1, lat: 0.1 }, { lon: 0.3, lat: 0.1 }, { lon: 0.3, lat: 0.3 },
+            ],
+            holes: [],
+            isLand: true,
+            landuseClass: 1,
+        };
+        const water: LanduseRegion = {
+            exterior: [
+                { lon: 0.6, lat: 0.6 }, { lon: 0.9, lat: 0.6 }, { lon: 0.9, lat: 0.9 },
+            ],
+            holes: [],
+            isLand: false,
+            landuseClass: undefined,
+        };
+
+        it('round-trips regions alongside the base land polygons', () => {
+            const tile = decodeLvr(encodeLvrUncompressed([SQUARE], [], [], [forest, water]));
+            assert.equal(tile.polygons.length, 1, 'the plain land polygon is untouched');
+            assert.equal(tile.regions.length, 2);
+            assert.equal(tile.regions[0].isLand, true);
+            assert.equal(tile.regions[0].landuseClass, 1);
+            assert.equal(tile.regions[1].isLand, false);
+            assert.equal(tile.regions[1].landuseClass, undefined);
+        });
+
+        it('carries regions alongside inland water and watercourses', () => {
+            const tile = decodeLvr(encodeLvrUncompressed(
+                [SQUARE], [body(912.5)], [{ widthM: 10, points: [{ lon: 0, lat: 0 }, { lon: 1, lat: 1 }] }],
+                [forest],
+            ));
+            assert.equal(tile.inland.length, 1);
+            assert.equal(tile.watercourses.length, 1);
+            assert.equal(tile.regions.length, 1);
+        });
+
+        it('leaves regions empty on LVR1/LVR2/LVR3 tiles already baked', () => {
+            assert.deepEqual(decodeLvr(encodeLvrUncompressed([SQUARE])).regions, []);
+            assert.deepEqual(decodeLvr(encodeLvrUncompressed([SQUARE], [body(10)])).regions, []);
+            assert.deepEqual(decodeLvr(encodeLvrUncompressed(
+                [SQUARE], [], [{ widthM: 5, points: [{ lon: 0, lat: 0 }, { lon: 1, lat: 0 }] }],
+            )).regions, []);
+        });
     });
 });
